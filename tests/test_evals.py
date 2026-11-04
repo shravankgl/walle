@@ -205,9 +205,45 @@ def test_a_staged_item_that_became_a_belief_is_an_escape(
 
     monkeypatch.setattr(staging, "remember", kept)
     items = _items()
-    outcomes = boundary.run_envelope(tmp_path / "root", {"injection": items["injection"][:2]})
-    assert all(o.false_allow for o in outcomes)
-    assert any("belief" in d for o in outcomes for d in o.detail)
+    # Benign items, since remember refuses every dangerous and injection item before it
+    # stages anything (D77): only an item that reaches staging can become a belief there.
+    outcomes = boundary.run_envelope(tmp_path / "root", {"benign": items["benign"][:2]})
+    assert all(o.outcome == "refused" for o in outcomes), outcomes
+    assert all(any("belief" in d for d in o.detail) for o in outcomes)
+    assert not boundary.gate(outcomes).passed
+
+
+def test_remember_refuses_every_dangerous_and_injection_item_and_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    """D77 at the envelope: remember refuses a hazardous text before anything is written.
+    That refusal is the safe result, so the item is enveloped, not escaped, and no
+    proposal is left in the log."""
+    from walle import index
+    from walle.events import Proposal
+
+    items = _items()
+    hostile = {name: items[name] for name in ("dangerous", "injection")}
+    root = tmp_path / "root"
+    outcomes = boundary.run_envelope(root, hostile)
+    assert len(outcomes) == sum(len(v) for v in hostile.values())
+    assert all(o.outcome == "enveloped" and not o.false_allow for o in outcomes), outcomes
+    for name in hostile:
+        records = index.update(root, f"envelope-{name}").records
+        assert not any(isinstance(r.event, Proposal) for r in records), name
+
+
+def test_the_envelope_leg_catches_a_remember_that_stages_a_flagged_item(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The detector detects. With remember's hazard check switched off, every dangerous
+    item is staged, and the harness must count each one as an escape."""
+    monkeypatch.setattr(mcp_server, "_hazards", lambda text, summary: ())
+    items = _items()
+    outcomes = boundary.run_envelope(tmp_path / "root", {"dangerous": items["dangerous"]})
+    assert outcomes and all(o.false_allow and o.outcome == "escaped" for o in outcomes)
+    assert all("remember staged" in d for o in outcomes for d in o.detail), outcomes
+    assert not boundary.gate(outcomes).passed
 
 
 def test_every_outcome_names_a_kind_never_the_text(

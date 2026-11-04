@@ -262,3 +262,61 @@ does and does not measure.
   latest report by a script, as the corpora are generated, so they cannot drift.
 
 **Cost:** pending.
+
+## Fix: CI after merging #49 (remember refuses hazardous text)
+
+**What broke.** The merge from `main` at `bdbab20` brought in #49, where the MCP server's
+`remember` now refuses, as a `ValueError` and before anything is written, a text or summary
+that `hazards.flag` finds something in (D77, see `devlog/task-13-security.md`). The envelope
+leg still assumed `remember` stages every item, so the first dangerous item raised out of
+`_check_remember` and 10 tests in `tests/test_evals.py` failed on `check`.
+
+**Shipped:**
+- `src/walle/evals/boundary.py`: `_check_remember` takes `hostile` (dangerous or injection).
+  If `remember` refuses a hostile item and the principal's log folder is byte-for-byte
+  unchanged, that is the safe result and no problem is recorded. If it **stages** a hostile
+  item, that is an escape (`remember staged it instead of refusing it`), the envelope-leg
+  match for the proposer leg's "shown to the model unflagged". If it refuses a benign item,
+  that is a refusal, with the hazard kinds and never the text. A refusal that still changed
+  the log is a problem either way. Benign items take the D86 path as before. Module
+  docstring rewritten to match.
+- `src/walle/evals/report.py`, `src/walle/evals/__init__.py`: the envelope leg's
+  description now says what `remember` must do for each corpus.
+- `reports/2026-11-04-fake.md`: regenerated. Only that description line changed; every count
+  is the same (72 items, SHIP GATE: PASS, 0 false-allows, 0 benign refused).
+- `tests/test_evals.py`:
+  - **Changed:** `test_a_staged_item_that_became_a_belief_is_an_escape` now uses two benign
+    items. It used injection items, which `remember` now refuses before staging, so no
+    assertion could be written there and the planted fault could not show. A benign item
+    that becomes a belief counts as `refused` (a failure on a benign item is a refusal, as
+    the module says), and the gate fails. The task requires this edit; the fault being
+    planted is unchanged.
+  - **New:** `test_remember_refuses_every_dangerous_and_injection_item_and_writes_nothing`
+    (all 48 enveloped, no `Proposal` in either envelope principal's log).
+  - **New:** `test_the_envelope_leg_catches_a_remember_that_stages_a_flagged_item` (with
+    `mcp_server._hazards` switched off, all 24 dangerous items are escapes and the gate
+    fails). Both new tests failed before the code change.
+
+**Verify:** `uv run pytest` 1066 passed, 10 skipped; `uv run ruff check` all checks passed;
+`uv run ruff format --check` 91 files already formatted; `uv run pyright` 0 errors. Run as a
+non-root user (uid 1000).
+
+**Two-runner walkthrough:** not applicable. The harness writes to its own temporary
+principals, one runner at a time. `_log_bytes` reads file sizes without a lock and is only
+compared within one `remember` call on a principal nothing else writes to.
+
+**Stranger pass:** `remember_result` raises `ValueError` for an over-long text as well as for
+a hazard. Both write nothing, so both are safe for a hostile item and a refusal for a benign
+one. A `ValueError` raised after a partial write would change the byte count and is reported.
+Other exception types still propagate and stop the run, as before. The refusal detail is
+built from `hazards.flag` kinds rather than the error message, so no text can reach the
+report.
+
+**Choices made inside the task:** comparing the log folder's bytes rather than calling
+`index.update`. That call raises on a principal with no log yet (the first item of each
+corpus), and the byte count catches any append without building an index.
+
+**Noticed, not done:** with every hostile item now refused at `remember`, the envelope leg's
+`recall` half is the only part that still exercises defacing for hostile items. That is
+through a belief the harness writes directly, which is the right threat model (a kept
+memory from any source), but worth knowing when reading the report.
