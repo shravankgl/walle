@@ -1,8 +1,14 @@
 """The `walle` command. Every later task adds a subcommand here."""
 
+from pathlib import Path
+
 import click
 
 from walle import __version__
+from walle import index as walle_index
+from walle.events import FutureSchemaError
+from walle.reader import CorruptStreamError
+from walle.resolver import ResolutionError, resolve
 
 
 @click.group(invoke_without_command=True)
@@ -12,3 +18,63 @@ def main(ctx: click.Context) -> None:
     """Append-only memory for AI agent harnesses."""
     if ctx.invoked_subcommand is None:
         click.echo(ctx.get_help())
+
+
+def _describe(exc: BaseException) -> str:
+    """The exception's message with its notes, which carry the file and the build (D111)."""
+    return "\n".join([str(exc), *getattr(exc, "__notes__", [])])
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
+
+
+@main.command("rebuild")
+@click.option(
+    "--root",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=".",
+    show_default=True,
+    help="The folder that holds principals/.",
+)
+@click.option("--principal", required=True, help="Whose index, without the p- prefix.")
+@click.option("--full", is_flag=True, help="Discard the index and rebuild it from the log alone.")
+def rebuild_command(root: Path, principal: str, full: bool) -> None:
+    """Bring the SQLite index up to date with the log (D10, D96).
+
+    Incremental by default: only seqs after each stream's tracking record are read in. The
+    log is the truth, so the index can always be deleted and rebuilt with --full.
+    """
+    build = walle_index.rebuild if full else walle_index.update
+    try:
+        report = build(root, principal)
+    except (
+        walle_index.DanglingRefError,
+        FutureSchemaError,
+        CorruptStreamError,
+        FileNotFoundError,
+        ValueError,
+    ) as exc:
+        raise click.ClickException(_describe(exc)) from exc
+
+    for stream, skip in report.skips:
+        click.echo(f"skipped {stream} line {skip.line}: {skip.reason}", err=True)
+    streams = _plural(len(report.streams), "stream")
+    if report.full:
+        click.echo(
+            f"{principal}: rebuilt the index from nothing ({report.reason}): "
+            f"{_plural(report.events, 'event')} from {streams}."
+        )
+    else:
+        click.echo(
+            f"{principal}: indexed {_plural(len(report.added), 'new event')} (incremental); "
+            f"{_plural(report.events, 'event')} from {streams}."
+        )
+
+    try:
+        state = walle_index.state_hash(resolve(walle_index.load_records(root, principal)))
+    except ResolutionError as exc:
+        raise click.ClickException(
+            f"the index is up to date with the log, but the log does not fold: {exc}"
+        ) from exc
+    click.echo(f"resolved state: {state}")

@@ -40,6 +40,8 @@ PRINCIPAL_PREFIX = "p-"
 DEVICE_PREFIX = "d-"
 LOG_DIRNAME = "log"
 STREAM_SUFFIX = ".jsonl"
+INDEX_FILENAME = "index.sqlite"
+INDEX_LOCK_FILENAME = "index.lock"
 
 
 def check_name(name: str, *, kind: str) -> str:
@@ -74,3 +76,17 @@ def log_dir(root: Path, principal: str) -> Path:
 def stream_path(root: Path, principal: str, device: str) -> Path:
     """``<root>/principals/p-<principal>/log/d-<device>.jsonl``."""
     return log_dir(root, principal) / f"{stream_id(device)}{STREAM_SUFFIX}"
+
+
+def index_path(root: Path, principal: str) -> Path:
+    """``<root>/principals/p-<principal>/index.sqlite`` — derived, rebuildable (D10).
+
+    One per principal, inside their folder, never one per tenant: an index spanning two
+    principals would put their facts back in one place (hard constraint 6).
+    """
+    return principal_dir(root, principal) / INDEX_FILENAME
+
+
+def index_lock_path(root: Path, principal: str) -> Path:
+    """``<root>/principals/p-<principal>/index.lock`` — held by whoever changes the index."""
+    return principal_dir(root, principal) / INDEX_LOCK_FILENAME
