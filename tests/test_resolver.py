@@ -525,3 +525,57 @@ def test_staged_is_in_ref_order_whatever_the_input_order() -> None:
     shuffled = list(records)
     random.Random(9).shuffle(shuffled)
     assert [s.ref for s in staged(shuffled)] == ["d-mbp:1", "d-phone:1", "d-phone:2"]
+
+
+# --- issue 23: low findings from the review of PR 22 -----------------------------------
+
+
+def test_one_moment_in_two_offsets_compares_the_same_against_a_date() -> None:
+    """Two spellings of one instant are equal, so neither may order differently against a
+    date. Comparing the instant's *written* day put the first on 1 March and the second on
+    2 March."""
+    utc, ist, day = "2026-03-01T20:30:00+00:00", "2026-03-02T02:00:00+05:30", "2026-03-01"
+    assert starts_later(Window(utc), Window(ist)) is False
+    assert starts_later(Window(ist), Window(utc)) is False
+    assert starts_later(Window(utc), Window(day)) == starts_later(Window(ist), Window(day))
+    assert windows_overlap(Window(None, day), Window(utc)) == windows_overlap(
+        Window(None, day), Window(ist)
+    )
+
+
+def test_an_instant_far_from_a_date_is_still_ordered_against_it() -> None:
+    """Outside every time zone's reading of the day, the order is known."""
+    assert starts_later(Window("2026-03-03T00:00:00+00:00"), Window("2026-03-01")) is True
+    assert starts_later(Window("2026-03-01"), Window("2026-02-27T23:00:00+00:00")) is True
+
+
+def test_two_contradictions_naming_one_pair_list_the_closer_once() -> None:
+    """Written independently on two devices before sync: one closing, listed once."""
+    records = _stream(
+        _assertion("Lives in Pune", "2020-01-01"),
+        _assertion("Lives in Bangalore", "2026-03-01"),
+        _contradiction("d-mbp:1", "d-mbp:2"),
+    ) + _stream(_contradiction("d-mbp:1", "d-mbp:2"), device="phone")
+    pune = resolve(records).belief("d-mbp:1")
+    assert pune.closed_by == ("d-mbp:2",)
+    assert pune.window == Window("2020-01-01", "2026-03-01")
+
+
+@pytest.mark.parametrize(
+    "empty",
+    [("2026-03-01", "2026-03-01"), ("2026-03-05", "2026-03-01"), (TS, TS)],
+    ids=["empty date window", "inverted", "empty instant window"],
+)
+def test_an_empty_or_inverted_window_overlaps_nothing(empty: tuple[str, str]) -> None:
+    """``[from, to)`` with ``from >= to`` holds no moment, so it cannot overlap one."""
+    assert windows_overlap(Window(*empty), Window(None, None)) is False
+    assert windows_overlap(Window(None, None), Window(*empty)) is False
+
+    records = _stream(
+        _assertion("Lives in Pune", "2020-01-01"),
+        _assertion("Lived in Bangalore, never", *empty),
+        _contradiction("d-mbp:1", "d-mbp:2"),
+    )
+    resolution = resolve(records)
+    assert resolution.conflicts == ()
+    assert resolution.belief("d-mbp:1").window == Window("2020-01-01", None)

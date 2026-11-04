@@ -15,10 +15,11 @@ What it reads
 -------------
 Only the hot tier task 7 rendered into ``principals/p-<name>/hot/``, in ``ORDER``:
 ``identity.md``, ``user.md``, ``rules.md`` and ``learned.md``. ``rules.md`` is optional, since
-the person may not have written one; the three rendered files are required, because without
-``learned.md`` the identity text points at a file that is not there. Each rendered file
-already opens with a line saying what it is, so they are joined as they are; ``rules.md`` is
-the person's own text, so the hook puts a one-line header in front of it saying whose it is.
+the person may not have written one; the three rendered files are required, and a blank one
+counts as missing, because without ``learned.md`` the identity text points at a file that is
+not there. Each rendered file already opens with a line saying what it is, so they are joined
+as they are; ``rules.md`` is the person's own text, so the hook puts a one-line header in front
+of it saying whose it is.
 
 It never renders, never touches the log or the index, and never writes anything: not under
 the root, not under ``~/.claude``. Opening ``render.lock`` read-only and taking a shared
@@ -130,6 +131,23 @@ class _Parser(argparse.ArgumentParser):
         raise Silent(f"bad arguments: {message}")
 
 
+def _wants_measure(argv: list[str]) -> bool:
+    """Whether ``--measure`` was given as a flag, for when the arguments do not parse.
+
+    Read the way the parser reads them: the token after ``--root`` or ``--principal`` is its
+    value, never a flag, and nothing after ``--`` is an option.
+    """
+    tokens = iter(argv)
+    for token in tokens:
+        if token == "--":
+            return False
+        if token == "--measure":
+            return True
+        if token in ("--root", "--principal"):
+            next(tokens, None)
+    return False
+
+
 def _parser() -> argparse.ArgumentParser:
     # add_help=False: --help would print usage to stdout, which the host would read as context.
     parser = _Parser(prog="walle-hook", add_help=False, allow_abbrev=False)
@@ -174,7 +192,11 @@ def context(root: Path, principal: str) -> str:
         for name in ORDER:
             text = _read(folder / name, optional=name == RULES)
             if text is None or not text.strip():
-                continue
+                if name == RULES:
+                    continue
+                # A render never writes a blank one, so this is the incomplete tier a
+                # missing file is: the framing would point at text that is not there.
+                raise Silent(f"{folder / name}: blank, so the hot tier is incomplete")
             if name == RULES:
                 text = (
                     f"<!-- walle hot tier: {RULES}, {principal}'s own rules, written only by "
@@ -253,14 +275,16 @@ def _alarm(_signum: int, _frame: FrameType | None) -> None:
 def main(argv: list[str] | None = None) -> None:
     """The console script. Writes the answer or nothing, and always exits 0."""
     started = time.monotonic()
-    measure = "--measure" in (sys.argv[1:] if argv is None else argv)
+    raw = sys.argv[1:] if argv is None else argv
+    measure = _wants_measure(raw)  # before parsing, so a parse error can still be explained
     out: bytes | None = None
     note = ""
     try:
         signal.signal(signal.SIGALRM, _alarm)
         signal.setitimer(signal.ITIMER_REAL, BUDGET)
         try:
-            args = _parser().parse_args(argv)
+            args = _parser().parse_args(raw)
+            measure = args.measure
             check_payload(_read_stdin())
             text = context(args.root, args.principal)
             if not text:
