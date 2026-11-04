@@ -49,7 +49,8 @@ read-only log is a tool error and writes nothing. ``recall`` and ``why`` first b
 up to date (``index.update``); when the profile is read-only that raises ``PermissionError``,
 and they answer from the index as it was last built (``index.load_records``, which needs no
 write access) and **say so** in the answer. No index at all is still an error: no index must
-not read as no memory. Task 15's ``srt`` profile is where this matters.
+not read as no memory. ``sandbox.py``'s ``srt`` profile (task 15) is where this matters: it
+makes everything in the principal's folder but the log read-only.
 
 Errors
 ------
@@ -111,6 +112,7 @@ from walle.labels import ifc
 from walle.paths import check_name
 from walle.reader import CorruptStreamError, Record
 from walle.resolver import Belief, ResolutionError, resolve
+from walle.sandbox import srt_settings_json
 from walle.why import Ledger
 from walle.writer import CorruptLogError
 
@@ -438,12 +440,20 @@ def schema_cost(server: FastMCP) -> SchemaCost:
 @click.option(
     "--measure", is_flag=True, help="Print the tool schema's size on stderr and exit (D102)."
 )
-def main(root: Path, principal: str, device: str, measure: bool) -> None:
+@click.option(
+    "--srt-profile",
+    is_flag=True,
+    help="Print the `srt` sandbox settings for this profile on stdout and exit (D52, D99).",
+)
+def main(root: Path, principal: str, device: str, measure: bool, srt_profile: bool) -> None:
     """Serve walle's recall, remember and why over MCP on stdio."""
     try:
         server = build_server(root, principal, device)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
+    if srt_profile:
+        click.echo(srt_settings_json(root, principal), nl=False)
+        return
     if measure:
         cost = schema_cost(server)
         click.echo(
