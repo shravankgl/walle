@@ -2,7 +2,7 @@
 
 One entry per shipped task (D104). Newest last. Each entry: what shipped, the verify criterion
 and its result, what is next, and anything noticed but deliberately not done. The task numbers
-are `PLAN.md` §9's.
+are `PLAN.md` §9's. From task 4, each task has its own file in [devlog/](devlog/) (R6).
 
 ---
 

@@ -1,0 +1,9 @@
+# Paths an agent may not change on its own (R6). A PR touching any of these waits for Shravan.
+/.github/                  @shravankgl
+/scripts/                  @shravankgl
+/tests/test_constraints.py @shravankgl
+/CLAUDE.md                 @shravankgl
+/CONVERSATION.md           @shravankgl
+/ARCHITECTURE.md           @shravankgl
+/PLAN.md                   @shravankgl
+/LICENSE                   @shravankgl
