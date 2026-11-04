@@ -8,12 +8,14 @@ requires-python = ">=3.12"
 authors = [{ name = "shravankgl", email = "shravan.kgl@gmail.com" }]
 dependencies = [
   "click>=8.1",
+  "fastmcp>=4.1",
   "pydantic>=2.7",
 ]
 
 [project.scripts]
 walle = "walle.cli:main"
 walle-hook = "walle.hook:main"
+walle-mcp = "walle.mcp_server:main"
 
 [dependency-groups]
 dev = [

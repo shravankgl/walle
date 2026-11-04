@@ -105,6 +105,32 @@ yourself, replacing the two paths and the name. Keep any `hooks` you already hav
   /path/to/walle-data --principal maya --measure`. The JSON goes to stdout, the count to
   stderr.
 
+## The MCP server
+
+Not usable yet either. `walle-mcp` serves three tools over stdio (D48): `recall` (search
+current facts, or fetch one by ref), `remember` (only *stages* a proposal; you keep or drop it
+in `walle review`) and `why` (where a fact came from). Every piece of memory comes back in an
+untrusted envelope with a random per-result id, labelled `_meta.ifc` from its provenance
+(D55, D84, D97). For Claude Code:
+
+```json
+{
+  "mcpServers": {
+    "walle": {
+      "command": "/path/to/walle/.venv/bin/walle-mcp",
+      "args": ["--root", "/path/to/walle-data", "--principal", "maya", "--device", "mbp"]
+    }
+  }
+}
+```
+
+- **Schema cost (D102): 1,102 characters, about 368 tokens** for all three tools, measured on
+  the `tools/list` answer a client receives at 3 characters per token (an estimate on the safe
+  side; Claude's tokenizer is not available offline). The cap is 400 and is a test. Check it
+  with `walle-mcp --root /path/to/walle-data --principal maya --device mbp --measure`.
+- The envelope cannot stop the host from acting on what it reads. A memory layer runs inside
+  the host and cannot taint its session or refuse its tool calls (D55).
+
 ## Documents
 
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — the system: layers, loops, event log, profiles
