@@ -28,6 +28,18 @@ where they are, starts its own record on a fresh line, and takes its ``seq`` fro
 exactly what "append, never mutate" forbids (hard constraint 2) — the bytes are evidence
 that a crash happened here.
 
+A locked session (``StreamWriter.locked``) is the same lock held across a read and any
+number of appends, for a caller whose decision to append depends on what the stream already
+holds. Say A and B both run "append each turn not already logged":
+
+1. A takes the lock and reads the stream: the turn is not there.
+2. B asks for the lock and blocks, having read nothing.
+3. A appends the turn, ``fsync``s, and closes. The lock goes.
+4. B wakes, reads the stream, and finds A's record: it appends nothing.
+
+Read before the lock instead, and both A and B would see an empty stream in step 1 and both
+would append the turn: two events, two refs, for one thing that happened.
+
 What this does not survive: a stream on NFS, where ``flock`` does not reliably serialise
 between hosts. Local-first is the premise (D10); a shared-filesystem log would need a
 different mechanism, and would silently interleave with this one.
@@ -39,11 +51,14 @@ import json
 import logging
 import os
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO, TypeVar
 
 from walle.events import Event
 from walle.paths import stream_id, stream_path
+from walle.reader import StreamContents, parse_stream
 
 if sys.platform == "win32":  # pragma: no cover - POSIX only in Phase 0
     raise ImportError(
@@ -172,49 +187,85 @@ class StreamWriter:
         Durable when it returns: the bytes are ``fsync``ed, and on the first append the
         directory entry is too.
         """
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.locked() as stream:
+            return stream.append(event)
 
+    @contextmanager
+    def locked(self) -> Iterator[LockedStream]:
+        """Hold the stream's lock for a read and any number of appends (see the walkthrough).
+
+        Opening the file creates it, empty, if it is not there yet. Keep the session short:
+        every other writer to this stream, and every reader, waits for it.
+        """
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.path, "a+b") as f:
             # Lock first. Everything below reads the file, and reading before the lock would
             # mean acting on what some other writer has already superseded.
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            size = f.seek(0, os.SEEK_END)
-
-            # Whether this is the stream's first record is decided *here*, inside the lock,
-            # from the file's own size — never from an `exists()` check before it.
-            #
-            # `open(..., "a+b")` creates the file before the lock is taken, so a check made
-            # outside races: writer A opens (the file now exists), writer B's `exists()` says
-            # True, B wins the lock, writes seq 1, skips this fsync and returns claiming
-            # durability — on a directory entry nobody has made durable. An empty file means
-            # nothing has been written yet, which is exactly the condition that needs it.
-            #
-            # And it runs *before* the write: a crash in between would otherwise leave
-            # durably written bytes in a non-durable entry, and a failure here after a
-            # successful write would tell the caller the append failed while the record sat
-            # on disk. Ordered first, a failure truthfully means nothing was written.
-            if size == 0:
-                _fsync_dir(self.path.parent)
-
-            last_line, torn = _tail(f, size)
-            next_seq = _seq_of(last_line, self.path) + 1 if last_line else 1
-
-            record = event.model_copy(update={"seq": next_seq})
-            # Encoded before anything is written, so a failure here leaves the file
-            # untouched rather than leaving a stray newline behind it (coding rule 7).
-            payload = encode(record)
-            if torn:
-                logger.warning(
-                    "%s: last line was not newline-terminated — an append was interrupted. "
-                    "Leaving the fragment in place and starting seq %d on a fresh line; "
-                    "readers skip it.",
-                    self.path,
-                    next_seq,
-                )
-                payload = b"\n" + payload
-            f.write(payload)
-            f.flush()
-            os.fsync(f.fileno())
+            yield LockedStream(f, self.path, self.stream)
             # The lock goes with close, after the data is on disk — never before.
 
+
+class LockedStream:
+    """One stream, held under ``LOCK_EX`` by ``StreamWriter.locked`` until the block ends.
+
+    Not usable after the block: the file is closed and the lock is gone.
+    """
+
+    def __init__(self, f: BinaryIO, path: Path, stream: str) -> None:
+        self._f = f
+        self.path = path
+        self.stream = stream
+
+    def read(self) -> StreamContents:
+        """Everything in the stream now, parsed by the reader's rules (D80).
+
+        Read through the locked handle. Opening the file again for ``reader.read_file``
+        would ask for ``LOCK_SH`` on a second open file, which waits for this lock forever.
+        """
+        size = self._f.seek(0, os.SEEK_END)
+        self._f.seek(0)
+        return parse_stream(self._f.read(size), self.path, self.stream)
+
+    def append(self, event: E) -> E:
+        """Append one event, returning it with its ``seq`` filled in. Durable on return."""
+        f = self._f
+        size = f.seek(0, os.SEEK_END)
+
+        # Whether this is the stream's first record is decided *here*, inside the lock,
+        # from the file's own size — never from an `exists()` check before it.
+        #
+        # `open(..., "a+b")` creates the file before the lock is taken, so a check made
+        # outside races: writer A opens (the file now exists), writer B's `exists()` says
+        # True, B wins the lock, writes seq 1, skips this fsync and returns claiming
+        # durability — on a directory entry nobody has made durable. An empty file means
+        # nothing has been written yet, which is exactly the condition that needs it.
+        #
+        # And it runs *before* the write: a crash in between would otherwise leave
+        # durably written bytes in a non-durable entry, and a failure here after a
+        # successful write would tell the caller the append failed while the record sat
+        # on disk. Ordered first, a failure truthfully means nothing was written.
+        if size == 0:
+            _fsync_dir(self.path.parent)
+
+        last_line, torn = _tail(f, size)
+        next_seq = _seq_of(last_line, self.path) + 1 if last_line else 1
+
+        record = event.model_copy(update={"seq": next_seq})
+        # Encoded before anything is written, so a failure here leaves the file
+        # untouched rather than leaving a stray newline behind it (coding rule 7).
+        payload = encode(record)
+        if torn:
+            logger.warning(
+                "%s: last line was not newline-terminated — an append was interrupted. "
+                "Leaving the fragment in place and starting seq %d on a fresh line; "
+                "readers skip it.",
+                self.path,
+                next_seq,
+            )
+            payload = b"\n" + payload
+        f.seek(0, os.SEEK_END)  # "a" mode appends anyway; this keeps the position honest
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
         return record

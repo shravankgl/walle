@@ -1,9 +1,9 @@
 """The transcript observer, part 2: one ``observation`` per completed turn (D51, D56, D93, D101).
 
 Part 1 (``transcript.py``) reads Claude Code's files into the ``parentUuid`` graph. This part
-finds the turns in that graph and makes one ``Observation`` for each turn that has finished.
-It returns the events and writes nothing: they come back unsequenced (``seq`` is ``None``),
-for the stream writer to append.
+finds the turns in that graph and makes one ``Observation`` for each turn that has finished
+(``observe``), then appends to a stream each one the log does not already hold
+(``append_observations``).
 
 What a turn is
 --------------
@@ -18,22 +18,55 @@ of its own.
 
 When a turn is complete (D56, D80)
 ----------------------------------
-**Only a completed turn is observed. A token is not.** A turn is complete at the first main-
-thread ``assistant`` entry, in walk order, whose ``stop_reason`` is one that ends a reply:
-``end_turn``, ``stop_sequence``, ``max_tokens`` or ``refusal``. ``tool_use`` and
-``pause_turn`` mean more is coming. An unknown reason counts as more coming, so a new reason
-in a later build delays an observation and never invents one.
+**Only a completed turn is observed. A token is not.** A turn runs until the person's next
+real prompt, so it is complete in one of two ways:
 
-So an assistant entry still streaming, with ``stop_reason`` still ``null``, produces nothing.
-Neither do any number of them in a row. They are D56's token deltas. The message they belong
-to is read whole once the turn completes.
+1. **The person spoke again.** A later prompt sits below the turn. The last main-thread
+   ``assistant`` entry above that prompt closes the turn, whatever its ``stop_reason``: even
+   a tool call cut short is over once the person has moved on. It is not trailing, so D80's
+   "pending" does not apply.
+2. **No later prompt yet, and the reply has ended.** The last main-thread ``user`` or
+   ``assistant`` entry in the turn, in walk order, is an ``assistant`` entry whose
+   ``stop_reason`` ends a reply: ``end_turn``, ``stop_sequence``, ``max_tokens`` or
+   ``refusal``. Entries of other types (``attachment``, ``system``, …) after it are passed
+   over. A ``user`` line after it that is not the person (a tool result, an ``isMeta`` hook
+   message) means more is coming, so the turn is pending.
 
-A build that never writes a ``stop_reason`` would then never complete a turn. So there is one
-more way to complete one: the person spoke again. If a later prompt sits directly below the
-turn, the last ``assistant`` entry above that prompt closes the turn, as long as it is not
-calling a tool. A call with no result is pending, not finished (D80).
+The closing entry is the *last* such entry, not the first: a message split into entries that
+each say ``end_turn``, or a reply that a hook continues, is read to its end.
+
+``tool_use`` and ``pause_turn`` mean more is coming. An unknown reason counts as more coming,
+so a new reason in a later build delays an observation and never invents one. An assistant
+entry still streaming, with ``stop_reason`` still ``null``, produces nothing, and neither do
+any number of them in a row. They are D56's token deltas. The message they belong to is read
+whole once the turn completes.
 
 A turn not complete yet is listed in ``pending``. It is observed on a later run, when it is.
+
+Appending, once per turn (D92)
+------------------------------
+``append_observations`` takes the stream's lock (``StreamWriter.locked``), folds the stream
+into the set of transcript observations it already holds, and appends each observed turn not
+in that set. What is "already logged" is that fold over the log, rebuilt every run, with no
+second store and no cursor file (D92). D92's own example cursor, ``max(ts)``, does not fit
+here: ``ts`` is when we read a turn, not when it happened, and turns from several files and
+resumes complete out of transcript order, so a high-water mark would drop late completions.
+
+A turn is matched by its content: ``(source, observed_at, body, source_version)``. Never by
+session id (D101), and not by ``ts``, which differs every run. The fold and the appends happen
+under one lock, so two runs at once cannot both append a turn:
+
+1. Runs A and B have each read the transcripts and found the same completed turn T.
+2. A takes the stream's ``LOCK_EX`` and folds the stream: T is not there.
+3. B asks for the lock and blocks. It has read nothing of the stream.
+4. A appends T, ``fsync``s, and closes. The lock goes.
+5. B gets the lock and folds the stream: T is there, with A's ``seq``. B appends nothing.
+
+If A dies between appends, the ones before are durable and the rest are not written. The
+next run appends the rest and nothing twice. The limit is the content match. A turn that
+changes after it was observed (more of it arrives, which rule 2 makes unlikely but cannot
+rule out) gets a second, longer observation. Telling those apart needs the prompt's ``uuid``
+on the event, which is a schema change (D88, D96).
 
 What an observation holds
 -------------------------
@@ -64,7 +97,9 @@ from pathlib import Path
 from typing import Any
 
 from walle.events import ACTOR_OBSERVER, Observation, now_instant
+from walle.reader import StreamContents
 from walle.transcript import TranscriptEntry, Transcripts, load, transcript_files
+from walle.writer import StreamWriter
 
 SOURCE = "transcript"
 
@@ -92,6 +127,67 @@ class ObserveReport:
     """Prompts whose turn has not completed yet, in walk order."""
     transcripts: Transcripts
     """The graph it read, with its skips and repairs, so a caller can report them."""
+
+
+@dataclass(frozen=True)
+class AppendReport:
+    """What one ``append_observations`` call wrote."""
+
+    appended: tuple[Observation, ...]
+    """The observations appended, in walk order, with their ``seq``."""
+    already_logged: tuple[ObservedTurn, ...]
+    """Completed turns whose observation the stream already held, so nothing was appended
+    for them. That includes a turn identical in content to one appended earlier in the same
+    call, which is the content match's limit, not a second append."""
+    report: ObserveReport
+
+
+type _Key = tuple[str, str, str, str | None]
+
+
+def _key(observation: Observation) -> _Key:
+    """What makes two transcript observations the same turn. Not ``ts``, not a session id."""
+    return (
+        observation.source,
+        observation.observed_at,
+        observation.body,
+        observation.source_version,
+    )
+
+
+def _logged(contents: StreamContents) -> set[_Key]:
+    """The fold: every transcript observation already in the stream (D92)."""
+    return {
+        _key(event)
+        for event in contents.events
+        if isinstance(event, Observation) and event.source == SOURCE
+    }
+
+
+def append_observations(report: ObserveReport, writer: StreamWriter) -> AppendReport:
+    """Append each completed turn in ``report`` that the stream does not hold yet.
+
+    The fold and every append happen under the stream's one lock (see *Appending, once per
+    turn*). With nothing completed, the stream is not touched, nor created.
+
+    A stream the reader refuses (``CorruptStreamError``, ``FutureSchemaError``) raises before
+    anything is appended. An error part-way through raises too, and leaves the appends
+    before it durable; running again appends the rest.
+    """
+    if not report.turns:
+        return AppendReport(appended=(), already_logged=(), report=report)
+    appended: list[Observation] = []
+    already: list[ObservedTurn] = []
+    with writer.locked() as stream:
+        logged = _logged(stream.read())
+        for turn in report.turns:
+            key = _key(turn.observation)
+            if key in logged:
+                already.append(turn)
+                continue
+            appended.append(stream.append(turn.observation))
+            logged.add(key)
+    return AppendReport(appended=tuple(appended), already_logged=tuple(already), report=report)
 
 
 def observe_projects(projects_dir: Path, *, ts: str | None = None) -> ObserveReport:
@@ -161,21 +257,18 @@ def _is_prompt(entry: TranscriptEntry) -> bool:
     return any(block.get("type") == "text" and _text_of(block) for block in blocks)
 
 
-def _calls_a_tool(entry: TranscriptEntry) -> bool:
-    return any(block.get("type") == "tool_use" for block in _blocks(entry))
-
-
 # --- finding the end of a turn ------------------------------------------------------------
 
 
 def _closing(transcripts: Transcripts, prompt: str) -> TranscriptEntry | None:
     """The entry that completes the turn started at ``prompt``, or ``None`` if none does yet.
 
-    Depth first, in the walk's own child order, so "first" means the same thing it means in
+    Depth first, in the walk's own child order, so "first" and "last" mean what they mean in
     ``Transcripts.walk``. The search stops at the next prompt and never enters a sidechain.
     """
     entries = transcripts.entries
     next_prompts: list[str] = []
+    last: TranscriptEntry | None = None  # the last main-thread user or assistant line
     stack = list(reversed(transcripts.children.get(prompt, ())))
     while stack:
         uuid = stack.pop()
@@ -185,16 +278,20 @@ def _closing(transcripts: Transcripts, prompt: str) -> TranscriptEntry | None:
         if _is_prompt(entry):
             next_prompts.append(uuid)
             continue
-        if entry.type == "assistant" and _message(entry).get("stop_reason") in _FINAL_STOP_REASONS:
-            return entry
+        if entry.type in ("user", "assistant"):
+            last = entry
         stack.extend(reversed(transcripts.children.get(uuid, ())))
 
-    for later in next_prompts:  # the person spoke again: the reply before it was finished
-        last = _last_assistant_above(transcripts, later, prompt)
-        if last is not None and not _calls_a_tool(last):
-            stop = _message(last).get("stop_reason")
-            if stop is None or stop in _FINAL_STOP_REASONS:
-                return last
+    for later in next_prompts:  # rule 1: the person spoke again
+        above = _last_assistant_above(transcripts, later, prompt)
+        if above is not None:
+            return above
+    if (  # rule 2: the reply has ended, and nothing after it says more is coming
+        last is not None
+        and last.type == "assistant"
+        and _message(last).get("stop_reason") in _FINAL_STOP_REASONS
+    ):
+        return last
     return None
 
 

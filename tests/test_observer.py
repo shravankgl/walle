@@ -8,6 +8,9 @@
   subagents            a subagent's file hangs under the call that started it, and adds no turn
   ignored types        only user and assistant entries are read; api-request never is
   explicit input       the projects folder is always named by the caller, never defaulted
+  appending            each completed turn reaches the log once; a re-run appends nothing,
+                       and two processes at once still append each turn once (D92)
+  a turn's end         a turn runs to the person's next real prompt; later text is kept
 
 The fixture under ``tests/fixtures/observer/`` is synthetic: made-up uuids, a made-up balcony
 garden. Its shape follows D101 and claude-code-log's ``dev-docs/agents.md``, plus the counts
@@ -18,6 +21,8 @@ from __future__ import annotations
 
 import inspect
 import json
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -25,8 +30,10 @@ import pytest
 
 from walle import observer
 from walle.events import ACTOR_OBSERVER, Observation
-from walle.observer import observe, observe_projects
+from walle.observer import append_observations, observe, observe_projects
+from walle.reader import read_stream
 from walle.transcript import load, transcript_files
+from walle.writer import StreamWriter
 
 PROJECTS = Path(__file__).parent / "fixtures" / "observer"
 PROJECT = PROJECTS / "-home-example-garden"
@@ -240,9 +247,11 @@ def test_with_no_stop_reason_the_next_prompt_closes_the_turn_before_it(tmp_path:
     assert report.pending == (u(3),)
 
 
-def test_a_next_prompt_does_not_close_a_turn_whose_last_reply_calls_a_tool(
+def test_the_next_prompt_ends_a_turn_even_when_its_last_reply_called_a_tool(
     tmp_path: Path,
 ) -> None:
+    """Changed in review: a turn runs until the person's next real prompt. A call cut short
+    by the person speaking again is not trailing, so it is not pending (D80)."""
     rows = [
         prompt(1, None, 0, "one"),
         reply(2, 1, 1, [tool_use("t1")], None),
@@ -250,8 +259,71 @@ def test_a_next_prompt_does_not_close_a_turn_whose_last_reply_calls_a_tool(
         reply(4, 3, 3, [text("second")], "end_turn"),
     ]
     report = observe_rows(tmp_path, rows)
-    assert [t.prompt for t in report.turns] == [u(3)]
-    assert report.pending == (u(1),)
+    assert [(t.prompt, t.closing) for t in report.turns] == [(u(1), u(2)), (u(3), u(4))]
+    assert report.pending == ()
+
+
+# --- a turn runs to the next real prompt (review, medium) -----------------------------------
+
+
+def test_a_message_split_into_entries_that_each_say_end_turn_is_read_whole(
+    tmp_path: Path,
+) -> None:
+    """Shape 1: thinking and text are separate entries of one message, both ``end_turn``."""
+    think = {"type": "thinking", "thinking": "hidden"}
+    rows = [
+        prompt(1, None, 0, "q"),
+        reply(2, 1, 1, [think], "end_turn", mid="m"),
+        reply(3, 2, 2, [text("the answer")], "end_turn", mid="m"),
+    ]
+    (turn,) = observe_rows(tmp_path, rows).turns
+    assert turn.closing == u(3)
+    assert turn.observation.body == "user: q\nassistant: the answer"
+    rows.append(prompt(4, 3, 3, "next"))
+    first, *_ = observe_rows(tmp_path, rows).turns
+    assert (first.closing, first.observation.body) == (u(3), "user: q\nassistant: the answer")
+
+
+@pytest.mark.parametrize(
+    "between",
+    [
+        {"isMeta": True, "message": {"role": "user", "content": "Stop hook feedback: go on"}},
+        {"type": "attachment", "attachment": {"type": "file"}, "message": None},
+    ],
+    ids=["meta", "attachment"],
+)
+def test_text_after_a_final_reply_and_before_the_next_prompt_stays_in_the_turn(
+    tmp_path: Path, between: dict[str, Any]
+) -> None:
+    """Shape 2: a final reply, a line that is not the person, then more reply."""
+    middle = {**entry(3, 2, 2, "user", None), **between}
+    if middle.get("message") is None:
+        middle.pop("message")
+    rows = [
+        prompt(1, None, 0, "q"),
+        reply(2, 1, 1, [text("cut off")], "max_tokens"),
+        middle,
+        reply(4, 3, 3, [text("and the rest")], "end_turn"),
+    ]
+    (turn,) = observe_rows(tmp_path, rows).turns
+    assert turn.closing == u(4)
+    assert turn.observation.body == "user: q\nassistant: cut off\nassistant: and the rest"
+    rows.append(prompt(5, 4, 4, "next"))
+    first = observe_rows(tmp_path, rows).turns[0]
+    assert first.closing == u(4)
+
+
+def test_a_final_reply_followed_by_a_line_that_is_not_the_person_is_pending(
+    tmp_path: Path,
+) -> None:
+    """More is coming: a meta line or a tool result after the reply is not the turn's end."""
+    rows = [
+        prompt(1, None, 0, "q"),
+        reply(2, 1, 1, [text("cut off")], "end_turn"),
+        prompt(3, 2, 2, "Stop hook feedback: go on", isMeta=True),
+    ]
+    report = observe_rows(tmp_path, rows)
+    assert report.turns == () and report.pending == (u(1),)
 
 
 @pytest.mark.parametrize("stop", ["tool_use", "pause_turn", "a_reason_from_the_future"])
@@ -449,3 +521,113 @@ def test_no_observer_module_names_a_home_folder() -> None:
         source = inspect.getsource(module)
         for needle in ("expanduser", "Path.home", "os.environ", "getenv", 'Path("~'):
             assert needle not in source, f"{module.__name__} uses {needle}"
+
+
+# --- appending (review, high 1; D92) ---------------------------------------------------------
+
+
+def lines_of(writer: StreamWriter) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in writer.path.read_bytes().splitlines()]
+
+
+def test_completed_turns_are_appended_with_seqs_and_a_rerun_appends_nothing(
+    tmp_path: Path,
+) -> None:
+    writer = StreamWriter(tmp_path / "root", "maya", "mbp")
+    first = append_observations(observe_projects(PROJECTS, ts=TS), writer)
+    assert [o.seq for o in first.appended] == [1, 2]
+    assert first.already_logged == ()
+    logged = read_stream(tmp_path / "root", "maya", "mbp").events
+    assert all(isinstance(e, Observation) for e in logged)
+    assert [e.body for e in logged if isinstance(e, Observation)] == [
+        t.observation.body for t in first.report.turns
+    ]
+    before = writer.path.read_bytes()
+
+    again = append_observations(observe_projects(PROJECTS), writer)  # a later run, a new ts
+    assert again.appended == ()
+    assert [t.prompt for t in again.already_logged] == [g(1), g(4)]
+    assert writer.path.read_bytes() == before
+
+
+def test_a_turn_that_completes_later_is_appended_by_the_later_run(tmp_path: Path) -> None:
+    writer = StreamWriter(tmp_path / "root", "maya", "mbp")
+    rows = [
+        prompt(1, None, 0, "q1"),
+        reply(2, 1, 1, [text("a1")], "end_turn"),
+        prompt(3, 2, 2, "q2"),
+        reply(4, 3, 3, [text("a2 so far")], None),
+    ]
+    path = write(tmp_path / "p" / "s.jsonl", rows)
+    assert len(append_observations(observe(load([path]), ts=TS), writer).appended) == 1
+    write(path, [*rows, reply(5, 4, 4, [text("done")], "end_turn")])
+    later = append_observations(observe(load([path]), ts=TS), writer)
+    assert [o.seq for o in later.appended] == [2]
+    assert [r["body"].splitlines()[0] for r in lines_of(writer)] == ["user: q1", "user: q2"]
+
+
+def test_what_is_logged_does_not_depend_on_the_session_id(tmp_path: Path) -> None:
+    """Rewrite every session id between runs: nothing is appended again (D101)."""
+    writer = StreamWriter(tmp_path / "root", "maya", "mbp")
+    rows = conversation(3, 1)
+    path = write(tmp_path / "p" / "s.jsonl", rows)
+    assert len(append_observations(observe(load([path]), ts=TS), writer).appended) == 3
+    write(path, [{**r, "sessionId": f"new-{i}"} for i, r in enumerate(rows)])
+    assert append_observations(observe(load([path]), ts=TS), writer).appended == ()
+
+
+def test_an_observation_from_another_source_does_not_count_as_logged(tmp_path: Path) -> None:
+    writer = StreamWriter(tmp_path / "root", "maya", "mbp")
+    (turn,) = observe_rows(tmp_path, conversation(1, 0)).turns
+    writer.append(turn.observation.model_copy(update={"source": "mail"}))
+    result = append_observations(observe_rows(tmp_path, conversation(1, 0)), writer)
+    assert [o.seq for o in result.appended] == [2]
+
+
+def test_with_nothing_completed_no_stream_file_is_created(tmp_path: Path) -> None:
+    writer = StreamWriter(tmp_path / "root", "maya", "mbp")
+    result = append_observations(observe_rows(tmp_path, conversation(0, 2)), writer)
+    assert result.appended == () and not writer.path.exists()
+
+
+# Each child observes the fixture into one stream. The fold over the log is slowed down so
+# that, if it ran outside the writer's lock, both children would read an empty stream and
+# both would append every turn. Under the lock the second child waits and appends nothing.
+_CHILD = """
+import sys, time
+from pathlib import Path
+import walle.observer as observer
+from walle.writer import StreamWriter
+
+projects, root = Path(sys.argv[1]), Path(sys.argv[2])
+fold = observer._logged
+def slow(contents):
+    found = fold(contents)
+    time.sleep(1.0)
+    return found
+observer._logged = slow
+result = observer.append_observations(
+    observer.observe_projects(projects), StreamWriter(root, "maya", "mbp")
+)
+print(len(result.appended))
+"""
+
+
+def test_two_processes_at_once_append_each_turn_once(tmp_path: Path) -> None:
+    children = [
+        subprocess.Popen(
+            [sys.executable, "-c", _CHILD, str(PROJECTS), str(tmp_path / "root")],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        for _ in range(2)
+    ]
+    counts = []
+    for child in children:
+        out, err = child.communicate(timeout=120)
+        assert child.returncode == 0, err.decode()
+        counts.append(int(out))
+    assert sorted(counts) == [0, 2]
+    records = lines_of(StreamWriter(tmp_path / "root", "maya", "mbp"))
+    assert [r["seq"] for r in records] == [1, 2]
+    assert len({r["body"] for r in records}) == 2

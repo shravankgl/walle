@@ -19,6 +19,7 @@ claude-code-transcripts; ``devlog/task-10.md`` lists what still needs checking a
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 from pathlib import Path
@@ -27,6 +28,7 @@ from typing import Any
 import pytest
 
 from walle.transcript import (
+    LineSkip,
     TranscriptEntry,
     load,
     read_transcript,
@@ -479,22 +481,92 @@ def test_a_line_with_a_uuid_and_no_type_is_still_skipped(tmp_path: Path) -> None
     assert [skip.line for skip in transcript.skips] == [2]
 
 
-@pytest.mark.parametrize(
-    "line",
-    [
-        b'{"type":"api-request","request":{"body":"CANARY-RAW-REQUEST-PAYLOAD',
-        b'{"type": "api-request-blob", "blob": "CANARY-RAW-REQUEST-PAYLOAD"',
-    ],
-)
-def test_a_broken_raw_request_line_is_reported_without_its_bytes(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture, line: bytes
-) -> None:
+def test_a_skip_carries_where_the_line_is_and_none_of_its_bytes(tmp_path: Path) -> None:
+    """Changed in review: no preview of transcript content, for any line (finding high 2)."""
+    good = json.dumps(row(1, None, "10:00:00")).encode()
+    bad = b'{"uuid": "broken'
+    tail = b'{"type": "user"'
     path = tmp_path / "p" / "s.jsonl"
     path.parent.mkdir()
-    for content in (line + b"\n", line):  # not JSON; and an unterminated last line
-        path.write_bytes(json.dumps(row(1, None, "10:00:00")).encode() + b"\n" + content)
-        with caplog.at_level(logging.WARNING):
-            (skip,) = read_transcript(path).skips
-        assert "CANARY" not in skip.preview
-        assert "api-request" in skip.preview
-    assert "CANARY" not in caplog.text
+    data = good + b"\n" + bad + b"\n" + tail
+    path.write_bytes(data)
+    skips = read_transcript(path).skips
+    assert {f.name for f in dataclasses.fields(LineSkip)} == {
+        "path",
+        "line",
+        "offset",
+        "length",
+        "reason",
+    }
+    assert [(s.line, s.offset, s.length) for s in skips] == [
+        (2, len(good) + 1, len(bad)),
+        (3, len(good) + len(bad) + 2, len(tail)),
+    ]
+    for skip in skips:
+        assert data[skip.offset : skip.offset + skip.length] in (bad, tail)
+
+
+PAYLOAD = "CANARY-RAW-REQUEST-PAYLOAD"
+
+
+def every_string(value: object) -> list[str]:
+    """Every string reachable from ``value``: dataclass fields (``raw`` too), maps, lists."""
+    found: list[str] = []
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            found.append(item)
+        elif isinstance(item, Path):
+            found.append(str(item))
+        elif dataclasses.is_dataclass(item) and not isinstance(item, type):
+            stack.extend(getattr(item, f.name) for f in dataclasses.fields(item))
+        elif isinstance(item, dict):
+            stack.extend([*item.keys(), *item.values()])  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+        elif isinstance(item, (list, tuple)):
+            stack.extend(item)  # pyright: ignore[reportUnknownArgumentType]
+    return found
+
+
+@pytest.mark.parametrize("where", ["mid-file", "last line"])
+def test_a_truncated_blob_line_with_its_type_last_leaves_no_payload_byte_anywhere(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, where: str
+) -> None:
+    """``type`` comes last and never arrives: nothing in the line says what it is."""
+    cut = ('{"sessionId":"s","blob":"' + PAYLOAD + "-and-more").encode()
+    path = tmp_path / "p" / "s" / "subagents" / "agent-x.jsonl"
+    path.parent.mkdir(parents=True)
+    first = json.dumps(row(1, None, "10:00:00")).encode() + b"\n"
+    after = json.dumps(row(2, 1, "10:00:01")).encode() + b"\n"
+    path.write_bytes(first + cut + b"\n" + after if where == "mid-file" else first + cut)
+    with caplog.at_level(logging.DEBUG):
+        transcript = read_transcript(path)
+        transcripts = load([path])
+    (skip,) = transcript.skips
+    assert skip.length == len(cut)
+    for text in every_string(transcript) + every_string(transcripts) + [caplog.text]:
+        assert PAYLOAD not in text
+        assert "and-more" not in text
+
+
+# --- the subagent anchor is a trunk entry (review, low) --------------------------------------
+
+
+def test_a_sidechain_entry_naming_an_agent_is_never_its_anchor(tmp_path: Path) -> None:
+    trunk = write(
+        tmp_path / "p" / "s.jsonl",
+        [row(1, None, "10:00:00"), spawn_result(2, 1, "10:00:30", "ag2")],
+    )
+    first = write(
+        tmp_path / "p" / "s" / "subagents" / "agent-ag1.jsonl",
+        [
+            agent_row(10, None, "10:00:01", "ag1"),
+            {**agent_row(11, 10, "10:00:02", "ag1"), "toolUseResult": {"agentId": "ag2"}},
+        ],
+    )
+    second = write(
+        tmp_path / "p" / "s" / "subagents" / "agent-ag2.jsonl",
+        [agent_row(20, None, "10:00:03", "ag2")],
+    )
+    transcripts = load([trunk, first, second])
+    assert transcripts.parent_of[u(20)] == u(2)  # not 11, though 11 is earlier

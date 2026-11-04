@@ -27,7 +27,9 @@ machine):
   of any other type that does not fit the entry shape is kept aside in ``unthreaded``, not
   reported as corrupt: a type we have never seen is not a broken file.
 * **``api-request`` and ``api-request-blob`` may hold raw request payloads.** Their ``raw`` is
-  replaced by ``{}`` as they are read, so nothing downstream can copy one anywhere.
+  replaced by ``{}`` as they are read, so nothing downstream can copy one anywhere. And no
+  skipped line of any type is copied into its ``LineSkip``: a skip says where the line is
+  (line, byte offset, length) and why, never what it held.
 
 Order (D101)
 ------------
@@ -86,7 +88,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -96,8 +97,6 @@ from typing import Any
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
 
 logger = logging.getLogger(__name__)
-
-_PREVIEW_BYTES = 80
 
 
 class _EntryFields(BaseModel):
@@ -161,9 +160,18 @@ class LineSkip:
     path: Path
     line: int
     """1-based; 0 when the whole file was skipped."""
+    offset: int
+    """Byte offset of the line's first byte in the file."""
+    length: int
+    """The line's length in bytes, without its newline. ``path``, ``offset`` and ``length``
+    find the line; nothing of it is copied here.
+
+    There is deliberately no preview. A line that cannot be parsed cannot be trusted to say
+    what it is: an ``api-request`` line cut off before its ``"type"`` arrives looks like any
+    other fragment, and its first bytes may be a raw request (issue #9)."""
     reason: str
-    preview: str
-    """The first bytes of the line, decoded leniently, enough to find it with ``grep``."""
+    """Why it was skipped. Built from the parser's own messages and field names, never from
+    the line's content."""
 
 
 @dataclass(frozen=True)
@@ -201,7 +209,6 @@ class TranscriptFile:
 
 # Lines that may carry a raw API request (issue #9). Their content is dropped on read.
 _PAYLOAD_TYPES = frozenset({"api-request", "api-request-blob"})
-_PAYLOAD_MARK = re.compile(rb'"type"\s*:\s*"api-request')
 
 # The types an entry must validate as. Any other type that does not fit is not corrupt.
 _CONVERSATIONAL = frozenset({"user", "assistant"})
@@ -241,28 +248,25 @@ def read_transcript(path: Path) -> TranscriptFile:
     unthreaded: list[Unthreaded] = []
     skips: list[LineSkip] = []
 
-    def skip(number: int, raw: bytes, reason: str) -> None:
-        # A broken api-request line is still a raw request: name it, show none of it.
-        if _PAYLOAD_MARK.search(raw):
-            preview = "(an api-request line; its bytes are not shown)"
-        else:
-            preview = raw[:_PREVIEW_BYTES].decode("utf-8", "replace")
-        skips.append(LineSkip(path=path, line=number, reason=reason, preview=preview))
-        logger.warning("%s:%d: skipped — %s", path, number, reason)
+    def skip(number: int, start: int, raw: bytes, reason: str) -> None:
+        skips.append(LineSkip(path=path, line=number, offset=start, length=len(raw), reason=reason))
+        logger.warning("%s:%d: skipped (%d bytes) — %s", path, number, len(raw), reason)
 
+    offset = 0
     for number, raw in enumerate(lines, start=1):
+        start, offset = offset, offset + len(raw) + 1
         if not raw.strip():
             continue
         try:
             parsed = json.loads(raw)
         except UnicodeDecodeError:
-            skip(number, raw, "not UTF-8")
+            skip(number, start, raw, "not UTF-8")
             continue
         except json.JSONDecodeError as exc:
-            skip(number, raw, f"not JSON ({exc.msg})")
+            skip(number, start, raw, f"not JSON ({exc.msg})")
             continue
         if not isinstance(parsed, dict):
-            skip(number, raw, f"a JSON {type(parsed).__name__}, not an object")
+            skip(number, start, raw, f"a JSON {type(parsed).__name__}, not an object")
             continue
         kind = parsed.get("type")
         kept: dict[str, Any] = {} if kind in _PAYLOAD_TYPES else parsed
@@ -281,7 +285,7 @@ def read_transcript(path: Path) -> TranscriptFile:
                 f"{'.'.join(str(p) for p in error['loc']) or 'line'}: {error['msg']}"
                 for error in exc.errors()
             )
-            skip(number, raw, f"not a transcript entry ({problems})")
+            skip(number, start, raw, f"not a transcript entry ({problems})")
             continue
         entries.append(
             TranscriptEntry(
@@ -295,6 +299,7 @@ def read_transcript(path: Path) -> TranscriptFile:
     if tail.strip():
         skip(
             len(lines) + 1,
+            offset,
             tail,
             "unterminated last line: pending, Claude Code may still be writing it",
         )
@@ -349,7 +354,7 @@ def load(paths: Iterable[Path]) -> Transcripts:
             files.append(read_transcript(path))
         except FileNotFoundError:
             reason = "file vanished before it was read"
-            vanished.append(LineSkip(path=path, line=0, reason=reason, preview=""))
+            vanished.append(LineSkip(path=path, line=0, offset=0, length=0, reason=reason))
             logger.warning("%s: skipped — %s", path, reason)
 
     def file_key(transcript: TranscriptFile) -> tuple[int, datetime | None, str]:
@@ -401,13 +406,15 @@ def load(paths: Iterable[Path]) -> Transcripts:
         return (not entry.is_sidechain, entry.timestamp, str(entry.path), entry.line)
 
     # Where each subagent started: the trunk entry carrying the spawn's structured result,
-    # ``toolUseResult.agentId``. The earliest wins if two claim one agent. An entry that is a
-    # member of that same agent (its own ``agentId``) is never its anchor.
+    # ``toolUseResult.agentId``. The earliest wins if two claim one agent. Sidechain entries
+    # are never anchors: that rules out an agent anchoring inside itself, and a nested
+    # spawn's result (claude-code-log says nested results carry no ``toolUseResult``
+    # anyway) beating the trunk's.
     anchors: dict[str, str] = {}
     for uuid in sorted(entries, key=lambda u: position(u)[1:]):
         result = entries[uuid].raw.get("toolUseResult")
         spawned = result.get("agentId") if isinstance(result, dict) else None
-        if isinstance(spawned, str) and spawned and entries[uuid].agent_id != spawned:
+        if isinstance(spawned, str) and spawned and not entries[uuid].is_sidechain:
             anchors.setdefault(spawned, uuid)
 
     parent_of: dict[str, str | None] = {}
