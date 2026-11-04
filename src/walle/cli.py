@@ -72,7 +72,10 @@ def rebuild_command(root: Path, principal: str, full: bool) -> None:
         )
 
     try:
-        state = walle_index.state_hash(resolve(walle_index.load_records(root, principal)))
+        # The rows this build committed, read before it released index.lock. Reading the
+        # index again here could already show another builder's work, and the hash would
+        # disagree with the counts printed above.
+        state = walle_index.state_hash(resolve(report.records))
     except ResolutionError as exc:
         raise click.ClickException(
             f"the index is up to date with the log, but the log does not fold: {exc}"

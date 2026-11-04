@@ -13,8 +13,13 @@ Every event here is synthetic: a made-up person's dinners and moves, no real dat
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -471,11 +476,11 @@ def test_a_cause_and_effect_written_mid_read_never_look_dangling(
         (cause,) = _write(tmp_path, "mbp", _obs("three"))
         _write(tmp_path, "phone", _assertion("four", caused_by=[cause]))
 
-    real = index_module.read_file
+    real = index_module.parse_stream
     started: list[threading.Thread] = []
 
-    def read_then_race(path: Path, stream: str) -> StreamContents:
-        contents = real(path, stream)
+    def read_then_race(data: bytes, path: Path, stream: str) -> StreamContents:
+        contents = real(data, path, stream)
         if stream == "d-mbp" and not started:
             thread = threading.Thread(target=writers)
             thread.start()
@@ -483,12 +488,12 @@ def test_a_cause_and_effect_written_mid_read_never_look_dangling(
             time.sleep(0.3)  # long enough for both appends, were they not blocked
         return contents
 
-    monkeypatch.setattr(index_module, "read_file", read_then_race)
+    monkeypatch.setattr(index_module, "parse_stream", read_then_race)
     report = update(tmp_path, P)
     started[0].join(timeout=10)
 
     assert report.added == ()
-    monkeypatch.setattr(index_module, "read_file", real)
+    monkeypatch.setattr(index_module, "parse_stream", real)
     assert update(tmp_path, P).added == ("d-mbp:2", "d-phone:2")
 
 
@@ -518,3 +523,274 @@ def test_walle_rebuild_fails_loudly_on_a_dangling_ref(tmp_path: Path) -> None:
     result = CliRunner().invoke(main, ["rebuild", "--root", str(tmp_path), "--principal", P])
     assert result.exit_code == 1
     assert "d-mbp:7" in result.output and "dangling" in result.output
+
+
+# --- task 6 follow-up (issue #25): readers, recovery, one lock per read ----------------
+
+_SLOW_BUILDER = r"""
+import sys
+import time
+from pathlib import Path
+
+import walle.index as ix
+
+root, ready, mode = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+real = ix._open_index
+
+
+def slow(*args, **kwargs):
+    opened = real(*args, **kwargs)
+    ready.write_text("the index file is open and nothing is committed yet")
+    time.sleep(1.0)  # a reader that does not wait sees this uncommitted file
+    return opened
+
+
+ix._open_index = slow
+(ix.rebuild if mode == "full" else ix.update)(root, "maya")
+"""
+
+
+@pytest.mark.parametrize("start", ["no index", "garbage index", "full rebuild"])
+def test_a_reader_during_a_fresh_build_gets_committed_state_or_waits(
+    tmp_path: Path, start: str
+) -> None:
+    """Issue #25.1. A second *process* builds while this one reads; the reader must see the
+    index before or after the commit, never the empty file in between."""
+    _write(tmp_path, "mbp", _obs("one"), _obs("two"))
+    before: set[tuple[str, ...]] = set()
+    if start == "garbage index":
+        index_path(tmp_path, P).write_bytes(b"not a database" * 100)
+    elif start == "full rebuild":
+        update(tmp_path, P)
+        before.add(("d-mbp:1", "d-mbp:2"))
+    _write(tmp_path, "phone", _obs("three"))
+    after = ("d-mbp:1", "d-mbp:2", "d-phone:1")
+
+    ready = tmp_path / "ready"
+    builder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            _SLOW_BUILDER,
+            str(tmp_path),
+            str(ready),
+            "full" if start == "full rebuild" else "update",
+        ]
+    )
+    try:
+        deadline = time.monotonic() + 20
+        while not ready.exists():
+            assert builder.poll() is None, "the builder exited before opening the index"
+            assert time.monotonic() < deadline, "the builder never opened the index"
+            time.sleep(0.01)
+        seen = tuple(r.ref for r in load_records(tmp_path, P))
+    finally:
+        assert builder.wait(timeout=20) == 0
+    assert seen in before | {after}
+
+
+def _corrupt_past_meta(root: Path) -> None:
+    """Overwrite the back half of the file: the header, sqlite_master and meta still read."""
+    path = index_path(root, P)
+    data = bytearray(path.read_bytes())
+    page = int.from_bytes(data[16:18], "big")
+    pages = len(data) // page
+    assert pages >= 8, "the fixture is too small to corrupt past meta"
+    for n in range(pages // 2, pages):
+        data[n * page : (n + 1) * page] = b"\xa5" * page
+    path.write_bytes(bytes(data))
+    with contextlib.closing(sqlite3.connect(path)) as db:
+        assert db.execute("SELECT value FROM meta").fetchone() == ("1",)
+        with pytest.raises(sqlite3.DatabaseError):
+            db.execute("SELECT count(*), max(length(data)) FROM events").fetchone()
+
+
+def _many(root: Path) -> None:
+    _history(root)
+    _write(
+        root, "tab", *(_obs(f"Dinner {n}: rajma, rice and a long note. " * 8) for n in range(60))
+    )
+
+
+@pytest.mark.parametrize("damage", ["drop events", "drop edges", "drop streams", "drop events_fts"])
+def test_walle_rebuild_full_recovers_a_dropped_table(tmp_path: Path, damage: str) -> None:
+    """Issue #25.2. The recovery command must always rebuild from the log (constraint 5)."""
+    _history(tmp_path)
+    update(tmp_path, P)
+    with contextlib.closing(sqlite3.connect(index_path(tmp_path, P))) as db:
+        db.execute(f"DROP TABLE {damage.removeprefix('drop ')}")
+        db.commit()
+
+    full = CliRunner().invoke(
+        main, ["rebuild", "--root", str(tmp_path), "--principal", P, "--full"]
+    )
+
+    assert full.exit_code == 0, full.output
+    assert f"resolved state: {_log_state(tmp_path)}" in full.output
+    assert _index_state(tmp_path) == _log_state(tmp_path)
+
+
+def test_walle_rebuild_full_recovers_an_index_corrupted_past_meta(tmp_path: Path) -> None:
+    _many(tmp_path)
+    update(tmp_path, P)
+    _corrupt_past_meta(tmp_path)
+
+    full = CliRunner().invoke(
+        main, ["rebuild", "--root", str(tmp_path), "--principal", P, "--full"]
+    )
+
+    assert full.exit_code == 0, full.output
+    assert f"resolved state: {_log_state(tmp_path)}" in full.output
+    assert _index_state(tmp_path) == _log_state(tmp_path)
+
+
+@pytest.mark.parametrize("table", ["events", "edges", "streams", "events_fts"])
+def test_an_index_missing_a_table_is_not_trusted(tmp_path: Path, table: str) -> None:
+    """The incremental path and readers check every table, not only ``meta``."""
+    _history(tmp_path)
+    update(tmp_path, P)
+    with contextlib.closing(sqlite3.connect(index_path(tmp_path, P))) as db:
+        db.execute(f"DROP TABLE {table}")
+        db.commit()
+
+    with pytest.raises(StaleIndexError, match=table):
+        load_records(tmp_path, P)
+    report = update(tmp_path, P)
+    assert report.full and table in report.reason
+    assert _index_state(tmp_path) == _log_state(tmp_path)
+
+
+def test_a_stream_is_locked_only_once_per_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #25.3. A second ``LOCK_SH`` through another ``open()`` can queue behind a
+    waiting ``LOCK_EX`` on some kernels, and the first one is never released: deadlock."""
+    _history(tmp_path)
+    streams = {f.stat().st_ino: f.stem for f in log_dir(tmp_path, P).glob("*.jsonl")}
+    shared: list[str] = []
+    real = fcntl.flock
+
+    def counting(fd: int, operation: int) -> None:
+        if operation == fcntl.LOCK_SH and os.fstat(fd).st_ino in streams:
+            shared.append(streams[os.fstat(fd).st_ino])
+        real(fd, operation)
+
+    monkeypatch.setattr(fcntl, "flock", counting)
+    for build in (update, update, rebuild):
+        shared.clear()
+        build(tmp_path, P)
+        assert sorted(shared) == ["d-mbp", "d-phone"]
+
+
+def test_read_paths_open_the_index_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #25.4. Task 15 reads under a read-only profile: ``mode=ro``, never ``rw``."""
+    _history(tmp_path)
+    update(tmp_path, P)
+    opened: list[str] = []
+    real = sqlite3.connect
+
+    def spy(database: str | Path, *args: object, **kwargs: object) -> sqlite3.Connection:
+        opened.append(str(database))
+        return real(database, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(sqlite3, "connect", spy)
+    load_records(tmp_path, P)
+    assert opened
+    assert all(uri.startswith("file:") and uri.endswith("?mode=ro") for uri in opened), opened
+
+
+@pytest.mark.parametrize("lock", ["lock file present", "lock file absent"])
+def test_read_paths_work_on_a_read_only_profile(tmp_path: Path, lock: str) -> None:
+    _history(tmp_path)
+    update(tmp_path, P)
+    expected = _log_state(tmp_path)
+    folder = index_path(tmp_path, P).parent
+    lock_file = folder / "index.lock"
+    if lock == "lock file absent":
+        lock_file.unlink()
+    frozen = [p for p in (index_path(tmp_path, P), lock_file) if p.exists()]
+    for path in frozen:
+        path.chmod(0o444)
+    folder.chmod(0o555)
+    try:
+        probe = folder / "probe"
+        with contextlib.suppress(PermissionError):
+            probe.touch()
+            probe.unlink()
+            pytest.skip("this process can write a 0o555 folder (root or CAP_DAC_OVERRIDE)")
+        assert _index_state(tmp_path) == expected
+        assert sorted(p.name for p in folder.iterdir()) == sorted(
+            ["index.sqlite", "log", *(["index.lock"] if lock_file in frozen else [])]
+        )
+    finally:
+        folder.chmod(0o755)
+        for path in frozen:
+            path.chmod(0o644)
+
+
+def test_walle_rebuild_prints_the_hash_of_what_it_built(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #25.5. Another builder landing between this build and its hash must not make
+    the printed hash disagree with the printed counts."""
+    _history(tmp_path)
+    built = _log_state(tmp_path)
+    real = index_module.update
+
+    def then_another_builder(root: Path, principal: str) -> IndexReport:
+        report = real(root, principal)
+        _write(root, "phone", _assertion("Likes chai, written and indexed by someone else"))
+        real(root, principal)
+        return report
+
+    monkeypatch.setattr(index_module, "update", then_another_builder)
+    result = CliRunner().invoke(main, ["rebuild", "--root", str(tmp_path), "--principal", P])
+
+    assert result.exit_code == 0, result.output
+    assert "6 events" in result.output
+    assert f"resolved state: {built}" in result.output
+
+
+def test_walle_rebuild_prints_the_index_hash_so_drift_shows(tmp_path: Path) -> None:
+    """The printed hash is folded from the index rows, not from the log just read: an old row
+    that drifted shows as a hash that differs from the log's until ``--full``."""
+    _history(tmp_path)
+    update(tmp_path, P)
+    with contextlib.closing(sqlite3.connect(index_path(tmp_path, P))) as db:
+        (data,) = db.execute("SELECT data FROM events WHERE ref = 'd-phone:1'").fetchone()
+        db.execute(
+            "UPDATE events SET data = ? WHERE ref = 'd-phone:1'",
+            (data.replace("Lives in Pune", "Lives in Mumbai"),),
+        )
+        db.commit()
+    args = ["rebuild", "--root", str(tmp_path), "--principal", P]
+
+    drifted = CliRunner().invoke(main, args)
+    assert drifted.exit_code == 0, drifted.output
+    assert f"resolved state: {_index_state(tmp_path)}" in drifted.output
+    assert _log_state(tmp_path) not in drifted.output
+
+    full = CliRunner().invoke(main, [*args, "--full"])
+    assert f"resolved state: {_log_state(tmp_path)}" in full.output
+
+
+def test_a_reader_that_cannot_lock_reports_its_own_error(tmp_path: Path) -> None:
+    """No lock file, a read-only folder and no index: the error is "no index yet", and it
+    does not arrive chained to the lock file's EACCES as if one caused the other."""
+    _write(tmp_path, "mbp", _obs("one"))
+    folder = index_path(tmp_path, P).parent
+    folder.chmod(0o555)
+    try:
+        probe = folder / "probe"
+        with contextlib.suppress(PermissionError):
+            probe.touch()
+            probe.unlink()
+            pytest.skip("this process can write a 0o555 folder (root or CAP_DAC_OVERRIDE)")
+        with pytest.raises(FileNotFoundError, match="no index yet") as caught:
+            load_records(tmp_path, P)
+        assert caught.value.__context__ is None
+        assert not (folder / "index.lock").exists()
+    finally:
+        folder.chmod(0o755)

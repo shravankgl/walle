@@ -48,41 +48,63 @@ B, having seen it, appends ``d-phone:2`` with ``caused_by: [d-mbp:4]``.
 2. R lists the log and takes ``LOCK_SH`` on **every** stream file, then lists again. If a new
    stream appeared meanwhile it drops the locks and starts over.
 3. While R holds them, A's ``LOCK_EX`` on ``d-mbp`` blocks, and B cannot append either. R
-   reads every stream. What it has is a single cut. Either ``d-mbp:4`` was already written,
+   reads every stream through the handle it locked, so each stream is locked once: a second
+   ``open`` and ``LOCK_SH`` could queue behind A's waiting ``LOCK_EX`` on kernels that put new
+   shared locks behind a queued writer, while R's first lock keeps A waiting forever. What R
+   has is a single cut. Either ``d-mbp:4`` was already written,
    and R sees it, or it was not, and then B, which only cites what it has seen, cannot have
    written ``d-phone:2`` yet.
 4. R drops the stream locks, so A and B continue, and checks the cut for dangling refs and
    future versions without touching the index.
-5. R writes the new rows and tracking records in one SQLite transaction and commits. A reader
-   of the index sees the state before or after, never between.
+5. R writes the new rows and tracking records in one SQLite transaction and commits. For a
+   fresh index (none yet, an unusable one, or ``rebuild``) R first deletes the old file and
+   creates an empty one; between that and the commit the file is empty. R reads its own
+   committed rows back for the report, still under the lock.
 6. R drops ``index.lock``. R2 now reads the log, which is a superset of R's cut because the
    log only grows, and finds R's tracking records already there.
+
+A reader Q (``load_records``) runs while R builds a fresh index.
+
+1. Q takes ``index.lock`` **shared**. If R holds it, Q waits; if Q got it first, R's
+   exclusive lock waits for Q, so R cannot delete or empty a file Q is reading.
+2. Q, holding it, finds the file, opens it ``mode=ro``, checks the schema and reads every row.
+3. Q drops the lock. What it read is the state before R started or after R committed.
+
+Without step 1, Q can arrive in R's step 5 between "empty file created" and "commit", see no
+tables and raise ``StaleIndexError``, telling the user to rebuild an index that is being
+rebuilt. ``test_a_reader_during_a_fresh_build_gets_committed_state_or_waits`` stages that
+with a second process. Readers share the lock, so they never wait for each other.
 
 Reading each stream under its own short lock instead (``read_stream`` one at a time) fails
 step 3. R reads ``d-mbp`` up to 3, A and B both append, R reads ``d-phone`` including seq 2,
 and the build fails on a "dangling" ref to an event that exists. The status would lie.
 ``test_a_cause_and_effect_written_mid_read_never_look_dangling`` stages that race.
 
-Lock order is always ``index.lock``, then stream files (shared), then SQLite. Writers take one
-stream lock and nothing else, so no cycle exists.
+Lock order is always ``index.lock``, then stream files (shared), then SQLite. Readers take
+``index.lock`` (shared), then SQLite. Writers take one stream lock and nothing else, so no
+cycle exists. ``flock`` locks belong to an open file, not a process, so code holding
+``index.lock`` must not call ``load_records``: the second open of the lock would wait for
+the first.
 """
 
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
+import os
 import sqlite3
 import sys
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from walle import __version__
 from walle.events import AnyEvent, FutureSchemaError, content_hash, make_ref, parse_event, parse_ref
 from walle.paths import STREAM_SUFFIX, index_lock_path, index_path, log_dir
-from walle.reader import CorruptStreamError, Record, Skip, StreamContents, read_file
+from walle.reader import CorruptStreamError, Record, Skip, StreamContents, parse_stream
 from walle.writer import encode
 
 if TYPE_CHECKING:  # annotations only: the index stores records, it does not fold them
@@ -160,6 +182,11 @@ class IndexReport:
     skips: tuple[tuple[str, Skip], ...]
     """``(stream, skip)`` for every line the reader skipped (D80). Reported, not indexed."""
 
+    records: tuple[Record, ...] = field(repr=False)
+    """The index's rows as this build committed them, read back before ``index.lock`` was
+    released. What ``events`` counts, and what to fold for this build's resolved state:
+    ``load_records`` afterwards may already include another builder's work."""
+
 
 # --- public -----------------------------------------------------------------------------
 
@@ -174,7 +201,12 @@ def update(root: Path, principal: str) -> IndexReport:
 
 
 def rebuild(root: Path, principal: str) -> IndexReport:
-    """Discard every row and index the log from nothing. The rebuild test (D10)."""
+    """Discard the index file and index the log from nothing. The rebuild test (D10).
+
+    The old file is deleted, not reused, so this works on an index that is damaged anywhere,
+    including past ``meta``: it is the recovery command and must always succeed from the log
+    (hard constraint 5). It never reads the old rows.
+    """
     return _build(Path(root), principal, full=True)
 
 
@@ -183,19 +215,21 @@ def load_records(root: Path, principal: str) -> tuple[Record, ...]:
 
     Says nothing about freshness: this is what the index holds, which may be behind the log.
     A missing index raises ``FileNotFoundError``, because no index must not read as no history.
+
+    Holds ``index.lock`` shared for the whole read, so a builder in progress is waited out
+    and the rows are the state before or after its commit, never a file it has just created
+    or emptied. Opens the file ``mode=ro`` and needs no write access anywhere (task 15).
     """
-    path = index_path(Path(root), principal)
-    if not path.is_file():
-        raise FileNotFoundError(f"{path}: no index yet. Run `walle rebuild`.")
-    reason = _unusable(path)
-    if reason is not None:
-        raise StaleIndexError(f"{path}: {reason}. Run `walle rebuild`.")
-    with contextlib.closing(_connect(path, create=False)) as db:
-        rows = db.execute("SELECT ref, seq, line, data FROM events ORDER BY stream, seq")
-        return tuple(
-            Record(ref=ref, seq=seq, event=parse_event(json.loads(data)), line=line)
-            for ref, seq, line, data in rows
-        )
+    root = Path(root)
+    path = index_path(root, principal)
+    with _shared(index_lock_path(root, principal)):
+        if not path.is_file():
+            raise FileNotFoundError(f"{path}: no index yet. Run `walle rebuild`.")
+        with contextlib.closing(_connect(path, mode="ro")) as db:
+            reason = _check(db)
+            if reason is not None:
+                raise StaleIndexError(f"{path}: {reason}. Run `walle rebuild`.")
+            return _rows(db)
 
 
 def state_hash(resolution: Resolution) -> str:
@@ -248,27 +282,23 @@ def _build(root: Path, principal: str, *, full: bool) -> IndexReport:
         if dangling:
             raise DanglingRefError(dangling, log)
 
-        conn, fresh_reason = _open_index(path)
+        conn, fresh_reason = _open_index(path, full=full)
         with contextlib.closing(conn):
-            if fresh_reason is not None:
-                reason: str | None = fresh_reason
-            elif full:
-                reason = "a full rebuild was asked for"
-            else:
-                reason = _disagreement(conn, cut)
+            reason = fresh_reason if fresh_reason is not None else _disagreement(conn, cut)
             tracked = {} if reason is not None else _tracked(conn)
             new = tuple(r for c in cut for r in c.records if r.seq > tracked.get(c.stream, 0))
             _write(conn, path, new, fresh=fresh_reason is not None, wipe=reason is not None)
-            total: int = conn.execute("SELECT count(*) FROM events").fetchone()[0]
+            committed = _rows(conn)  # still under index.lock: exactly what this build left
 
     return IndexReport(
         path=path,
         full=reason is not None,
         reason=reason or "incremental",
         added=tuple(r.ref for r in new),
-        events=total,
+        events=len(committed),
         streams=tuple(c.stream for c in cut),
         skips=tuple((c.stream, skip) for c in cut for skip in c.skips),
+        records=committed,
     )
 
 
@@ -279,6 +309,43 @@ def _exclusive(lock: Path) -> Iterator[None]:
         fcntl.flock(f.fileno(), fcntl.LOCK_EX)
         yield
         # The lock goes with close.
+
+
+_CANNOT_CREATE = frozenset({errno.EACCES, errno.EPERM, errno.EROFS, errno.ENOENT})
+
+
+def _open_for_shared_lock(lock: Path) -> int | None:
+    """``index.lock`` opened read-only, created if need be, or ``None`` if it cannot be."""
+    try:
+        return os.open(lock, os.O_RDONLY | os.O_CLOEXEC)
+    except FileNotFoundError:
+        pass
+    try:
+        return os.open(lock, os.O_RDONLY | os.O_CREAT | os.O_CLOEXEC, 0o644)
+    except OSError as exc:
+        if exc.errno in _CANNOT_CREATE:
+            return None
+        raise
+
+
+@contextlib.contextmanager
+def _shared(lock: Path) -> Iterator[None]:
+    """Hold ``index.lock`` shared while reading the index: wait for a builder, not a reader.
+
+    Opened read-only, so a read-only lock file or folder is fine. If the lock file does not
+    exist and cannot be created (a read-only or missing folder), the read goes ahead
+    unlocked: a builder must create that same file before it touches the index, so a builder
+    sharing this view of the folder cannot be running either.
+    """
+    fd = _open_for_shared_lock(lock)
+    if fd is None:
+        yield
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH)
+        yield
+    finally:
+        os.close(fd)  # the lock goes with it
 
 
 def _stream_files(log: Path) -> list[Path]:
@@ -300,23 +367,25 @@ def _read_cut(log: Path) -> tuple[StreamContents, ...]:
     for _ in range(_CUT_ATTEMPTS):
         files = _stream_files(log)
         with contextlib.ExitStack() as held:
+            handles = []
             for path in files:
                 f = held.enter_context(open(path, "rb"))
                 fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                handles.append((path, f))
             if _stream_files(log) != files:
                 continue  # a stream appeared while locking; it is not in this cut
-            return tuple(sorted((_read_one(p) for p in files), key=lambda c: c.stream))
+            # Read through the handle that holds the lock. Each stream is locked once.
+            cut = [_read_one(path, f.read()) for path, f in handles]
+            return tuple(sorted(cut, key=lambda c: c.stream))
     raise RuntimeError(
         f"{log}: new streams kept appearing while taking a consistent read. Nothing was "
         "indexed; run it again."
     )
 
 
-def _read_one(path: Path) -> StreamContents:
+def _read_one(path: Path, data: bytes) -> StreamContents:
     try:
-        # A second LOCK_SH from this process on a file it already share-locks is granted at
-        # once; a writer waiting for LOCK_EX does not queue ahead of it.
-        return read_file(path, path.stem)
+        return parse_stream(data, path, path.stem)
     except (FutureSchemaError, CorruptStreamError) as exc:
         exc.add_note(f"found in {path} by walle {__version__}; the index was not changed")
         raise
@@ -338,25 +407,29 @@ def _dangling(cut: tuple[StreamContents, ...]) -> tuple[tuple[str, str], ...]:
 # --- the file ---------------------------------------------------------------------------
 
 
-def _connect(path: Path, *, create: bool) -> sqlite3.Connection:
-    # Autocommit, with explicit BEGIN/COMMIT below: the module's implicit transactions would
-    # commit around DDL behind our back. ``mode=rw`` never creates a file that is not there.
-    if create:
-        return sqlite3.connect(path, isolation_level=None, timeout=_BUSY_TIMEOUT_S)
-    uri = f"{path.resolve().as_uri()}?mode=rw"
+def _connect(path: Path, *, mode: Literal["rwc", "rw", "ro"]) -> sqlite3.Connection:
+    """``rwc`` creates the file, ``rw`` (builders) never does, ``ro`` (readers) never writes.
+
+    Autocommit, with explicit BEGIN/COMMIT below: the module's implicit transactions would
+    commit around DDL behind our back.
+    """
+    uri = f"{path.resolve().as_uri()}?mode={mode}"
     return sqlite3.connect(uri, uri=True, isolation_level=None, timeout=_BUSY_TIMEOUT_S)
 
 
-def _unusable(path: Path) -> str | None:
-    """Why ``path`` is not an index this build can use, or ``None`` if it is."""
+def _check(db: sqlite3.Connection) -> str | None:
+    """Why the open file is not an index this build can use, or ``None`` if it is.
+
+    Looks at the schema only: ``meta``, then every table. Damage inside a table's pages is
+    not found here; ``rebuild`` never reads the old rows, so it recovers from that too.
+    """
     try:
-        with contextlib.closing(_connect(path, create=False)) as db:
-            names = {row[0] for row in db.execute("SELECT name FROM sqlite_master")}
-            if not names:
-                return "the index file is empty"
-            if "meta" not in names:
-                return "not a walle index"
-            row = db.execute("SELECT value FROM meta WHERE key = 'index_schema'").fetchone()
+        names = {row[0] for row in db.execute("SELECT name FROM sqlite_master")}
+        if not names:
+            return "the index file is empty"
+        if "meta" not in names:
+            return "not a walle index"
+        row = db.execute("SELECT value FROM meta WHERE key = 'index_schema'").fetchone()
     except sqlite3.DatabaseError as exc:
         # Busy is not broken. ``OperationalError: database is locked`` is a DatabaseError too,
         # and treating it as "unreadable" would delete a good index over a timeout.
@@ -366,7 +439,30 @@ def _unusable(path: Path) -> str | None:
     found = row[0] if row else "unknown"
     if found != str(INDEX_SCHEMA):
         return f"index schema {found}, this build writes {INDEX_SCHEMA}"
+    missing = [table for table in _TABLES if table not in names]
+    if missing:
+        return f"the index is missing table(s): {', '.join(missing)}"
     return None
+
+
+def _unusable(path: Path) -> str | None:
+    """``_check`` on the file at ``path``, for a builder (``mode=rw``)."""
+    try:
+        db = _connect(path, mode="rw")
+    except sqlite3.DatabaseError as exc:
+        if exc.sqlite_errorname in _BUSY:
+            raise
+        return f"the index file is unreadable ({exc})"
+    with contextlib.closing(db):
+        return _check(db)
+
+
+def _rows(db: sqlite3.Connection) -> tuple[Record, ...]:
+    rows = db.execute("SELECT ref, seq, line, data FROM events ORDER BY stream, seq")
+    return tuple(
+        Record(ref=ref, seq=seq, event=parse_event(json.loads(data)), line=line)
+        for ref, seq, line, data in rows
+    )
 
 
 def _remove(path: Path) -> None:
@@ -379,16 +475,23 @@ def _remove(path: Path) -> None:
         leftover.unlink(missing_ok=True)
 
 
-def _open_index(path: Path) -> tuple[sqlite3.Connection, str | None]:
-    """A connection to the index, and why it is starting from an empty file (``None`` if not)."""
+def _open_index(path: Path, *, full: bool) -> tuple[sqlite3.Connection, str | None]:
+    """A connection to the index, and why it is starting from an empty file (``None`` if not).
+
+    ``full`` always starts from an empty file. Reusing the old one would mean reading and
+    deleting its rows, and a file damaged past ``meta`` fails exactly there. Readers wait on
+    ``index.lock`` (``load_records``), so none has the old file open while it is removed.
+    """
     if not path.exists():
         reason: str | None = "no index yet"
     else:
         reason = _unusable(path)
         if reason is None:
-            return _connect(path, create=False), None
+            if not full:
+                return _connect(path, mode="rw"), None
+            reason = "a full rebuild was asked for"
         _remove(path)
-    return _connect(path, create=True), reason
+    return _connect(path, mode="rwc"), reason
 
 
 def _tracked(conn: sqlite3.Connection) -> dict[str, int]:
