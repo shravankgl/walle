@@ -52,6 +52,6 @@
     "d-phone:3.valid_to": "2026-12-01",
     "d-phone:4.valid_to": "2026-07-15",
     "d-phone:9.summary": "Learning Marathi",
-    "d-phone:9.v": 1
+    "d-phone:9.valid_from": "2026-10-01"
   }
 }

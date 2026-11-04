@@ -28,7 +28,7 @@ Issue #15. Branch `task/24`, from `main` at `9cc5bf0`. Test-only: no file under 
   - `state_hash`, the hash of the resolved state (`ebf47084…1b05`);
   - `fold`, the refs in `current`, `retired`, `conflicts`, `unapplied` and `staged`;
   - 28 `sentinels`, mapping dotted paths to values (`"d-mbp:10.forgets.1": "d-mbp:3"`). They
-    cover every optional field the fixture sets.
+    cover every optional field the fixture sets. None of them pins `v` (see Review).
 - `tests/test_golden.py`, the compatibility check. It finds every `tests/fixtures/v<N>/*/`
   with an `__expected__.json` and copies each to `tmp_path`, so the repo copy is never written.
   It then checks:
@@ -41,10 +41,15 @@ Issue #15. Branch `task/24`, from `main` at `9cc5bf0`. Test-only: no file under 
   It also guards the set of fixtures:
   - at least one exists;
   - each holds only its log and `__expected__.json`, with no index or lock;
-  - every event in `vN/` carries `v == N`;
-  - every type in `EVENT_TYPES` has a fixture at every version from 1 to its
-    `SCHEMA_VERSION`, so a schema bump that ships without a frozen log of the old shape
-    fails here.
+  - every event in `vN/` carries a raw on-disk `v` from 1 to `min(N, its type's
+    SCHEMA_VERSION)`, and at least one is at `N` (`version_failures`);
+  - every type in `EVENT_TYPES` has a fixture under `vK/` holding it at raw `v == K`, for
+    every `K` from 1 to its `SCHEMA_VERSION` (`coverage_gaps`). A schema bump that ships
+    without a frozen log of the new shape fails here.
+  - no sentinel pins `v`.
+
+  Versions are read from the raw JSON lines (`_raw`), not from loaded events, because the
+  upcast chain rewrites `v` to the current version on load.
 
 **Why:** D88 says old events must always load. It asks for golden logs per shipped schema
 version, sentinels mapping dotted paths to values so that *silent* data loss is caught and not
@@ -70,9 +75,10 @@ catches what it is for:
 instead of passing quietly.
 
 Checks, on the final tree:
-- `uv run pytest`: 932 passed, 5 skipped (main was 920 passed, 5 skipped; 12 new).
+- `uv run pytest`: 949 passed, 5 skipped (after the merge of main, 946 passed before the
+  review fixes; 3 new tests, 15 in `test_golden.py`).
 - `uv run ruff check`: All checks passed!
-- `uv run ruff format --check`: 75 files already formatted.
+- `uv run ruff format --check`: 77 files already formatted.
 - `uv run pyright`: 0 errors, 0 warnings, 0 informations.
 
 The tests do not assume root. They also pass with the fixture tree made read-only
@@ -99,15 +105,50 @@ float does not pass for an int.
 **Review:** none before the PR. Under R6 the reviewer agent reviews this PR's head and sets
 `agent-review`. The author does not run `scripts/review.sh` and never sets that status.
 
+*Round 1* (`walle-reviewer`, Gemini, direct diff review of `31fd32e`, since `ocr` could not
+install): `agent-review` failure, two medium findings, no high. Both were right.
+- **Medium 1: the version checks read `v` after the upcast.** `_from_log` goes through
+  `parse_event`, and `Event._upcast` rewrites `v` to `SCHEMA_VERSION`. On the first bump the
+  frozen `v1/` log would have read as v2, so the old tests failed in two ways. I confirmed
+  both by running the old file with `proposal` bumped. The directory test failed, and the
+  coverage test reported `proposal v1 under tests/fixtures/v1/` as missing, which is false.
+  The old directory rule (`v == N` for every event) also made a `v2/` log citing any unbumped
+  type impossible. Fixed: `_raw` reads the JSON lines as written. `version_failures` allows
+  raw `1 <= v <= min(N, SCHEMA_VERSION)` with at least one event at `N`. `coverage_gaps`
+  counts raw versions.
+- **Medium 2: the sentinel `"d-phone:9.v": 1` pinned the post-upcast version.** It would
+  have forced an edit to the frozen `__expected__.json` on a proposal bump. Fixed: replaced
+  with `"d-phone:9.valid_from": "2026-10-01"`. The fixture test now refuses any sentinel
+  whose field is `v`. This changes `__expected__.json` before the fixture has ever merged,
+  so nothing frozen was edited.
+- **New tests.** These simulate a later build by monkeypatching `proposal` to
+  `SCHEMA_VERSION = 2` with a no-op upcaster:
+  - `test_a_schema_bump_needs_no_edit_to_the_v1_fixture` checks that the `v1/maya` log loads
+    as v2, the raw version check passes, and every sentinel, the fold and the hash hold. I
+    wrote it first. Before the sentinel fix it failed with
+    `d-phone:9.v: 2 after the rebuild, expected 1`.
+  - `test_a_schema_bump_without_a_v2_golden_log_is_caught` checks that exactly
+    `proposal v2 under tests/fixtures/v2/` is reported.
+  - `test_a_vn_fixture_may_hold_older_versions_but_not_newer_ones` uses a `v2/` copy in
+    `tmp_path`. With only v1 events it reports `no event at v2`. With one event at v2 whose
+    type is still v1, it reports that the event is newer than the build.
+
+Round 1 stranger pass: `_raw` fails loudly with `KeyError` or `JSONDecodeError` on a line
+with no `seq` or a torn line. That is right for a golden log, which the rebuild test already
+requires to have no skips. The monkeypatch is undone after each test, and the full suite
+passes with the bump tests in it.
+
 **Choices made inside the task:**
 - **`tests/fixtures/v1/`, not D88's `tests/baselines/vN/`.** PLAN §9 and the issue name
   `tests/fixtures/v1/`, and CLAUDE.md's layout puts golden logs in `tests/fixtures/`. PLAN is
   the newer synthesized view of the same decision, and the directory name does not change what
   D88 asks for. I did not treat this as disagreeing with D88.
-- **What `vN` means, given D96's per-type versions.** A fixture under `vN/` holds events at
-  `v == N`, and every type needs a fixture at every version it has had. Another option was a
-  global "release N" counter, but walle has no tagged release yet (see below). This reading is
-  the one a test can enforce today.
+- **What `vN` means, given D96's per-type versions.** A fixture under `vN/` holds events up
+  to `v == N`, with at least one at `N`. Older events are allowed because a v2 event can cite
+  a v1 one of another type. Every type needs a fixture holding it at `v == K` under `vK/`
+  for every version `K` it has had. (Before review round 1, every event had to be exactly
+  `v == N`; see Review.) Another option was a global "release N" counter, but walle has no
+  tagged release yet (see below). This reading is the one a test can enforce today.
 - **The checker lives in the test file, not in `src/`.** Nothing in the product needs it, and
   putting it in `src/walle` would ship test code in the wheel.
 - **No generator script is committed.** A golden log is written once and never regenerated.
@@ -131,6 +172,15 @@ the type and version coverage test, which is what makes a future v2 bump carry a
 - Nothing stops someone from editing a golden log together with its `__expected__.json`. A
   checksum file would be just as editable. The protection is that `tests/fixtures/v*/` changes
   are visible in review. A CODEOWNERS entry for `tests/fixtures/v*/` would make that explicit.
+- **A bump of `assertion` will move every golden `state_hash`, even with a no-op
+  upcaster.** I checked this with a probe. `content_hash` hashes `canonical_json`, which
+  includes `v`, and `state_hash` hashes current and retired assertions by content hash. So
+  the first `assertion` upcaster breaks
+  `test_rebuild_over_every_fixture_equals_its_hash` on `v1/maya` unless the frozen hash is
+  edited. That is the same problem as medium 2, but in `src/walle/events.py` (D66), not in
+  this task's tests. There are two possible fixes: exclude `v` from the content hash, or
+  hash the upcast form and accept that the hash moves on a bump. Either one changes D66's
+  hash and every stored hash, so it needs a decision from Shravan. It is not done here.
 - D88's rule that test names carry the last version where a structure existed only bites at
   the first upcaster. There is nothing to name yet.
 

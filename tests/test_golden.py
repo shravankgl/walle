@@ -22,9 +22,16 @@ and nothing derived, plus ``__expected__.json``:
                covers assertions, so an observation that quietly lost a field, or a field the
                fold never reads, would leave it unchanged (D88).
 
-``vN`` names the event schema version the fixture's events carry (D96 versions each type).
-Every type this build knows needs a fixture at every version up to its current one, so a
-bump that ships without a golden log for the old shape fails here.
+``vN`` names the newest event schema version the fixture's events carry. D96 versions each
+type on its own, so a ``vN/`` log may also hold older events (a v2 assertion citing a v1
+observation), but none newer than ``N``. Every type this build knows needs a fixture under
+``vK/`` holding it at ``v == K``, for every ``K`` up to its current version, so a bump that
+ships without a golden log for the new shape fails here, and the old ``v1/`` log keeps
+proving the old shape still loads.
+
+Versions are read from the raw JSON lines, never from loaded events: the upcast chain
+rewrites ``v`` to the current version on load, so a loaded event always reports this
+build's version, not the one on disk. For the same reason a sentinel may not pin ``v``.
 
 A fixture is copied to ``tmp_path`` before anything runs, so the repo copy is never written
 to and the suite needs no write access to it.
@@ -80,6 +87,62 @@ def _from_log(root: Path, principal: str) -> list[Record]:
     """Every record read straight from the JSONL, no index involved."""
     log = log_dir(root, principal)
     return [r for f in sorted(log.glob("*.jsonl")) for r in read_file(f, f.stem).records]
+
+
+def _raw(fixture: Path) -> list[tuple[str, dict[str, Any]]]:
+    """Every event as written on disk, before any upcast: ``(ref, json)``."""
+    log = log_dir(fixture, _expected(fixture)["principal"])
+    return [
+        (f"{f.stem}:{data['seq']}", data)
+        for f in sorted(log.glob("*.jsonl"))
+        for line in f.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+        for data in [json.loads(line)]
+    ]
+
+
+def _dir_version(fixture: Path) -> int:
+    return int(fixture.parent.name.removeprefix("v"))
+
+
+def version_failures(fixture: Path) -> list[str]:
+    """One line per way the on-disk ``v`` values do not fit the fixture's ``vN/`` directory.
+
+    Each event's raw ``v`` must be at least 1 and at most ``N`` and its type's current
+    version; at least one event must be at ``N``, or the log belongs under a lower ``vN/``.
+    """
+    n = _dir_version(fixture)
+    failures = []
+    raw = _raw(fixture)
+    for ref, data in raw:
+        v, kind = data.get("v", 1), data.get("type")
+        known = EVENT_TYPES[kind].SCHEMA_VERSION if kind in EVENT_TYPES else None
+        if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+            failures.append(f"{ref}: v must be a positive integer, got {v!r}")
+        elif known is None:
+            failures.append(f"{ref}: unknown event type {kind!r}")
+        elif v > n:
+            failures.append(f"{ref}: {kind} v{v} is newer than its directory v{n}")
+        elif v > known:
+            failures.append(f"{ref}: {kind} v{v} is newer than this build's v{known}")
+    if not any(data.get("v", 1) == n for _, data in raw):
+        failures.append(f"no event at v{n}")
+    return failures
+
+
+def coverage_gaps(fixtures: list[Path]) -> list[str]:
+    """Each ``(type, version)`` this build knows that no ``v<version>/`` fixture holds on disk."""
+    seen = {
+        (data.get("type"), data.get("v", 1), fixture.parent.name)
+        for fixture in fixtures
+        for _, data in _raw(fixture)
+    }
+    return [
+        f"{name} v{v} under tests/fixtures/v{v}/"
+        for name, cls in sorted(EVENT_TYPES.items())
+        for v in range(1, cls.SCHEMA_VERSION + 1)
+        if (name, v, f"v{v}") not in seen
+    ]
 
 
 def _fold(records: list[Record] | tuple[Record, ...]) -> dict[str, list[str]]:
@@ -138,17 +201,8 @@ def test_there_are_golden_fixtures() -> None:
 
 
 def test_every_event_type_has_a_golden_log_at_every_version_it_has_shipped() -> None:
-    """A schema bump without a frozen log of the old shape is the hole D88 closes."""
-    seen: set[tuple[str, int, str]] = set()
-    for fixture in GOLDEN:
-        for record in _from_log(fixture, _expected(fixture)["principal"]):
-            seen.add((record.event.type, record.event.v, fixture.parent.name))
-    missing = [
-        f"{name} v{v} under tests/fixtures/v{v}/"
-        for name, cls in sorted(EVENT_TYPES.items())
-        for v in range(1, cls.SCHEMA_VERSION + 1)
-        if (name, v, f"v{v}") not in seen
-    ]
+    """A schema bump without a frozen log of the new shape is the hole D88 closes."""
+    missing = coverage_gaps(GOLDEN)
     assert not missing, "no golden log for: " + ", ".join(missing)
 
 
@@ -158,6 +212,8 @@ def test_a_fixture_holds_a_log_and_its_expectations_and_nothing_derived(fixture:
     assert set(expected) == EXPECTED_KEYS
     assert set(expected["fold"]) == FOLD_KEYS
     assert expected["sentinels"], "a fixture with no sentinels cannot catch silent data loss"
+    pinned_v = [p for p in expected["sentinels"] if p.split(".")[1:] == ["v"]]
+    assert not pinned_v, f"{pinned_v}: v is rewritten by the upcast chain, pin a field instead"
     principal = expected["principal"]
     log = log_dir(fixture, principal)
     files = sorted(p.relative_to(fixture).as_posix() for p in fixture.rglob("*") if p.is_file())
@@ -167,10 +223,8 @@ def test_a_fixture_holds_a_log_and_its_expectations_and_nothing_derived(fixture:
 
 
 @pytest.mark.parametrize("fixture", GOLDEN, ids=IDS)
-def test_every_event_in_a_fixture_carries_its_directory_version(fixture: Path) -> None:
-    version = int(fixture.parent.name.removeprefix("v"))
-    records = _from_log(fixture, _expected(fixture)["principal"])
-    assert {r.event.v for r in records} == {version}
+def test_every_event_in_a_fixture_fits_its_directory_version(fixture: Path) -> None:
+    assert version_failures(fixture) == []
 
 
 # --- verify: rebuild over every fixture equals its hash ---------------------------------
@@ -280,3 +334,45 @@ def test_a_sentinel_that_names_nothing_is_a_failure_not_a_pass(tmp_path: Path) -
         },
     )
     assert len(failures) == 5
+
+
+# --- a schema bump leaves the v1 fixture untouched ---------------------------------------
+
+
+def _bump(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    """Simulate a later build where ``name`` is at v2 with a no-op 1 -> 2 upcaster."""
+    cls = EVENT_TYPES[name]
+    monkeypatch.setattr(cls, "SCHEMA_VERSION", 2)
+    monkeypatch.setattr(cls, "UPCASTS", {1: lambda d: d})
+
+
+def test_a_schema_bump_needs_no_edit_to_the_v1_fixture(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _bump(monkeypatch, "proposal")
+    root, principal = _copy(MAYA, tmp_path)
+    report = rebuild(root, principal)
+    assert {r.event.v for r in report.records if r.event.type == "proposal"} == {2}
+
+    assert version_failures(MAYA) == []
+    assert sentinel_failures(load_records(root, principal), _expected(MAYA)["sentinels"]) == []
+    assert _fold(report.records) == _expected(MAYA)["fold"]
+    assert state_hash(resolve(report.records)) == _expected(MAYA)["state_hash"]
+
+
+def test_a_schema_bump_without_a_v2_golden_log_is_caught(monkeypatch: pytest.MonkeyPatch) -> None:
+    _bump(monkeypatch, "proposal")
+    assert coverage_gaps(GOLDEN) == ["proposal v2 under tests/fixtures/v2/"]
+
+
+def test_a_vn_fixture_may_hold_older_versions_but_not_newer_ones(tmp_path: Path) -> None:
+    """D96 versions each type, so v2/ legitimately cites v1 events of an unbumped type."""
+    root, _ = _copy(MAYA, tmp_path)
+    v2 = tmp_path / "v2" / "maya"
+    v2.parent.mkdir()
+    shutil.copytree(root, v2)
+    shutil.copy(MAYA / EXPECTED, v2 / EXPECTED)
+    assert version_failures(v2) == ["no event at v2"]
+
+    _rewrite_line(v2, "d-phone", 9, lambda d: d.update(v=2))
+    assert version_failures(v2) == ["d-phone:9: proposal v2 is newer than this build's v1"]
