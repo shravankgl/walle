@@ -1,0 +1,57 @@
+{
+  "principal": "maya",
+  "events": 19,
+  "state_hash": "ebf47084e517ed6d0fed59d074cad08e2691439bf3e66d4c0034d08ea0ee1b05",
+  "fold": {
+    "current": [
+      "d-mbp:2",
+      "d-mbp:4",
+      "d-mbp:7",
+      "d-phone:1",
+      "d-phone:5",
+      "d-phone:6"
+    ],
+    "retired": [
+      "d-phone:3"
+    ],
+    "conflicts": [
+      "d-phone:7"
+    ],
+    "unapplied": [
+      "d-phone:8"
+    ],
+    "staged": [
+      "d-phone:9"
+    ]
+  },
+  "sentinels": {
+    "d-mbp:1.source_version": "2.1.0",
+    "d-mbp:1.observed_at": "2026-10-11T21:15:00+00:00",
+    "d-mbp:1.source": "transcript",
+    "d-mbp:1.ts": "2026-10-12T09:00:00.000000+05:30",
+    "d-mbp:2.valid_from": "2026-03-01",
+    "d-mbp:2.caused_by.0": "d-mbp:1",
+    "d-mbp:2.summary": "Lives in Pune",
+    "d-mbp:3.type": "proposal",
+    "d-mbp:3.level": "inductive",
+    "d-mbp:3.valid_from": "2026-04-01",
+    "d-mbp:4.confidence": 0.51,
+    "d-mbp:4.evidence_count": 2,
+    "d-mbp:4.caused_by.0": "d-mbp:3",
+    "d-mbp:6.target": "d-mbp:5",
+    "d-mbp:6.reason": "dropped in review: a one-off remark",
+    "d-mbp:9.target": "d-mbp:8",
+    "d-mbp:10.forgets.1": "d-mbp:3",
+    "d-mbp:10.model": "synthetic-digest-1",
+    "d-mbp:10.actor": "curator",
+    "d-phone:1.seq": 1,
+    "d-phone:2.note": "Pune and Bangalore cannot both be home at once",
+    "d-phone:2.caused_by.1": "d-phone:1",
+    "d-phone:3.about": "arjun",
+    "d-phone:3.level": "deductive",
+    "d-phone:3.valid_to": "2026-12-01",
+    "d-phone:4.valid_to": "2026-07-15",
+    "d-phone:9.summary": "Learning Marathi",
+    "d-phone:9.v": 1
+  }
+}
