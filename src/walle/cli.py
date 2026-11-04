@@ -1,14 +1,19 @@
 """The `walle` command. Every later task adds a subcommand here."""
 
+import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 
 import click
 
 from walle import __version__
+from walle import context as walle_context
 from walle import hot as walle_hot
 from walle import index as walle_index
 from walle import staging as walle_staging
-from walle.events import FutureSchemaError
+from walle import why as walle_why
+from walle.events import AnyEvent, Assertion, FutureSchemaError, Proposal, Supersede
+from walle.paths import principal_dir
 from walle.reader import CorruptStreamError
 from walle.resolver import ResolutionError, resolve
 from walle.writer import CorruptLogError
@@ -141,8 +146,8 @@ def render_command(root: Path, principal: str) -> None:
         click.echo(
             f"kept your edit to {kept.path}: {kept.reason}, so it was not rendered over. "
             "The hot tier carries your version until you deal with it. To let walle render "
-            "it again, move your edit somewhere safe and delete the file. Edits made through "
-            "`walle context` are not built yet.",
+            "it again, move your edit somewhere safe and delete the file. To change what it "
+            "says, use `walle context`, which writes the change to the log.",
             err=True,
         )
     if report.preserved:
@@ -328,3 +333,134 @@ def review_command(root: Path, principal: str, device: str) -> None:
         done[answer] += 1
 
     report()
+
+
+# --- forget, why and context (task 12) --------------------------------------------------
+
+
+@main.command("forget")
+@_ROOT
+@click.option("--principal", required=True, help="Whose memory, without the p- prefix.")
+@_DEVICE
+@click.option(
+    "--valid-to",
+    default=None,
+    help="When it stopped being true, if you know: YYYY-MM-DD or an RFC 3339 instant (D93).",
+)
+@click.option("--reason", default=None, help="A note kept with the retraction.")
+@click.argument("ref")
+def forget_command(
+    root: Path, principal: str, device: str, valid_to: str | None, reason: str | None, ref: str
+) -> None:
+    """Forget the current assertion REF: append a supersede that retires it.
+
+    Nothing is deleted. REF stays in the log, and `walle why REF` still explains it.
+    """
+    try:
+        retire = walle_context.forget(
+            root, principal, device, ref, valid_to=valid_to, reason=reason
+        )
+    except (walle_context.NotCurrentError, *_LOG_ERRORS) as exc:
+        raise click.ClickException(_describe(exc)) from exc
+    click.echo(f"{principal}: forgot {ref}: {retire} retires it, and it stays in the log.")
+    click.echo(f"`walle why {ref}` still explains it. Run `walle render` to update the hot tier.")
+
+
+def _gist(event: AnyEvent) -> str:
+    """One line saying what an event holds, for `walle why`."""
+    if isinstance(event, Assertion | Proposal):
+        text = event.summary
+    elif isinstance(event, Supersede):
+        text = f"retracts {event.target}" + (f": {event.reason}" if event.reason else "")
+    else:
+        text = getattr(event, "body", None) or getattr(event, "note", None) or ""
+    line = " ".join(str(text).split())
+    return line if len(line) <= 120 else line[:119] + "…"
+
+
+@main.command("why")
+@_ROOT
+@click.option("--principal", required=True, help="Whose log, without the p- prefix.")
+@click.argument("ref")
+def why_command(root: Path, principal: str, ref: str) -> None:
+    """Explain REF: the full caused_by chain behind it, and what became of each step (D59).
+
+    A forgotten or edited assertion is still explained, with what retired it.
+    """
+    try:
+        explanation = walle_why.explain(root, principal, ref)
+    except KeyError as exc:
+        raise click.ClickException(str(exc.args[0])) from exc
+    except (walle_index.StaleIndexError, *_LOG_ERRORS) as exc:
+        raise click.ClickException(_describe(exc)) from exc
+    for step in explanation.steps:
+        indent = "  " * step.depth
+        event = step.event
+        head = f"{indent}{step.ref} {event.type} {event.ts[:10]} by {event.actor}"
+        click.echo(head + (f": {step.status}" if step.status else ""))
+        if gist := _gist(event):
+            click.echo(f"{indent}  | {gist}")
+
+
+def _keep_unsaved(root: Path, principal: str, text: str) -> str:
+    """Put a refused save where the person can find it. Returns where, or why it could not."""
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    try:
+        fd, path = tempfile.mkstemp(
+            prefix=f"context-unsaved-{stamp}-", suffix=".md", dir=principal_dir(root, principal)
+        )
+        with open(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+    except OSError as exc:
+        return f"nowhere: it could not be saved ({exc}). Here it is:\n{text}"
+    return path
+
+
+@main.command("context")
+@_ROOT
+@click.option("--principal", required=True, help="Whose memory, without the p- prefix.")
+@_DEVICE
+def context_command(root: Path, principal: str, device: str) -> None:
+    """Edit what walle believes in $EDITOR; the changes are appended to the log (D107).
+
+    Change an entry to edit it, delete it to forget it, or head a new one [#new]. Every
+    change is a new event; nothing in the log is edited or deleted.
+    """
+    try:
+        walle_staging.check_device(device)
+        view = walle_context.open_view(root, principal)
+    except _LOG_ERRORS as exc:
+        raise click.ClickException(_describe(exc)) from exc
+
+    edited = click.edit(view.text, extension=".md", require_save=True)
+    if edited is None or not edited.strip():
+        click.echo(f"{principal}: no changes saved; nothing written.")
+        return
+
+    try:
+        applied = walle_context.apply(root, principal, device, view, edited)
+    except walle_context.PartialWriteError as exc:
+        kept = _keep_unsaved(root, principal, edited)
+        raise click.ClickException(f"{exc}\nYour edited text is in {kept}") from exc
+    except (walle_context.StaleViewError, *_LOG_ERRORS) as exc:
+        kept = _keep_unsaved(root, principal, edited)
+        raise click.ClickException(
+            f"{_describe(exc)}\nNothing was written. Your edited text is in {kept}"
+        ) from exc
+
+    if not applied.written:
+        click.echo(f"{principal}: nothing changed; nothing written.")
+        return
+    click.echo(
+        f"{principal}: edited {len(applied.edited)}, forgot {len(applied.forgotten)}, "
+        f"added {len(applied.added)}."
+    )
+    for old, new, retire in applied.edited:
+        click.echo(
+            f"  edited {old} as {new}; {retire} retires the old text, which stays in the log"
+        )
+    for ref, retire in applied.forgotten:
+        click.echo(f"  forgot {ref}; {retire} retires it, and it stays in the log")
+    for ref in applied.added:
+        click.echo(f"  added {ref}")
+    click.echo("Run `walle render` to put this in the hot tier.")
