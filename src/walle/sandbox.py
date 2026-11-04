@@ -12,7 +12,9 @@ What the profile says, in ``srt``'s terms (reads are allowed everywhere unless d
 ``allowRead`` wins over ``denyRead``; writes are denied everywhere unless allowed):
 
 - **Reads.** The home folder and ``<root>/principals`` are denied, then this principal's
-  folder and the Python that runs the server are allowed back. Denying the parent of every
+  folder and the Python that runs the server are allowed back. That includes every symlink
+  on the way from ``sys.executable`` to the real binary, each by its own name: macOS refuses
+  to exec through a link left under the home denial. Denying the parent of every
   principal is what keeps another principal's facts unreadable (hard constraint 6): the
   sandbox enforces on the filesystem what no resolver is trusted to.
 - **Writes.** The log folder, and only the log folder. The index, its lock, the staging lock
@@ -32,6 +34,7 @@ bad name is refused before anything is made.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -45,7 +48,9 @@ def srt_settings(root: Path, principal: str) -> dict[str, Any]:
 
     Raises ``ValueError`` for a name that is not a usable principal (``paths.check_name``).
     Every path is absolute and symlink-resolved: ``srt`` matches resolved paths, and on macOS
-    ``/var`` is a symlink to ``/private/var``, so an unresolved path would match nothing.
+    ``/var`` is a symlink to ``/private/var``, so an unresolved path would match nothing. The
+    one exception is the links on the way to the interpreter (``_symlink_hops``): each is
+    named as itself, with its parent folder resolved, because the link is what is read.
     """
     root = Path(root)
     folder = _resolved(principal_dir(root, principal))
@@ -84,19 +89,70 @@ def _interpreter_paths(principals: Path, home: Path) -> list[str]:
     hand back a single other's. Both are dropped: the profile reads one folder there. The same
     goes for an entry that is the home folder or holds it (``PYTHONPATH=$HOME``): it would void
     the home denial, so it is dropped too. One inside home (a virtualenv) stays.
+
+    Resolved entries are not enough to start Python. A uv interpreter is reached through
+    links (``.venv/bin/python`` to ``cpython-3.12-<platform>/bin/python3.12``, where the
+    ``cpython-3.12`` folder is itself a link to ``cpython-3.12.14``), and macOS refuses to exec
+    through a link that is still under the home denial. So every link on the way from
+    ``sys.executable`` is allowed too, by its own name, under the same two drops. That is
+    narrower than allowing the whole uv folder.
     """
     wanted = [sys.prefix, sys.base_prefix, str(Path(walle.__file__).parent), *sys.path]
     found: list[str] = []
+
+    def keep(path: Path) -> None:
+        resolved = path.resolve()
+        for form in {path, resolved}:
+            if form.is_relative_to(principals) or principals.is_relative_to(form):
+                return
+            if home.is_relative_to(form):
+                return
+        if str(path) not in found:
+            found.append(str(path))
+
     for entry in wanted:
         path = Path(entry)
         if not entry or not path.is_absolute() or not path.exists():
             continue
-        resolved = path.resolve()
-        if resolved.is_relative_to(principals) or principals.is_relative_to(resolved):
-            continue
-        if home.is_relative_to(resolved):
-            continue
-        text = str(resolved)
-        if text not in found:
-            found.append(text)
+        keep(path.resolve())
+    if sys.executable and Path(sys.executable).is_absolute():
+        for hop in _symlink_hops(Path(sys.executable)):
+            keep(hop)
     return found
+
+
+def _symlink_hops(path: Path, limit: int = 40) -> list[Path]:
+    """Every symlink met while resolving ``path``, each named as itself.
+
+    Each hop's parent folder is already resolved and its last component is the link, which
+    is the name the OS reads when it follows it. Stops quietly at a link it cannot read or
+    after ``limit`` links (a loop): the profile then lacks those hops, and ``srt`` refuses
+    the exec loudly rather than anything being widened.
+    """
+    hops: list[Path] = []
+    current = Path(path.anchor)
+    parts = list(path.parts[1:])
+    while parts:
+        part = parts.pop(0)
+        if part in ("", "."):
+            continue
+        if part == "..":
+            current = current.parent
+            continue
+        candidate = current / part
+        if not candidate.is_symlink():
+            current = candidate
+            continue
+        if len(hops) >= limit:
+            break
+        try:
+            target = Path(os.readlink(candidate))
+        except OSError:
+            break
+        hops.append(candidate)
+        if target.is_absolute():
+            current = Path(target.anchor)
+            parts = [*target.parts[1:], *parts]
+        else:
+            parts = [*target.parts, *parts]
+    return hops

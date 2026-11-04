@@ -190,6 +190,64 @@ def test_an_import_path_that_holds_the_home_folder_does_not_reopen_it(
     assert str(venv.resolve()) in allowed
 
 
+def _uv_style_python(home: Path) -> tuple[Path, list[Path]]:
+    """A synthetic uv layout under `home`: a venv's `python` links to `python3`, which links
+    through `cpython-3.12`, itself a link to the real `cpython-3.12.14` folder. Returns the
+    venv's `python` and every link on the way, in order."""
+    pythons = home / ".local" / "share" / "uv" / "python"
+    real = pythons / "cpython-3.12.14-macos-aarch64-none" / "bin"
+    real.mkdir(parents=True)
+    (real / "python3.12").write_text("synthetic, not a real interpreter\n")
+    minor = pythons / "cpython-3.12-macos-aarch64-none"
+    minor.symlink_to(real.parent.name)
+    venv_bin = home / "proj" / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "python3").symlink_to(minor / "bin" / "python3.12")
+    (venv_bin / "python").symlink_to("python3")
+    return venv_bin / "python", [venv_bin / "python", venv_bin / "python3", minor]
+
+
+def test_every_link_on_the_way_to_the_interpreter_is_allowed_by_its_own_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Allowing only the resolved interpreter leaves the links on the way under the home
+    denial, and macOS then refuses to exec it. Each link is allowed as itself, unresolved;
+    the home folder is not."""
+    _profile_folder(tmp_path)
+    home = tmp_path.resolve() / "home" / "maya"
+    python, hops = _uv_style_python(home)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(sys, "executable", str(python))
+    allowed = _settings(tmp_path)["filesystem"]["allowRead"]
+    for hop in hops:
+        assert str(hop) in allowed, hop
+    assert str(home) not in allowed
+    assert not any(home.is_relative_to(a) for a in allowed)
+
+
+def test_a_link_on_the_way_that_holds_home_or_principals_is_not_allowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A link named on the way to the interpreter is kept out when it is, or points at, a
+    folder holding home or the principals: allowing it would void that denial."""
+    _profile_folder(tmp_path)
+    base = tmp_path.resolve()
+    home = base / "home" / "maya"
+    python, hops = _uv_style_python(home)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    to_home = base / "to-home"
+    to_home.symlink_to(home.parent)
+    monkeypatch.setattr(sys, "executable", str(to_home / python.relative_to(home.parent)))
+    allowed = _settings(tmp_path)["filesystem"]["allowRead"]
+    assert str(to_home) not in allowed
+    for hop in hops:
+        assert str(hop) in allowed, hop
+    to_principals = base / "to-principals"
+    to_principals.symlink_to(base / "principals")
+    monkeypatch.setattr(sys, "executable", str(to_principals / "python"))
+    assert str(to_principals) not in _settings(tmp_path)["filesystem"]["allowRead"]
+
+
 def test_every_path_is_absolute_and_json_round_trips(tmp_path: Path) -> None:
     _profile_folder(tmp_path)
     settings = _settings(tmp_path)
