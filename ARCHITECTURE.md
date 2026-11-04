@@ -195,6 +195,7 @@ be replayed as history (D56).
 |---|---|---|
 | `observation` | Observation loop | Something happened in the user's world. Carries `observed_at` — the source's own time — beside `ts`, the append time (D93) |
 | `utterance` | Conversation loop | A turn, user or agent |
+| `proposal` | Human or Curator | A belief waiting in the staging queue for a human yes. Never folded into what is believed (D120) |
 | `assertion` | Curator | A fact about the subject, with confidence, a `level` (explicit / deductive / inductive), `valid_from` / `valid_to` in world time, and — only inside a workflow whose manifest declares the cross-folder read — `about: p-<other>` (D93, D94) |
 | `supersede` | any | Retract or replace a prior seq |
 | `contradiction` | Curator | Two assertions that cannot both hold; `caused_by` names both. Resolved, or not, by a later `supersede` (D58) |

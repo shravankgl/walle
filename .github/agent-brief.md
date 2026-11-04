@@ -38,9 +38,11 @@ Must be a separate agent on a **different vendor's model** from the author.
 3. Post findings as a PR comment, each with a severity.
 4. Set the status on that commit:
    `gh api repos/shravankgl/walle/statuses/$SHA -f state=success -f context=agent-review -f description="..."`.
-   Use `state=failure` for any high-severity finding.
+   Use `state=failure` for any high or medium finding (R8). Use `state=success` only if the worst
+   finding is low.
 
-A new commit clears the status, so each push is reviewed again. A review that did not finish sets
+A new commit clears the status, so each push is reviewed again. When a review fails, the author
+fixes the findings on the same branch. A review that did not finish sets
 nothing, and the PR does not merge.
 
 ## When to stop

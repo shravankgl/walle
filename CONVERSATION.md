@@ -2281,3 +2281,31 @@ plan cannot have it. So the repo is public before M2, as a new repo with one sta
 Three Session 1 passages (D40, the market read after D46, and D47) and one `PLAN.md` risk row were
 reworded before publishing, which is the one exception to appending only. The original history
 and wording are kept in a private archive repo.
+
+---
+
+## 2026-11-04 — Session 13
+
+**R8 — Quality first, then keep building through Phases 1 to 4 until the credit runs out. Amends R6, D119, PLAN.md §3.**
+The pilot cost about $3-4 per PR, so credit is not the limit: Phase 0 needs a small part of the
+$1,000. Shravan's call on using the rest:
+
+- **Medium findings now block.** `agent-review` is set to failure on any high or medium finding.
+  Under R6 only high findings blocked, and two real defects landed on `main` before being fixed in
+  follow-ups (PR #24's recovery crash and reader race).
+- **The strongest model writes the hardest tasks.** Fable 5.1 takes the proposer and the evals.
+- **Scope grows.** After M2, work continues into Phases 1, 2, 3 and 4 until the credit runs out.
+  Each phase's tasks are drafted with verify criteria and approved by Shravan before agents start.
+  Agents still make no new decisions, and real personal data never goes to Hyperagent.
+
+**Correction to R6.** R6 names the course as ERA V4. It is **EAG V4**, The School of AI's Engineering
+Agents program, first class 2026-12-05. R6 is left as written, per constraint 2.
+
+**D120 — The staging queue lives in the log as a new event type, `proposal`. Extends D49, D60, §5.2.**
+Made by the author agent in task 9 (PR #31) and recorded here because a schema type is a decision,
+even though R6 says agents make none. A drop has to leave a tombstone, and a tombstone needs an event
+to point at, so the queue cannot live beside the log. It is a separate type rather than an assertion
+with a flag, so nothing that folds assertions can pick one up by forgetting the flag. A `supersede`
+of a proposal is a drop; an assertion whose `caused_by` names it is a keep or an edit. Shravan to
+confirm or overturn it during the EAG V4 review.
+
