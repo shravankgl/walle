@@ -1,0 +1,19 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.pyright/
+# local state — never the log of a real person
+principals/
+*.local.*
+.env
+# os
+.DS_Store
+
+# advisory review output (D119) — regenerated per run, never committed
+.review/
