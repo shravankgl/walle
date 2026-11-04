@@ -418,6 +418,17 @@ def staged(records: Iterable[Record]) -> tuple[Staged, ...]:
     )
 
 
+def retired_refs(records: Iterable[Record]) -> frozenset[str]:
+    """Every ref some live supersede targets: the events the log has dropped.
+
+    One fold over the log for a caller with many refs to ask about; ``retired_by`` answers
+    for one ref and says which supersedes did it.
+    """
+    events = _by_ref(records)
+    live, targeted_by = _liveness(events)
+    return frozenset(ref for ref, by in targeted_by.items() if any(live[s] for s in by))
+
+
 def retired_by(records: Iterable[Record], ref: str) -> tuple[str, ...]:
     """The live supersedes that target ``ref``, in ref order. Empty when it is live.
 
