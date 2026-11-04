@@ -370,8 +370,10 @@ failed on the merge commit `069a181`: the `check` job's only failure (1 failed, 
 That test exists so a report cannot lie about the code (D77, D98); the fix is to regenerate
 the report, not to touch the test. No test was edited.
 
-**Verify:** the test failed locally on `069a181` and passes after the regeneration; the
-four checks are clean (output in the PR comment for this commit and the run report).
+**Verify:** the test failed locally on `069a181` and passes after the regeneration. Four
+checks, run locally as a non-root user: `uv run pytest` 1390 passed, 10 skipped;
+`uv run ruff check` all checks passed; `uv run ruff format --check` 100 files already
+formatted; `uv run pyright` 0 errors, 0 warnings. CI `check` and `gate` green on `1a65a4a`.
 
 **Two-runner walkthrough:** not applicable; a generated report and one line of prose.
 
