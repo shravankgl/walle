@@ -13,6 +13,22 @@ D101 records from claude-code-log and claude-code-transcripts:
 * Some lines have no ``uuid`` at all (``summary``, ``queue-operation``). They are not part of
   the graph. They are kept aside, in ``Transcripts.unthreaded``, not skipped.
 
+What real files showed (issue #9, task 11; counts and structure only, read on the owner's
+machine):
+
+* **Subagents have their own files**, ``<project>/<session>/subagents/agent-<id>.jsonl``.
+  Every entry there has ``isSidechain: true``, the trunk's ``sessionId`` and the agent's own
+  ``agentId``, and the first has ``parentUuid: null`` (claude-code-log ``dev-docs/agents.md``).
+  ``load`` hangs that root under the trunk entry whose ``toolUseResult.agentId`` names the
+  agent: the result of the call that started it. That repair is reported only when it fails
+  (``unanchored-agent``).
+* **More entry types exist** than D101 lists (``attachment``, ``mode``, ``ai-title``,
+  ``api-request`` and others). Only ``user`` and ``assistant`` matter to the observer. A line
+  of any other type that does not fit the entry shape is kept aside in ``unthreaded``, not
+  reported as corrupt: a type we have never seen is not a broken file.
+* **``api-request`` and ``api-request-blob`` may hold raw request payloads.** Their ``raw`` is
+  replaced by ``{}`` as they are read, so nothing downstream can copy one anywhere.
+
 Order (D101)
 ------------
 **Order is the graph, never the clock.** A parent always comes before its children, and a
@@ -70,6 +86,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -129,7 +146,8 @@ class TranscriptEntry:
 
 @dataclass(frozen=True)
 class Unthreaded:
-    """A valid JSON object with no ``uuid``: ``summary``, ``queue-operation`` and the like."""
+    """A JSON object that is not part of the graph: no ``uuid`` (``summary``, ``mode``, …), or
+    a type other than ``user`` or ``assistant`` whose fields do not fit an entry."""
 
     path: Path
     line: int
@@ -166,7 +184,7 @@ class Anomaly:
     """A repair made to the graph so it can be walked. The files are not touched."""
 
     kind: str
-    """``orphan``, ``self-parent`` or ``cycle``."""
+    """``orphan``, ``self-parent``, ``cycle`` or ``unanchored-agent``."""
     uuid: str
     detail: str
 
@@ -181,17 +199,32 @@ class TranscriptFile:
     skips: tuple[LineSkip, ...]
 
 
-def transcript_files(projects_dir: Path) -> list[Path]:
-    """Every ``<projects_dir>/*/*.jsonl`` that is a regular file, sorted.
+# Lines that may carry a raw API request (issue #9). Their content is dropped on read.
+_PAYLOAD_TYPES = frozenset({"api-request", "api-request-blob"})
+_PAYLOAD_MARK = re.compile(rb'"type"\s*:\s*"api-request')
 
-    Deeper files (subagent transcripts under ``<session>/subagents/``) are not included; see
-    *Noticed, not done* in ``devlog/task-10.md``. A missing directory gives ``[]``: no
-    transcripts yet is not an error.
+# The types an entry must validate as. Any other type that does not fit is not corrupt.
+_CONVERSATIONAL = frozenset({"user", "assistant"})
+
+# Where a subagent's own transcript lives, relative to the projects folder.
+_PATTERNS = ("*/*.jsonl", "*/*/subagents/*.jsonl")
+
+
+def transcript_files(projects_dir: Path) -> list[Path]:
+    """Every session file and every subagent file under ``projects_dir``, sorted.
+
+    That is ``<projects_dir>/<project>/<session>.jsonl`` and
+    ``<projects_dir>/<project>/<session>/subagents/<agent>.jsonl``, regular files only.
+
+    ``projects_dir`` has no default, here or in any caller: walle reads only a folder the
+    person names (issue #9, D40). A missing directory gives ``[]``: no transcripts yet is not
+    an error.
     """
     projects_dir = Path(projects_dir)
     if not projects_dir.is_dir():
         return []
-    return sorted(path for path in projects_dir.glob("*/*.jsonl") if path.is_file())
+    found = {path for pattern in _PATTERNS for path in projects_dir.glob(pattern)}
+    return sorted(path for path in found if path.is_file())
 
 
 def read_transcript(path: Path) -> TranscriptFile:
@@ -209,7 +242,11 @@ def read_transcript(path: Path) -> TranscriptFile:
     skips: list[LineSkip] = []
 
     def skip(number: int, raw: bytes, reason: str) -> None:
-        preview = raw[:_PREVIEW_BYTES].decode("utf-8", "replace")
+        # A broken api-request line is still a raw request: name it, show none of it.
+        if _PAYLOAD_MARK.search(raw):
+            preview = "(an api-request line; its bytes are not shown)"
+        else:
+            preview = raw[:_PREVIEW_BYTES].decode("utf-8", "replace")
         skips.append(LineSkip(path=path, line=number, reason=reason, preview=preview))
         logger.warning("%s:%d: skipped — %s", path, number, reason)
 
@@ -227,12 +264,19 @@ def read_transcript(path: Path) -> TranscriptFile:
         if not isinstance(parsed, dict):
             skip(number, raw, f"a JSON {type(parsed).__name__}, not an object")
             continue
+        kind = parsed.get("type")
+        kept: dict[str, Any] = {} if kind in _PAYLOAD_TYPES else parsed
         if "uuid" not in parsed:
-            unthreaded.append(Unthreaded(path=path, line=number, raw=parsed))
+            unthreaded.append(Unthreaded(path=path, line=number, raw=kept))
             continue
         try:
             fields = _EntryFields.model_validate(parsed)
         except ValidationError as exc:
+            if isinstance(kind, str) and kind not in _CONVERSATIONAL:
+                # Not ours to judge: a type we do not read, in a schema we do not own.
+                logger.debug("%s:%d: %r line kept aside, not an entry", path, number, kind)
+                unthreaded.append(Unthreaded(path=path, line=number, raw=kept))
+                continue
             problems = "; ".join(
                 f"{'.'.join(str(p) for p in error['loc']) or 'line'}: {error['msg']}"
                 for error in exc.errors()
@@ -244,7 +288,7 @@ def read_transcript(path: Path) -> TranscriptFile:
                 **fields.model_dump(),
                 path=path,
                 line=number,
-                raw=parsed,
+                raw=kept,
             )
         )
 
@@ -352,6 +396,20 @@ def load(paths: Iterable[Path]) -> Transcripts:
         anomalies.append(Anomaly(kind=kind, uuid=entry.uuid, detail=detail))
         logger.warning("%s:%d: %s %s — %s", entry.path, entry.line, kind, entry.uuid, detail)
 
+    def position(uuid: str) -> tuple[bool, datetime, str, int]:
+        entry = entries[uuid]
+        return (not entry.is_sidechain, entry.timestamp, str(entry.path), entry.line)
+
+    # Where each subagent started: the trunk entry carrying the spawn's structured result,
+    # ``toolUseResult.agentId``. The earliest wins if two claim one agent. An entry that is a
+    # member of that same agent (its own ``agentId``) is never its anchor.
+    anchors: dict[str, str] = {}
+    for uuid in sorted(entries, key=lambda u: position(u)[1:]):
+        result = entries[uuid].raw.get("toolUseResult")
+        spawned = result.get("agentId") if isinstance(result, dict) else None
+        if isinstance(spawned, str) and spawned and entries[uuid].agent_id != spawned:
+            anchors.setdefault(spawned, uuid)
+
     parent_of: dict[str, str | None] = {}
     for uuid, entry in entries.items():
         parent = entry.parent_uuid
@@ -361,11 +419,15 @@ def load(paths: Iterable[Path]) -> Transcripts:
         elif parent is not None and parent not in entries:
             repair("orphan", entry, f"parent {parent} was not loaded; walked as a root")
             parent = None
+        elif parent is None and entry.agent_id and entry.path.parent.name == "subagents":
+            parent = anchors.get(entry.agent_id)
+            if parent is None:
+                repair(
+                    "unanchored-agent",
+                    entry,
+                    f"no loaded entry started agent {entry.agent_id}; walked as a root",
+                )
         parent_of[uuid] = parent
-
-    def position(uuid: str) -> tuple[bool, datetime, str, int]:
-        entry = entries[uuid]
-        return (not entry.is_sidechain, entry.timestamp, str(entry.path), entry.line)
 
     def build() -> tuple[dict[str, list[str]], list[str]]:
         children: dict[str, list[str]] = {}

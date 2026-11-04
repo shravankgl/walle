@@ -8,7 +8,9 @@
   unthreaded           summary and queue-operation lines have no uuid: kept aside, not walked
   shapes               clock skew, a rewind, a dangling parent, a cycle
   bad lines            skipped and reported; one bad line never loses the rest of the file
-  discovery            ``<projects>/*/*.jsonl`` and nothing deeper
+  discovery            ``<projects>/*/*.jsonl`` and ``<project>/<session>/subagents/*.jsonl``
+  subagent files       a subagent's root hangs under the call that spawned it (task 11)
+  ignored lines        undocumented types are not corrupt; api-request is never kept
 
 The fixture under ``tests/fixtures/transcripts/`` is synthetic: made-up uuids, a made-up walking
 trip, a made-up museum. It follows the shape D101 records from claude-code-log and
@@ -323,17 +325,176 @@ def test_a_file_that_vanished_before_load_is_reported_and_the_rest_loads(
 # --- discovery ---------------------------------------------------------------------------
 
 
-def test_transcript_files_finds_project_level_jsonl_only(tmp_path: Path) -> None:
+def test_transcript_files_finds_sessions_and_their_subagents_and_nothing_else(
+    tmp_path: Path,
+) -> None:
+    """Changed in task 11: subagent files were left out (issue #9: that is where they live)."""
     write(tmp_path / "b-proj" / "s2.jsonl", [])
     write(tmp_path / "a-proj" / "s1.jsonl", [])
     write(tmp_path / "a-proj" / "s1" / "subagents" / "agent-1.jsonl", [])
+    (tmp_path / "a-proj" / "s1" / "subagents" / "agent-1.meta.json").write_text("{}")
+    write(tmp_path / "a-proj" / "s1" / "other" / "x.jsonl", [])
+    write(tmp_path / "a-proj" / "s1" / "subagents" / "deeper" / "agent-2.jsonl", [])
     write(tmp_path / "top.jsonl", [])
     (tmp_path / "a-proj" / "notes.txt").write_text("x")
     (tmp_path / "a-proj" / "dir.jsonl").mkdir()
+    (tmp_path / "a-proj" / "s1" / "subagents" / "dir.jsonl").mkdir()
     found = transcript_files(tmp_path)
-    assert found == [tmp_path / "a-proj" / "s1.jsonl", tmp_path / "b-proj" / "s2.jsonl"]
+    assert found == [
+        tmp_path / "a-proj" / "s1" / "subagents" / "agent-1.jsonl",
+        tmp_path / "a-proj" / "s1.jsonl",
+        tmp_path / "b-proj" / "s2.jsonl",
+    ]
+
+
+# --- subagent files (task 11) --------------------------------------------------------------
+
+
+def agent_row(n: int, parent: int | None, ts: str, agent: str) -> dict[str, Any]:
+    return {**row(n, parent, ts, sidechain=True), "agentId": agent}
+
+
+def spawn_result(n: int, parent: int, ts: str, agent: str) -> dict[str, Any]:
+    return {**row(n, parent, ts), "toolUseResult": {"agentId": agent}}
+
+
+def test_a_subagent_root_hangs_under_the_tool_result_that_names_its_agent(
+    tmp_path: Path,
+) -> None:
+    trunk = write(
+        tmp_path / "p" / "s.jsonl",
+        [
+            row(1, None, "10:00:00"),
+            row(2, 1, "10:00:01", typ="assistant"),
+            spawn_result(3, 2, "10:00:09", "ag1"),
+            row(4, 3, "10:00:10", typ="assistant"),
+        ],
+    )
+    agent = write(
+        tmp_path / "p" / "s" / "subagents" / "agent-ag1.jsonl",
+        [agent_row(20, None, "10:00:02", "ag1"), agent_row(21, 20, "10:00:05", "ag1")],
+    )
+    transcripts = load([trunk, agent])
+    assert transcripts.parent_of[u(20)] == u(3)
+    assert transcripts.roots == (u(1),)
+    assert short(transcripts.walk()) == [1, 2, 3, 20, 21, 4]
+    assert transcripts.anomalies == ()
+    assert transcripts.entries[u(20)].parent_uuid is None  # as written; the graft is a view
+
+
+def test_a_subagent_nobody_names_stays_a_root_and_is_reported(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    trunk = write(tmp_path / "p" / "s.jsonl", [row(1, None, "10:00:00")])
+    agent = write(
+        tmp_path / "p" / "s" / "subagents" / "agent-ag9.jsonl",
+        [agent_row(20, None, "10:00:02", "ag9")],
+    )
+    with caplog.at_level(logging.WARNING):
+        transcripts = load([trunk, agent])
+    assert transcripts.roots == (u(1), u(20))
+    (anomaly,) = transcripts.anomalies
+    assert (anomaly.kind, anomaly.uuid) == ("unanchored-agent", u(20))
+    assert "ag9" in caplog.text
+
+
+def test_an_agent_is_never_anchored_inside_itself(tmp_path: Path) -> None:
+    """A tool_result inside agent ag1's own file that names ag1 is not where ag1 started."""
+    agent = write(
+        tmp_path / "p" / "s" / "subagents" / "agent-ag1.jsonl",
+        [
+            agent_row(20, None, "10:00:02", "ag1"),
+            {**agent_row(21, 20, "10:00:03", "ag1"), "toolUseResult": {"agentId": "ag1"}},
+        ],
+    )
+    transcripts = load([agent])
+    assert transcripts.roots == (u(20),)
+    assert [a.kind for a in transcripts.anomalies] == ["unanchored-agent"]
+
+
+def test_a_null_parent_outside_a_subagents_folder_is_not_grafted(tmp_path: Path) -> None:
+    trunk = write(
+        tmp_path / "p" / "s.jsonl",
+        [row(1, None, "10:00:00"), spawn_result(2, 1, "10:00:01", "ag1")],
+    )
+    other = write(tmp_path / "p" / "t.jsonl", [agent_row(20, None, "10:00:02", "ag1")])
+    assert load([trunk, other]).roots == (u(1), u(20))
+
+
+# --- ignored lines (issue #9) --------------------------------------------------------------
+
+
+def test_an_undocumented_type_that_does_not_fit_is_ignored_not_skipped(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    rows = [
+        row(1, None, "10:00:00"),
+        {"type": "atis-latch", "uuid": u(2), "parentUuid": u(1)},  # no timestamp
+        {"type": "ai-title", "aiTitle": "t"},
+        row(3, 1, "10:00:02", typ="a-type-from-the-future"),
+    ]
+    path = write(tmp_path / "p" / "s.jsonl", rows)
+    with caplog.at_level(logging.WARNING):
+        transcript = read_transcript(path)
+    assert transcript.skips == ()
+    assert short(transcript.entries) == [1, 3]
+    assert sorted(item.raw["type"] for item in transcript.unthreaded) == ["ai-title", "atis-latch"]
+    assert caplog.text == ""
+
+
+def test_a_user_or_assistant_line_that_does_not_fit_is_still_skipped(tmp_path: Path) -> None:
+    rows = [
+        row(1, None, "10:00:00"),
+        {**row(2, 1, "10:00:01", typ="assistant"), "timestamp": "soon"},
+    ]
+    transcript = read_transcript(write(tmp_path / "p" / "s.jsonl", rows))
+    assert [skip.line for skip in transcript.skips] == [2]
+
+
+@pytest.mark.parametrize("typ", ["api-request", "api-request-blob"])
+def test_a_raw_request_line_is_never_kept(tmp_path: Path, typ: str) -> None:
+    secret = "CANARY-RAW-REQUEST-PAYLOAD"
+    rows = [
+        row(1, None, "10:00:00"),
+        {**row(2, 1, "10:00:01", typ=typ), "request": {"body": secret}},
+        {"type": typ, "blob": secret},
+    ]
+    transcript = read_transcript(write(tmp_path / "p" / "s.jsonl", rows))
+    assert short(transcript.entries) == [1, 2]  # still in the graph, so its children hold
+    kept = [dict(e.raw) for e in transcript.entries] + [dict(i.raw) for i in transcript.unthreaded]
+    assert secret not in json.dumps(kept)
+    assert transcript.entries[1].raw == {}
+    assert len(transcript.unthreaded) == 1
 
 
 def test_transcript_files_of_a_missing_directory_is_empty(tmp_path: Path) -> None:
     """No Claude Code installed yet is not an error; there is simply nothing to observe."""
     assert transcript_files(tmp_path / "absent") == []
+
+
+def test_a_line_with_a_uuid_and_no_type_is_still_skipped(tmp_path: Path) -> None:
+    """An unknown type is ignored; a missing one is a broken line."""
+    rows = [row(1, None, "10:00:00"), {"uuid": u(2), "parentUuid": u(1)}]
+    transcript = read_transcript(write(tmp_path / "p" / "s.jsonl", rows))
+    assert [skip.line for skip in transcript.skips] == [2]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        b'{"type":"api-request","request":{"body":"CANARY-RAW-REQUEST-PAYLOAD',
+        b'{"type": "api-request-blob", "blob": "CANARY-RAW-REQUEST-PAYLOAD"',
+    ],
+)
+def test_a_broken_raw_request_line_is_reported_without_its_bytes(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, line: bytes
+) -> None:
+    path = tmp_path / "p" / "s.jsonl"
+    path.parent.mkdir()
+    for content in (line + b"\n", line):  # not JSON; and an unterminated last line
+        path.write_bytes(json.dumps(row(1, None, "10:00:00")).encode() + b"\n" + content)
+        with caplog.at_level(logging.WARNING):
+            (skip,) = read_transcript(path).skips
+        assert "CANARY" not in skip.preview
+        assert "api-request" in skip.preview
+    assert "CANARY" not in caplog.text
