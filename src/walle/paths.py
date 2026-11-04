@@ -42,6 +42,7 @@ LOG_DIRNAME = "log"
 STREAM_SUFFIX = ".jsonl"
 INDEX_FILENAME = "index.sqlite"
 INDEX_LOCK_FILENAME = "index.lock"
+HOT_DIRNAME = "hot"
 
 
 def check_name(name: str, *, kind: str) -> str:
@@ -90,3 +91,12 @@ def index_path(root: Path, principal: str) -> Path:
 def index_lock_path(root: Path, principal: str) -> Path:
     """``<root>/principals/p-<principal>/index.lock`` — held by whoever changes the index."""
     return principal_dir(root, principal) / INDEX_LOCK_FILENAME
+
+
+def hot_dir(root: Path, principal: str) -> Path:
+    """``<root>/principals/p-<principal>/hot`` — the rendered hot tier and ``rules.md``.
+
+    Inside the principal's folder like everything else that holds their facts (hard
+    constraint 6). The rendered files are derived (D10, D107); ``rules.md`` is not.
+    """
+    return principal_dir(root, principal) / HOT_DIRNAME

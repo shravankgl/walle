@@ -5,6 +5,7 @@ from pathlib import Path
 import click
 
 from walle import __version__
+from walle import hot as walle_hot
 from walle import index as walle_index
 from walle.events import FutureSchemaError
 from walle.reader import CorruptStreamError
@@ -81,3 +82,66 @@ def rebuild_command(root: Path, principal: str, full: bool) -> None:
             f"the index is up to date with the log, but the log does not fold: {exc}"
         ) from exc
     click.echo(f"resolved state: {state}")
+
+
+@main.command("render")
+@click.option(
+    "--root",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=".",
+    show_default=True,
+    help="The folder that holds principals/.",
+)
+@click.option("--principal", required=True, help="Whose hot tier, without the p- prefix.")
+def render_command(root: Path, principal: str) -> None:
+    """Render the hot tier from the log into principals/p-<name>/hot/ (D64, D81, D107).
+
+    The rendered files are read-only. A file edited since walle wrote it is kept, reported,
+    and not rendered over; the command then exits 1. rules.md is never touched.
+    """
+    try:
+        report = walle_hot.render(root, principal)
+    except (
+        walle_index.DanglingRefError,
+        FutureSchemaError,
+        CorruptStreamError,
+        ResolutionError,
+        OSError,  # a read-only hot/ folder, a full disk: said plainly, not as a traceback
+        ValueError,
+    ) as exc:
+        raise click.ClickException(_describe(exc)) from exc
+
+    for stream, skip in report.skips:
+        click.echo(f"skipped {stream} line {skip.line}: {skip.reason}", err=True)
+    if report.manifest_note:
+        click.echo(report.manifest_note, err=True)
+
+    shape = (
+        "every one in full"
+        if report.mode is walle_hot.Mode.FULL
+        else f"{report.in_full} in full, {report.summarised} as one-line summaries"
+    )
+    click.echo(
+        f"{principal}: hot tier for {_plural(report.assertions, 'assertion')}, "
+        f"{report.mode} mode, {shape}."
+    )
+    click.echo(f"  written: {', '.join(report.written) or 'nothing'}")
+    click.echo(f"  unchanged: {', '.join(report.unchanged) or 'nothing'}")
+    if report.preserved:
+        # On stdout too: the line above must not read as if every file now holds this render.
+        names = ", ".join(kept.name for kept in report.preserved)
+        click.echo(f"  kept as edited, not this render: {names}")
+    rules = "present, left alone" if report.rules_present else "none yet"
+    click.echo(f"  {walle_hot.RULES}: {rules}")
+    click.echo(f"resolved state: {report.state}")
+
+    for kept in report.preserved:
+        click.echo(
+            f"kept your edit to {kept.path}: {kept.reason}, so it was not rendered over. "
+            "The hot tier carries your version until you deal with it. To let walle render "
+            "it again, move your edit somewhere safe and delete the file. Edits made through "
+            "`walle context` are not built yet.",
+            err=True,
+        )
+    if report.preserved:
+        raise SystemExit(1)
