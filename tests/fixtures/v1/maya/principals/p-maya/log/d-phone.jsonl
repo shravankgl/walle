@@ -1,0 +1,9 @@
+{"actor":"user","body":"Moved to Bangalore in September 2026.","caused_by":["d-mbp:1"],"confidence":0.3,"evidence_count":1,"level":"explicit","seq":1,"summary":"Lives in Bangalore","ts":"2026-10-15T10:00:00.000000+05:30","type":"assertion","v":1,"valid_from":"2026-09-01"}
+{"actor":"curator","caused_by":["d-mbp:2","d-phone:1"],"note":"Pune and Bangalore cannot both be home at once","seq":2,"ts":"2026-10-15T10:01:00.000000+05:30","type":"contradiction","v":1}
+{"about":"arjun","actor":"user","body":"Arjun works from a cafe on Tuesdays.","caused_by":[],"confidence":0.3,"evidence_count":1,"level":"deductive","seq":3,"summary":"Arjun works from a cafe on Tuesdays","ts":"2026-10-15T11:00:00.000000+05:30","type":"assertion","v":1,"valid_from":"2026-05-01","valid_to":"2026-12-01"}
+{"actor":"user","caused_by":[],"reason":"Arjun stopped","seq":4,"target":"d-phone:3","ts":"2026-10-16T09:00:00.000000+05:30","type":"supersede","v":1,"valid_to":"2026-07-15"}
+{"actor":"user","body":"Walks the dog at 7am.","caused_by":[],"confidence":0.3,"evidence_count":1,"level":"explicit","seq":5,"summary":"Walks the dog at 7am","ts":"2026-10-16T09:30:00.000000+05:30","type":"assertion","v":1}
+{"actor":"user","body":"Walks the dog at 8am.","caused_by":[],"confidence":0.3,"evidence_count":1,"level":"explicit","seq":6,"summary":"Walks the dog at 8am","ts":"2026-10-16T09:31:00.000000+05:30","type":"assertion","v":1}
+{"actor":"curator","caused_by":["d-phone:5","d-phone:6"],"note":"Two walk times, no world time to order them","seq":7,"ts":"2026-10-16T09:32:00.000000+05:30","type":"contradiction","v":1}
+{"actor":"curator","caused_by":["d-phone:5","d-mbp:1"],"seq":8,"ts":"2026-10-16T09:33:00.000000+05:30","type":"contradiction","v":1}
+{"actor":"proposer","body":"Started learning Marathi after the move.","caused_by":["d-mbp:1"],"level":"explicit","seq":9,"summary":"Learning Marathi","ts":"2026-10-18T19:00:00.000000+05:30","type":"proposal","v":1,"valid_from":"2026-10-01"}
