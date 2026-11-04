@@ -223,6 +223,12 @@ stranger. Findings:
 - **One model for proposing, answering and judging** when a provider is given. LongMemEval
   judges with GPT-4o; a run that uses a different judge should pass one. The `evaluate`
   function takes separate `answerer` and `judge`; only the command ties them.
+- **The *Evals* section sits at the end of the README, after *Documents*.** Main gained a
+  *Running the server sandboxed* subsection (#42) at the exact spot *Evals* was inserted,
+  so `update-branch` hit a merge conflict. The agent can only add single-parent commits
+  to the branch, not merge commits, and two insertions at the same point always conflict,
+  so the section moved to the one place main does not touch. Moving it back above
+  *Documents* is a one-line follow-up once both have landed.
 - **The report names failing items by id, nothing else.** A report in a public repo that
   quoted the item would quote the marker.
 

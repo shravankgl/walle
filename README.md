@@ -131,6 +131,14 @@ untrusted envelope with a random per-result id, labelled `_meta.ifc` from its pr
 - The envelope cannot stop the host from acting on what it reads. A memory layer runs inside
   the host and cannot taint its session or refuse its tool calls (D55).
 
+## Documents
+
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** — the system: layers, loops, event log, profiles
+- **[PLAN.md](PLAN.md)** — the roadmap: phases, metrics, writing track, risks
+- **[CONVERSATION.md](CONVERSATION.md)** — decision log: what was chosen, what was rejected, why
+- **[REFERRALS.md](REFERRALS.md)** — repos reviewed for adoption: what was taken, what was left, why
+- **[CLAUDE.md](CLAUDE.md)** — working agreement for Claude Code sessions in this repo
+
 ## Evals
 
 What the boundary refuses is measured, not asserted (D77), and what the memory does is
@@ -168,11 +176,3 @@ uv run --with 'aisuite[anthropic]' walle eval --model anthropic:claude-...   # a
 | LoCoMo (ten conversations) | — | — | **not run**: needs `locomo10.json` and model keys |
 
 These cells are filled from a report, never typed in. Until a run exists they stay empty.
-
-## Documents
-
-- **[ARCHITECTURE.md](ARCHITECTURE.md)** — the system: layers, loops, event log, profiles
-- **[PLAN.md](PLAN.md)** — the roadmap: phases, metrics, writing track, risks
-- **[CONVERSATION.md](CONVERSATION.md)** — decision log: what was chosen, what was rejected, why
-- **[REFERRALS.md](REFERRALS.md)** — repos reviewed for adoption: what was taken, what was left, why
-- **[CLAUDE.md](CLAUDE.md)** — working agreement for Claude Code sessions in this repo
