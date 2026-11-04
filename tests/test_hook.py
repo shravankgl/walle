@@ -305,11 +305,15 @@ def _break_lock_missing(folder: Path) -> None:
 
 
 def _break_learned_blank(folder: Path) -> None:
-    (folder / hot.LEARNED).write_text(" \n\n", encoding="utf-8")
+    path = folder / hot.LEARNED
+    path.chmod(0o644)  # rendered files are 0444; without CAP_DAC_OVERRIDE the write fails
+    path.write_text(" \n\n", encoding="utf-8")
 
 
 def _break_identity_empty(folder: Path) -> None:
-    (folder / hot.IDENTITY).write_bytes(b"")
+    path = folder / hot.IDENTITY
+    path.chmod(0o644)  # rendered files are 0444; without CAP_DAC_OVERRIDE the write fails
+    path.write_bytes(b"")
 
 
 BROKEN_FOLDERS = {

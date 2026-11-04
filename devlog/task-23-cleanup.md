@@ -91,18 +91,36 @@ Two of the tests set up an unusual state on purpose. The `_disagreement` test pl
 table in the old file. Only a recreated file loses it, while `DELETE FROM` keeps it, and an
 inode check would be unreliable because a freed inode can be reused at once. The
 `load_records` test removes the file between the existence check and the open. That is a real
-`SQLITE_CANTOPEN` at connect time. A `chmod 000` would not show it, because this sandbox can
-read a mode-000 file.
+`SQLITE_CANTOPEN` at connect time. A `chmod 000` test would only work for a process without
+`CAP_DAC_OVERRIDE`, and it would skip quietly everywhere else.
 
-Checks, on the final tree:
+Checks, on the final tree (the branch after Shravan merged main into it, plus the fix
+commit below). Run as uid 1000 with every capability dropped
+(`setpriv --inh-caps=-all --ambient-caps=-all --bounding-set=-all`), so file modes are
+enforced the way they are in CI:
 ```
-uv run pytest              460 passed, 3 skipped   (main: 447 passed, 3 skipped)
+uv run pytest              490 passed
 uv run ruff check          All checks passed!
-uv run ruff format --check 52 files already formatted
+uv run ruff format --check 57 files already formatted
 uv run pyright             0 errors, 0 warnings, 0 informations
 ```
-The 3 skips are the existing read-only-folder tests. They skip when the process can write a
-`0o555` folder, which this sandbox can.
+With the capabilities this sandbox has by default, the result is 487 passed, 3 skipped. The 3
+skips are the existing read-only-folder tests, which skip when the process can write a
+`0o555` folder.
+
+**CI failure on the first push, and the fix.** CI failed two of the new cases,
+`[identity.md is empty]` and `[learned.md is blank]`, with `PermissionError`. Their helpers
+wrote to a rendered file, and rendered files are `0444`. The sandbox runs as uid 1000 but
+holds every capability, including `CAP_DAC_OVERRIDE`, so it ignored the mode and the cases
+passed for me. I ran the first push's checks only that way, which was the mistake. The fix
+is in the tests only: each helper now `chmod(0o644)`s the file before writing it, as
+`_break_learned_bytes` already did. With capabilities dropped, both cases fail against main's
+`hook.py` on the hook's output, not on a permission error, and pass with the fix. I re-ran
+the whole suite with capabilities dropped to check my other new tests for the same
+assumption, and all of them pass. The new resolver tests touch no files. The index tests
+write `index.sqlite` and unlink inside folders the test owns. The blank `rules.md` test
+writes a file the fixture created, not a rendered one. From now on I run the suite with
+capabilities dropped before every push.
 
 **Two-runner walkthrough** (`index.py`: the lock and the derived file):
 - *Builder A runs `update` and finds a disagreement; reader B runs `load_records`.* A holds
