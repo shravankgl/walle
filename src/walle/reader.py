@@ -20,9 +20,11 @@ fail on every read for the rest of the log's life — one bad line bricking a st
   it reused this one's number. The later record is the acknowledged one; the earlier is
   skipped, because one ref naming two events is the failure this log exists to prevent.
 * **Everything else that is wrong is fatal.** Valid JSON that is not a valid event, a
-  missing ``seq``, a ``seq`` that goes backwards: none of these is an interrupted write, and
-  skipping them would silently drop or misnumber a real record. ``CorruptStreamError``
-  names the file and line. An event from a newer schema raises ``FutureSchemaError`` (D111).
+  missing ``seq``, a ``seq`` that is not a JSON integer a ref can carry (``"2"``, ``true``,
+  ``2.0``, more than 19 digits), a ``seq`` that goes backwards: none of these is an
+  interrupted write, and skipping them would silently drop or misnumber a real record.
+  ``CorruptStreamError`` names the file and line. An event from a newer schema raises
+  ``FutureSchemaError`` (D111).
 
 Every skip is returned in ``StreamContents.skips`` *and* logged as a warning — reported, not
 silent. Gaps in ``seq`` are allowed and are not skips: a process that dies after ``flush``
@@ -225,12 +227,27 @@ def _parse(data: bytes, path: Path, stream: str) -> StreamContents:
 def _record(data: object, path: Path, number: int, stream: str) -> Record:
     if not isinstance(data, dict):
         raise CorruptStreamError(f"{path}:{number}: a complete line that is not a JSON object")
+    # Taken before parsing: the model validates ``seq`` in lax mode, so ``"2"``, ``true`` and
+    # ``2.0`` all come out as ints, and only the raw value shows what was in the file.
+    raw_seq = data.get("seq")
     try:
-        event = parse_event(data)
+        event = parse_event(data)  # first, so a newer schema still halts by name (D111)
     except ValidationError as exc:
         raise CorruptStreamError(
             f"{path}:{number}: a complete line that is not a valid event — {exc}"
         ) from exc
     if event.seq is None:
         raise CorruptStreamError(f"{path}:{number}: an event with no seq")
-    return Record(ref=make_ref(stream, event.seq), seq=event.seq, event=event, line=number)
+    # The writer's rule (``writer._seq_of``): a JSON integer, not a bool, at least 1. A line
+    # the writer would refuse to number from is not one the reader may load.
+    if not isinstance(raw_seq, int) or isinstance(raw_seq, bool) or raw_seq < 1:
+        raise CorruptStreamError(
+            f"{path}:{number}: seq must be a JSON integer >= 1, found {raw_seq!r}"
+        )
+    try:
+        ref = make_ref(stream, event.seq)
+    except ValueError as exc:  # the stream id was checked in read_file; this is the seq
+        raise CorruptStreamError(
+            f"{path}:{number}: seq {raw_seq} is too large for a ref — {exc}"
+        ) from exc
+    return Record(ref=ref, seq=event.seq, event=event, line=number)

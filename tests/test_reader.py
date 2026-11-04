@@ -262,6 +262,104 @@ def test_a_repeated_seq_with_a_line_between_halts(tmp_path: Path) -> None:
         read_file(path, "d-mbp")
 
 
+# --- seq is an integer in range, or the line is corrupt (issue #20) ----------------------
+
+
+@pytest.mark.parametrize(
+    "seq",
+    ["2", True, 2.0, 10_000_000_000_000_000_000],
+    ids=["string", "bool", "float", "out-of-range"],
+)
+def test_a_seq_that_is_not_a_json_integer_in_range_halts_naming_the_line(
+    tmp_path: Path, seq: object
+) -> None:
+    """The same rule as the writer's ``_seq_of``: an int, not a bool, at least 1. Pydantic's
+    lax mode would coerce the first three, and the fourth overflows the ref format; each is
+    a complete line that is not a valid event, so it halts with ``file:line``. ``true`` is
+    the sharpest case: coerced to 1, it would make line 1 look like an unacknowledged
+    duplicate and silently drop it."""
+    path = tmp_path / "d-mbp.jsonl"
+    _write(path, _record(1), {**_record(2), "seq": seq}, _record(3))
+    with pytest.raises(CorruptStreamError, match=r"d-mbp\.jsonl:2: .*seq"):
+        read_file(path, "d-mbp")
+
+
+def test_the_largest_seq_a_ref_can_name_is_still_read(tmp_path: Path) -> None:
+    """The range edge: 19 digits is the most a ref carries, and it is not corrupt."""
+    path = tmp_path / "d-mbp.jsonl"
+    _write(path, _record(9_999_999_999_999_999_999))
+    assert [r.ref for r in read_file(path, "d-mbp")] == ["d-mbp:9999999999999999999"]
+
+
+def test_an_event_from_a_newer_build_still_halts_by_name_whatever_its_seq(
+    tmp_path: Path,
+) -> None:
+    """D111 keeps priority: a newer schema is named as such, not reported as a bad seq."""
+    path = tmp_path / "d-mbp.jsonl"
+    _write(path, _record(1), {**_record(2, v=99), "seq": "2"})
+    with pytest.raises(FutureSchemaError, match="v99"):
+        read_file(path, "d-mbp")
+
+
+# --- where a skip says it is -------------------------------------------------------------
+
+
+def test_each_skip_reports_the_byte_offset_and_preview_of_its_line(tmp_path: Path) -> None:
+    """All three skip branches in one synthetic file, with offsets worked out from the bytes
+    written rather than from the reader's own arithmetic:
+
+      line 1  seq 1                    kept
+      line 2  a mid-file fragment      skipped: not JSON
+      line 3  seq 2, unacknowledged    skipped: line 4 reuses its seq
+      line 4  seq 2                    kept
+      line 5  seq 3, cut, no newline   skipped: torn tail
+    """
+    path = tmp_path / "d-mbp.jsonl"
+    first = encode(_observation("first").model_copy(update={"seq": 1}))
+    fragment = b'{"seq":2,"ts":"tr\n'
+    unacked = encode(_observation("never acknowledged " * 4).model_copy(update={"seq": 2}))
+    acked = encode(_observation("the real seq 2").model_copy(update={"seq": 2}))
+    torn = encode(_observation("torn " * 30).model_copy(update={"seq": 3}))[:100]
+    lines = [first, fragment, unacked, acked, torn]
+    data = b"".join(lines)
+    path.write_bytes(data)
+    starts = [sum(len(line) for line in lines[:i]) for i in range(len(lines))]
+    assert len(unacked) > 80 and len(torn) > 80  # so the previews really are cut
+
+    contents = read_file(path, "d-mbp")
+
+    assert [r.line for r in contents] == [1, 4]
+    assert [s.line for s in contents.skips] == [2, 3, 5]
+    assert [s.offset for s in contents.skips] == [starts[1], starts[2], starts[4]]
+    assert (
+        [s.preview for s in contents.skips]
+        == [
+            '{"seq":2,"ts":"tr',  # the whole fragment, without its newline
+            unacked[:80].decode(),
+            torn[:80].decode(),
+        ]
+    )
+    for skip in contents.skips:  # each offset lands on the first byte of its preview
+        assert data[skip.offset :].startswith(skip.preview.encode())
+
+
+def test_a_preview_cut_inside_a_multibyte_character_is_replaced_not_an_error(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "d-mbp.jsonl"
+    good = encode(_observation("first").model_copy(update={"seq": 1}))
+    torn = encode(_observation("☕☕☕").model_copy(update={"seq": 2}))
+    cut = torn.index("☕".encode()) + 1
+    path.write_bytes(good + torn[:cut])
+
+    (skip,) = read_file(path, "d-mbp").skips
+
+    assert skip.offset == len(good)
+    assert cut < 80  # the whole torn line is the preview, ending mid-character
+    assert skip.preview == torn[:cut].decode("utf-8", "replace")
+    assert skip.preview.endswith("\ufffd")
+
+
 def test_a_unicode_line_separator_inside_a_body_does_not_split_the_record(
     tmp_path: Path,
 ) -> None:
