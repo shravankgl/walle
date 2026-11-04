@@ -100,7 +100,6 @@ import contextlib
 import fcntl
 import json
 import os
-import re
 import secrets
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
@@ -239,7 +238,7 @@ def _requests(
 # --- excerpts -----------------------------------------------------------------------------
 
 
-_LABEL = re.compile(r"^(user|assistant|tool|system):")
+_LABEL = hazards.LABEL  # one reading of a turn label, shared with the hazard checks
 
 
 def excerpts(ref: str, body: str, limit: int = EXCERPT_CHARS) -> list[tuple[str, str]]:
@@ -259,7 +258,7 @@ def excerpts(ref: str, body: str, limit: int = EXCERPT_CHARS) -> list[tuple[str,
     for line in body.split("\n"):
         match = _LABEL.match(line)
         if match:
-            role = match.group(1)
+            role = match.group(1).lower()
         # What a new piece starting at this line opens with: nothing when the line has its
         # own label or no role has been seen yet, else the role it continues.
         prefix = "" if match or role is None else f"{role}: "
@@ -345,7 +344,7 @@ class FakeModel:
         out: list[str] = []
         for line in excerpt.split("\n"):
             match = _LABEL.match(line)
-            if match and match.group(1) != "user":
+            if match and match.group(1).lower() != "user":
                 break
             said = line[match.end() :] if match else line
             if said.strip():

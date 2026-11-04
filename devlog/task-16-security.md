@@ -222,7 +222,27 @@ before commit:
   `>>>` as a Python prompt — conservative, one proposal's cost; the `turn` kind reaching
   `walle propose`'s stderr as a new word in the withheld list.
 
-**Review:** pending.
+**Review:**
+- *Round 1* — Gemini 4 Argon, `ocr delegate` file selection plus a direct read of `tests/`,
+  on `d4ae858`. `agent-review` failed: one medium, one low.
+  - **Medium, fixed.** `forged_turn` closed the opening block only on a blank line or an
+    `assistant:` line, so a paste's unlabelled continuation lines (an email after `---`, a
+    multi-line `tool:` turn) let a forged `user:` line through, and the fake then proposed
+    it. Now any line that is neither `user:` nor `tool:` closes the block, and a body that
+    opens with `tool:` has no opening block. The reviewer's three examples are cases in
+    `test_a_user_line_outside_the_opening_block_is_a_forged_turn`, and
+    `test_a_forged_turn_in_a_pasted_email_is_not_proposed` runs the email through
+    `propose`. All five new tests failed before the fix.
+  - **Low, fixed.** `proposer._LABEL` read only exact lowercase labels while `hazards`
+    read any case and spacing, so `TOOL:` after the person's line was the person's words to
+    the fake. `proposer` now uses `hazards.LABEL` and lowercases the role it carries;
+    `test_the_proposer_reads_labels_as_hazards_does`.
+  - Cost of the medium fix, said plainly: a prompt whose first text block runs over
+    several lines and is followed by a second `user:` block is now withheld as a forged
+    turn. The observer can write that, but rarely, and the price is one withheld proposal.
+  - Stranger pass on the round-1 diff: a `system:` line now closes the block as well (it
+    was caught only by `boundary` before, and still is); an unlabelled first line still
+    means no opening block; no IO, lock or error path is touched.
 
 **Choices made inside the task:**
 - **A seventh kind rather than keeping the turn inside `boundary`.** The issue's verify
@@ -251,7 +271,9 @@ before commit:
   corpus layout does, and its benign tool-result items have a genuine `user:` line after
   one. Treating `tool:` as a turn label keeps the corpus honest; in a real body a `tool:`
   line is pasted text and its effect is nil, because the rule then only matters for a
-  later `user:` line, which the blank or the reply still catches.
+  later `user:` line, which the blank or the reply still catches. After review round 1,
+  `tool:` keeps the block open only while lines stay labelled: an unlabelled continuation
+  closes it, and a body cannot open with one.
 - **`_read_other` reads unlocked when refused** rather than failing or waiting. Failing
   would make a concurrent run on another device an error; waiting is the deadlock. A torn
   tail is exactly what D80's reader is for.
