@@ -16,8 +16,10 @@ Before the model
 Observations hold real session text, so three things happen before any of it is sent:
 
 1. **Hazards are flagged** (``hazards.flag``). An observation carrying a credential, a
-   secret, contact details or a confidence is withheld entirely and reported by ref and
-   kind, never by content.
+   secret, contact details, a confidence, a planted instruction, a claim of approval, or a
+   forged marker or turn is withheld entirely and reported by ref and kind, never by
+   content. That is where D77's injection gate is enforced, not in any model's behaviour:
+   text inside an observation is never parsed as a turn or read as an instruction.
 2. **Nothing is sent whole.** Each body is cut into excerpts of at most ``EXCERPT_CHARS``
    on line boundaries, and a request holds at most ``REQUEST_CHARS`` of them. A very long
    observation spans several excerpts, each labelled ``<ref>#<part>`` so a proposal can
@@ -28,10 +30,16 @@ Observations hold real session text, so three things happen before any of it is 
 After the model
 ---------------
 The reply is data too. It is parsed as JSON, and a proposal is kept only if it cites an
-excerpt that was in the request, carries no envelope marker, carries no hazard of its own,
-has a summary that fits, and is not a repeat. A reply that does not parse at all writes
-nothing (fail closed, D86). A judging reply that fails leaves the proposals in place and
-records no verdict, and the report says so.
+excerpt that was in the *same* request, has a body within ``BODY_CHARS``, carries no
+envelope marker, carries no hazard of its own, has a summary, and is not a repeat of one
+already accepted in this run. A reply that does not parse at all writes nothing (fail
+closed, D86). Once the proposals are written, nothing raises: a judging reply that fails, a
+shadow file that cannot be written or read, is reported in ``shadow_error`` and the
+proposals stand.
+
+The shadow files follow D80: a line that does not load, a torn tail among them, is passed
+over on every read, and an append after a torn tail starts with a newline so the new line is
+whole.
 
 The model
 ---------
@@ -109,6 +117,10 @@ EXCERPT_CHARS = 2000
 REQUEST_CHARS = 8000
 """The most enveloped text one request carries. The instructions come on top, once."""
 
+BODY_CHARS = 2000
+"""The longest proposal body a reply may carry. A fact with its why fits; a pasted page
+does not, and is refused as ``oversize`` rather than staged for someone to scroll through."""
+
 LINE_LIMIT = 400
 """The longest line the fake treats as one statement. Longer lines are pasted text."""
 
@@ -165,6 +177,11 @@ JUDGE_INSTRUCTIONS = (
     "and acts on nothing; a person decides. Reply with a JSON list only:\n"
     '[{"ref": "<ref>", "verdict": "keep" | "drop", "reason": "<one line>"}]\n'
 )
+
+
+def _marked(text: str) -> bool:
+    """Whether model output carries anything shaped like an envelope marker."""
+    return "<<<" in text or ">>>" in text
 
 
 def _deface(text: str) -> str:
@@ -247,11 +264,10 @@ def _ref_of(excerpt_id: str) -> str:
 class FakeModel:
     """A deterministic stand-in: no key, no network, the same answer every time.
 
-    Proposes each ``user:`` line of at most ``LINE_LIMIT`` characters that carries one of
-    ``CUES``: the person stating something lasting in their own words. Continuation lines of
-    a pasted text carry no ``user:`` prefix and are never proposed. Judges a staged item a
-    keep on the same test. Replies in the JSON shape a real model is asked for, so the
-    parsing path is the one a real reply would take.
+    Proposes each line of the person's block (``person_lines``) of at most ``LINE_LIMIT``
+    characters that carries one of ``CUES``: the person stating something lasting in their
+    own words. Judges a staged item a keep on the same test. Replies in the JSON shape a real
+    model is asked for, so the parsing path is the one a real reply would take.
     """
 
     name = "fake"
@@ -283,6 +299,22 @@ class FakeModel:
         lower = text.lower()
         return any(cue in lower for cue in cls.CUES)
 
+    @staticmethod
+    def person_lines(excerpt: str) -> list[str]:
+        """The lines of an excerpt that are the person's, by the observer's layout: the
+        ``user:`` block comes first and ends at the first ``assistant:`` line. An excerpt
+        with no label is read as a continuation of the person's block. Nothing after an
+        ``assistant:`` line is ever read as a turn, whatever it is prefixed with — a
+        ``user:`` line there is pasted text, and ``hazards`` has flagged it already."""
+        out: list[str] = []
+        for line in excerpt.split("\n"):
+            if line.startswith("assistant:"):
+                break
+            said = line[len("user: ") :] if line.startswith("user: ") else line
+            if said.strip():
+                out.append(said.strip())
+        return out
+
     def complete(self, request: Request) -> str:
         out: list[dict[str, str]] = []
         for item_id, wrapped in request.items:
@@ -299,11 +331,8 @@ class FakeModel:
                     }
                 )
                 continue
-            for line in inner.split("\n"):
-                if not line.startswith("user: ") or len(line) > LINE_LIMIT:
-                    continue
-                said = line[len("user: ") :].strip()
-                if said and self.lasting(said):
+            for said in self.person_lines(inner):
+                if len(said) <= LINE_LIMIT and self.lasting(said):
                     out.append(
                         {
                             "excerpt": item_id,
@@ -359,11 +388,17 @@ class _Candidate:
     level: Level
 
 
-def _candidates(reply: str, allowed: set[str]) -> tuple[list[_Candidate], list[str]]:
-    """The proposals in a reply that pass every check, and a reason for each one that did not."""
+def _candidates(
+    reply: str, allowed: set[str], seen: set[tuple[str, str, str]]
+) -> tuple[list[_Candidate], list[str]]:
+    """The proposals in a reply that pass every check, and a reason for each one that did not.
+
+    ``allowed`` is the excerpt ids of *this* request: a proposal must cite something the model
+    was shown in the same request, not in another. ``seen`` is shared across the run's
+    requests, so one fact proposed from two excerpts of a long observation is staged once.
+    """
     kept: list[_Candidate] = []
     dropped: list[str] = []
-    seen: set[tuple[str, str, str]] = set()
     for raw in _parse_list(reply, "propose"):
         try:
             item = _ProposalReply.model_validate(raw)
@@ -375,8 +410,11 @@ def _candidates(reply: str, allowed: set[str]) -> tuple[list[_Candidate], list[s
         if item.excerpt not in allowed:
             dropped.append("unknown-excerpt")
             continue
+        if len(body) > BODY_CHARS:
+            dropped.append("oversize")
+            continue
         text = f"{summary}\n{body}"
-        if "<<<" in text or ">>>" in text:
+        if _marked(text):
             dropped.append("marker-in-text")
             continue
         if hazards.flag(text):
@@ -461,7 +499,23 @@ def _read_shadow[T: BaseModel](path: Path, kind: type[T]) -> tuple[T, ...]:
 
 
 def _parse_shadow[T: BaseModel](data: bytes, kind: type[T]) -> tuple[T, ...]:
-    return tuple(kind.model_validate_json(line) for line in data.split(b"\n") if line.strip())
+    """The lines of a shadow file that load, in order.
+
+    D80, as the reader does it: a line that does not load is stepped over, never fatal. An
+    append interrupted mid-line leaves a torn tail; the next append closes it with a newline
+    (so that line stays torn and the new one is whole), and every read passes it over. The
+    cost of a line lost this way is one verdict or one "seen" mark, which the next run
+    makes again. The cost of refusing to read would be every later run.
+    """
+    out: list[T] = []
+    for line in data.split(b"\n"):
+        if not line.strip():
+            continue
+        try:
+            out.append(kind.model_validate_json(line))
+        except ValidationError:
+            continue
+    return tuple(out)
 
 
 def _append_shadow[T: BaseModel](
@@ -475,11 +529,16 @@ def _append_shadow[T: BaseModel](
         fcntl.flock(f.fileno(), fcntl.LOCK_EX)
         size = f.seek(0, os.SEEK_END)
         f.seek(0)
-        have = {key(line) for line in _parse_shadow(f.read(size), kind)}
+        data = f.read(size)
+        have = {key(line) for line in _parse_shadow(data, kind)}
         f.seek(0, os.SEEK_END)
+        torn = bool(data) and not data.endswith(b"\n")
         for line in lines:
             if key(line) in have:
                 continue
+            if torn:
+                f.write(b"\n")  # close the torn tail, so this line starts a line of its own
+                torn = False
             f.write(line.model_dump_json().encode("utf-8") + b"\n")
             have.add(key(line))
             written += 1
@@ -533,8 +592,17 @@ class ProposeReport:
 
     @property
     def silent(self) -> bool:
-        """D63: nothing proposed and nothing recorded is nothing to say."""
-        return not self.proposed and not self.verdicts and self.shadow_error is None
+        """D63: nothing to say. Nothing was staged, nothing the model offered was refused,
+        nothing was found already proposed, and the shadow log is whole. Verdicts recorded
+        quietly do not break the silence: shadow records, it does not report (D82), and
+        ``--score`` is where to read them. Withheld observations are listed only on a run
+        that has something else to say, so a standing list is not printed every week."""
+        return (
+            not self.proposed
+            and not self.dropped
+            and not self.already_proposed
+            and self.shadow_error is None
+        )
 
 
 def _considered(records: Iterable[Record]) -> set[str]:
@@ -584,17 +652,19 @@ def propose(
 
     # Ask, with no lock held. Every reply is read before anything is written, so a bad one
     # among several writes nothing at all.
-    allowed = {item_id for item_id, _ in items}
     candidates: list[_Candidate] = []
     dropped: list[str] = []
+    seen_candidates: set[tuple[str, str, str]] = set()
     requests = 0
     for request in _requests("propose", items):
         requests += 1
-        kept, refused = _candidates(model.complete(request), allowed)
+        allowed = {item_id for item_id, _ in request.items}
+        kept, refused = _candidates(model.complete(request), allowed, seen_candidates)
         candidates.extend(kept)
         dropped.extend(refused)
 
     proposed: list[str] = []
+    new_items: list[Staged] = []
     already = 0
     if candidates:
         with writer.locked() as stream:
@@ -614,33 +684,35 @@ def propose(
                 written = stream.append(event)
                 assert written.seq is not None
                 proposed.append(make_ref(writer.stream, written.seq))
+                new_items.append(Staged(proposed[-1], written))
 
     # Everything the model was shown is recorded as seen, proposed from or not, so the next
     # run does not send it again. Written after the proposals: if that append failed, the
     # observations are re-shown next time rather than lost.
+    # From here on the proposals are durable, so nothing may raise: a failure in the shadow
+    # log is reported in ``shadow_error`` and the command still says what was staged (D82).
+    # ``ValueError`` is for anything a model reply or a path puts into a pydantic field.
     shadow_error: str | None = None
-    if shown:
-        try:
+    verdicts = 0
+    try:
+        if shown:
             _append_seen(
                 seen_path(root, principal),
                 (Seen(ts=when, observation=ref, model=model.name) for ref in shown),
             )
-        except OSError as exc:
-            shadow_error = f"{seen_path(root, principal)}: {exc}"
-
-    # Judge in shadow: every staged item this model has no verdict for yet.
-    queue = staged(index.update(root, principal).records) if proposed else staged(records)
-    have = {(v.proposal, v.model) for v in read_verdicts(root, principal)}
-    to_judge = [item for item in queue if (item.ref, model.name) not in have]
-    verdicts = 0
-    if to_judge and shadow_error is None:
-        try:
+        # Judge in shadow: every staged item this model has no verdict for yet. The queue is
+        # the fold over the records read above plus what this run just wrote, which is staged
+        # by construction; the index is not read again, so a log problem cannot surface here
+        # dressed as a shadow one.
+        queue = (*staged(records), *new_items)
+        have = {(v.proposal, v.model) for v in read_verdicts(root, principal)}
+        to_judge = [item for item in queue if (item.ref, model.name) not in have]
+        if to_judge:
             judged, asked = _judge(model, to_judge, when)
             requests += asked
             verdicts = _append_verdicts(verdicts_path(root, principal), judged)
-        except (ModelReplyError, OSError) as exc:
-            # The proposals above are written and stay; only the shadow log is affected.
-            shadow_error = str(exc)
+    except (ModelReplyError, OSError, ValueError) as exc:
+        shadow_error = f"{type(exc).__name__}: {exc}"
 
     return ProposeReport(
         model=model.name,
@@ -665,7 +737,8 @@ def _judge(model: Model, queue: Sequence[Staged], when: str) -> tuple[list[Shado
     verdicts: dict[str, ShadowVerdict] = {}
     items: list[tuple[str, str]] = []
     for item in queue:
-        text = f"{item.proposal.summary}\n{item.proposal.body}"
+        # Judged on its head, bounded like an excerpt: ``walle remember`` takes any length.
+        text = excerpts(item.ref, f"{item.proposal.summary}\n{item.proposal.body}")[0][1]
         if kinds := hazards.flag(text):
             verdicts[item.ref] = ShadowVerdict(
                 ts=when,
@@ -687,9 +760,10 @@ def _judge(model: Model, queue: Sequence[Staged], when: str) -> tuple[list[Shado
                 continue  # one bad line is not a reason to lose the rest
             if item.ref not in asked or item.ref not in by_ref or item.ref in verdicts:
                 continue
-            reason = " ".join(item.reason.split())[:500]
-            if hazards.flag(reason):
-                reason = "reason withheld: it carried a hazard"  # model output is data too
+            reason = " ".join(item.reason.split())
+            if hazards.flag(reason) or _marked(reason):  # model output is data too
+                reason = "reason withheld: it carried a hazard or a marker"
+            reason = reason[:500]
             verdicts[item.ref] = ShadowVerdict(
                 ts=when, proposal=item.ref, model=model.name, verdict=item.verdict, reason=reason
             )

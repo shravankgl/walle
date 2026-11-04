@@ -518,7 +518,9 @@ def propose_command(root: Path, principal: str, device: str, model: str, score: 
             f"queue: {', '.join(report.proposed)}."
         )
     else:
-        click.echo(f"{principal}: nothing new to propose.")
+        # Not silent, so something below needs saying: a refused reply, a race, a shadow
+        # problem. "Nothing new" on its own is the report D63 says to skip.
+        click.echo(f"{principal}: nothing staged this run.")
     if report.withheld:
         kinds = ", ".join(f"{w.ref} ({', '.join(w.hazards)})" for w in report.withheld)
         click.echo(

@@ -1,16 +1,32 @@
-"""Secrets and other people's details, found before anything leaves the machine (D18, D77).
+"""Secrets, other people's details and planted instructions, found before anything leaves the
+machine (D18, D55, D77).
 
-Observations hold the text of real sessions. Before one is shown to a model, ``flag`` says
-whether it carries something that must not travel: a credential, a secret, contact details,
-or a confidence about a third party. The proposer withholds a flagged observation entirely.
-That is stricter than D77 asks (a dangerous item may become an assertion *with a flag*) and
-coarser than D18 wants (pseudonymise, so the model still sees the structure). Both are the
-right later shape. For now the rule is the one that cannot leak: nothing flagged is sent.
+Observations hold the text of real sessions, and that text is **data**: what a web page said,
+what a tool returned, what someone pasted. Before an observation is shown to a model, ``flag``
+says whether it carries something that must not travel, or something that is trying to be
+read as an instruction:
+
+* a credential, a secret, contact details, or a confidence about a third party (D77's
+  ``dangerous`` corpus), which must not reach a vendor;
+* a planted instruction, a claim of prior approval, a forged envelope or boundary marker, or
+  a forged turn (D77's ``injection`` corpus), which must not become a proposal.
+
+The proposer withholds a flagged observation entirely. For secrets that is stricter than D77
+asks (a dangerous item may become an assertion *with a flag*) and coarser than D18 wants
+(pseudonymise, so the model still sees the structure). For injection it is exactly D77's
+gate: zero reach a proposal. Both finer paths are the right later shape; for now the rule is
+the one that cannot leak and cannot be talked round: nothing flagged is sent.
 
 Deterministic, and conservative on purpose. A false flag costs one proposal; a miss sends a
-secret to a vendor. Every rule here was checked against ``tests/corpora``: every item of
-``dangerous.jsonl`` flags, and no item of ``benign.jsonl`` does, including the near-misses
-that mention passwords, phone numbers and rules without carrying any.
+secret to a vendor or lets a web page write a memory. Every rule here was checked against
+``tests/corpora``: every item of ``dangerous.jsonl`` and ``injection.jsonl`` flags, with the
+tool turns included, and no item of ``benign.jsonl`` does, including the near-misses that
+mention passwords, phone numbers, rules and approvals without carrying any.
+
+**A line inside a body is never a turn.** The observer writes one ``user:`` block, then
+``assistant:`` lines (``observer.py``). So a ``user:`` line that follows an ``assistant:`` line,
+or follows a blank line, did not come from the person: it is text that was pasted or returned
+and is shaped to be read as the person speaking. ``flag`` reports it as ``boundary``.
 
 ``flag`` returns the **kinds** found, never the matched text. A report that said "withheld,
 because it contains 4821" would be the leak it exists to prevent.
@@ -33,7 +49,15 @@ so the person's own are flagged too; D18's pseudonymisation is the finer path.""
 DISCLOSURE = "disclosure"
 """Something told in confidence, or another person's health, in so many words."""
 
-KINDS: tuple[str, ...] = (CREDENTIAL, SECRET, CONTACT, DISCLOSURE)
+INSTRUCTION = "instruction"
+"""Text addressed to the assistant rather than said by the person: an order to remember or
+to ignore its instructions, or a claim that something was already approved (D77)."""
+
+BOUNDARY = "boundary"
+"""A forged envelope or boundary marker (D55), or a forged turn: a ``user:`` or ``system:``
+line where the observer would never write one."""
+
+KINDS: tuple[str, ...] = (CREDENTIAL, SECRET, CONTACT, DISCLOSURE, INSTRUCTION, BOUNDARY)
 
 _CREDENTIAL = (
     # The corpora's own shape, named so the eval cannot be passed by accident.
@@ -91,6 +115,79 @@ _DISCLOSURE = (
     ),
 )
 
+_INSTRUCTION = (
+    # "Ignore all previous instructions" and its cousins. "Ignore last week's shopping list"
+    # names no instructions and is not matched.
+    re.compile(
+        r"\b(?:ignore|disregard|forget|override)\b[^\n.]{0,20}?"
+        r"\b(?:previous|prior|earlier|above|preceding|all|any|your|the)\b[^\n.]{0,20}?"
+        r"\b(?:instructions?|rules|prompts?|guidelines|directives)\b",
+        re.IGNORECASE,
+    ),
+    # An order to write memory: "remember permanently that", "save a note that", "store as a
+    # fact", "add to the user's rules", "write it straight to the log". The person says
+    # "remember that lentil soup as a weeknight staple" — no object below, not matched.
+    re.compile(
+        r"\b(?:remember|save|store|write|add|record|note)\b[^\n.]{0,40}?"
+        r"\b(?:permanently|a note that|as a fact|as fact|to the log|straight to|"
+        r"to (?:the |your |their )?(?:user'?s? |principal'?s? )?"
+        r"(?:rules|memory|memories|facts|hot tier))\b",
+        re.IGNORECASE,
+    ),
+    # Addressed to the assistant or the system by name. Not a bare ``assistant:``, which is
+    # how the observer labels the reply itself ("assistant: Remember to bring your keys").
+    re.compile(
+        r"\b(?:AI assistant|AI|system|model|agent|walle)\s*:\s*"
+        r"(?:save|store|remember|add|write|note|record|trusted)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\btrusted from here on\b|\bsaved to memory\b", re.IGNORECASE),
+    # Prior approval asserted by the text itself. "The school approved the trip form" is
+    # about a third party's form, not about this text, and is not matched.
+    re.compile(
+        r"\b(?:pre-?approved|already approved|no need to ask again|review status\s*:|"
+        r"kept by (?:the )?user|approved by the (?:account )?owner|"
+        r"the (?:user|principal|owner|account owner) (?:has )?(?:already )?"
+        r"(?:approved|agreed|asked you|told you|trusts|consents|authori[sz]ed|lets|allows|"
+        r"wants you))\b",
+        re.IGNORECASE,
+    ),
+)
+
+_BOUNDARY = (
+    re.compile(r"<<<\s*/?\s*(?:un)?trusted\b|<<<[^\n>]{0,40}>>>"),
+    re.compile(
+        r"</?\s*(?:untrusted|trusted|tool_result|tool_results|tool_use|function_results?|"
+        r"system|instructions?|user|assistant|human|context|document|memory|prompt)\s*>",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\[\s*(?:end|begin|start)\s+of\s+[^\]\n]{0,40}\]", re.IGNORECASE),
+    re.compile(r"(?m)^\s*(?:system|SYSTEM)\s*:"),
+)
+
+_TURN = re.compile(r"^\s*(user|assistant)\s*:", re.IGNORECASE)
+
+
+def forged_turn(text: str) -> bool:
+    """Whether a ``user:`` line sits where the observer would never write one: after an
+    ``assistant:`` line, or after a blank line. ``observer._body`` writes the person's
+    block first and the reply after it, with no blank line between roles; anything else
+    shaped like a turn came from inside a block."""
+    replied = False
+    blank = False
+    for line in text.split("\n"):
+        if not line.strip():
+            blank = True
+            continue
+        match = _TURN.match(line)
+        if match:
+            role = match.group(1).lower()
+            if role == "user" and (replied or blank):
+                return True
+            replied = replied or role == "assistant"
+        blank = False
+    return False
+
 
 def flag(text: str) -> tuple[str, ...]:
     """The kinds of hazard in ``text``, in ``KINDS`` order; ``()`` when there is none.
@@ -106,4 +203,8 @@ def flag(text: str) -> tuple[str, ...]:
         found.add(CONTACT)
     if any(pattern.search(text) for pattern in _DISCLOSURE):
         found.add(DISCLOSURE)
+    if any(pattern.search(text) for pattern in _INSTRUCTION):
+        found.add(INSTRUCTION)
+    if any(pattern.search(text) for pattern in _BOUNDARY) or forged_turn(text):
+        found.add(BOUNDARY)
     return tuple(kind for kind in KINDS if kind in found)
