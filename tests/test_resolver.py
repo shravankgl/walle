@@ -26,6 +26,7 @@ from walle.events import (
     Assertion,
     Contradiction,
     Observation,
+    Proposal,
     Supersede,
 )
 from walle.reader import Record, read_stream
@@ -34,6 +35,7 @@ from walle.resolver import (
     ResolutionError,
     Window,
     resolve,
+    staged,
     starts_later,
     windows_overlap,
 )
@@ -470,3 +472,56 @@ def test_belief_names_a_ref_that_is_not_current() -> None:
     resolution = resolve(_stream(_assertion("a"), _supersede("d-mbp:1")))
     with pytest.raises(KeyError, match="d-mbp:1"):
         resolution.belief("d-mbp:1")
+
+
+# --- the staging queue (task 9, D49, D60) -----------------------------------------------
+
+
+def _proposal(summary: str) -> Proposal:
+    return Proposal(ts=TS, actor=ACTOR_USER, body=summary, summary=summary)
+
+
+def _kept(proposal_ref: str, summary: str) -> Assertion:
+    return Assertion(
+        ts=TS, actor=ACTOR_USER, body=summary, summary=summary, caused_by=[proposal_ref]
+    )
+
+
+def test_a_proposal_is_staged_and_never_current() -> None:
+    records = _stream(_proposal("likes rasam"))
+    assert [s.ref for s in staged(records)] == ["d-mbp:1"]
+    assert resolve(records).current == ()
+
+
+def test_an_assertion_citing_a_proposal_decides_it() -> None:
+    records = _stream(_proposal("likes rasam"), _kept("d-mbp:1", "likes rasam"))
+    assert staged(records) == ()
+    assert [b.ref for b in resolve(records).current] == ["d-mbp:2"]
+
+
+def test_a_superseded_proposal_is_not_staged_and_still_in_the_records() -> None:
+    records = _stream(_proposal("likes rasam"), _supersede("d-mbp:1"))
+    assert staged(records) == ()
+    assert resolve(records).unapplied == ()  # the tombstone applied: its target was given
+
+
+def test_superseding_the_tombstone_stages_the_proposal_again() -> None:
+    """Rule 1 for proposals too: a drop is undone by retracting it, not by editing."""
+    records = _stream(_proposal("likes rasam"), _supersede("d-mbp:1"), _supersede("d-mbp:2"))
+    assert [s.ref for s in staged(records)] == ["d-mbp:1"]
+
+
+def test_a_kept_proposal_stays_decided_after_its_assertion_is_forgotten() -> None:
+    """Forgetting the belief later must not put the proposal back in the review batch."""
+    records = _stream(
+        _proposal("likes rasam"), _kept("d-mbp:1", "likes rasam"), _supersede("d-mbp:2")
+    )
+    assert staged(records) == ()
+    assert resolve(records).current == ()
+
+
+def test_staged_is_in_ref_order_whatever_the_input_order() -> None:
+    records = _stream(_proposal("a"), _proposal("b"), device="phone") + _stream(_proposal("c"))
+    shuffled = list(records)
+    random.Random(9).shuffle(shuffled)
+    assert [s.ref for s in staged(shuffled)] == ["d-mbp:1", "d-phone:1", "d-phone:2"]

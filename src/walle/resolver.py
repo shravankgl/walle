@@ -30,6 +30,14 @@ The rules
    both null, or a start that cannot be ordered — is a real conflict. Both sides stay current
    and the contradiction is returned under ``conflicts``; D58 presents both rather than picking.
 
+The staging queue (D49, D60)
+---------------------------
+``staged`` is the same kind of fold for ``proposal`` events: a proposal is staged while it
+is live (rule 1, so a drop is a ``supersede`` and undoing a drop is superseding that) and no
+``assertion`` names it in ``caused_by``. Any assertion counts, live or not: forgetting a kept
+belief later must not put the proposal back in the review batch. ``resolve`` never returns a
+proposal, so nothing staged can reach the hot tier.
+
 Each contradiction is judged on the windows as written, never on windows another
 contradiction has already closed. That is what makes the answer independent of input order.
 
@@ -55,7 +63,15 @@ from typing import TYPE_CHECKING
 
 from pydantic import TypeAdapter
 
-from walle.events import AnyEvent, Assertion, Contradiction, Supersede, WorldTime, parse_ref
+from walle.events import (
+    AnyEvent,
+    Assertion,
+    Contradiction,
+    Proposal,
+    Supersede,
+    WorldTime,
+    parse_ref,
+)
 
 if TYPE_CHECKING:  # annotations only: the fold takes records, it never reads them itself
     from collections.abc import Iterable
@@ -149,6 +165,14 @@ class Resolution:
             if belief.ref == ref:
                 return belief
         raise KeyError(f"{ref} is not a current assertion")
+
+
+@dataclass(frozen=True)
+class Staged:
+    """A proposal still waiting for a keep, an edit or a drop."""
+
+    ref: str
+    proposal: Proposal
 
 
 # --- world time --------------------------------------------------------------------------
@@ -342,6 +366,37 @@ def resolve(records: Iterable[Record]) -> Resolution:
         conflicts=tuple(conflicts),
         unapplied=tuple(unapplied),
     )
+
+
+def staged(records: Iterable[Record]) -> tuple[Staged, ...]:
+    """The staging queue: every live proposal no assertion has decided, in ref order.
+
+    Pure, like ``resolve``: the same records in any order give the same answer.
+    """
+    events = _by_ref(records)
+    live, _ = _liveness(events)
+    decided = {
+        cause
+        for event in events.values()
+        if isinstance(event, Assertion)
+        for cause in event.caused_by
+    }
+    return tuple(
+        Staged(ref, event)
+        for ref in sorted(events, key=_ref_key)
+        if isinstance(event := events[ref], Proposal) and live[ref] and ref not in decided
+    )
+
+
+def retired_by(records: Iterable[Record], ref: str) -> tuple[str, ...]:
+    """The live supersedes that target ``ref``, in ref order. Empty when it is live.
+
+    For any event, not only assertions: it is how a review says which tombstone dropped a
+    proposal.
+    """
+    events = _by_ref(records)
+    live, targeted_by = _liveness(events)
+    return tuple(s for s in targeted_by.get(ref, ()) if live[s])
 
 
 def _supersede_valid_to(event: AnyEvent) -> str | None:

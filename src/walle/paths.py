@@ -43,6 +43,7 @@ STREAM_SUFFIX = ".jsonl"
 INDEX_FILENAME = "index.sqlite"
 INDEX_LOCK_FILENAME = "index.lock"
 HOT_DIRNAME = "hot"
+STAGING_LOCK_FILENAME = "staging.lock"
 
 
 def check_name(name: str, *, kind: str) -> str:
@@ -100,3 +101,12 @@ def hot_dir(root: Path, principal: str) -> Path:
     constraint 6). The rendered files are derived (D10, D107); ``rules.md`` is not.
     """
     return principal_dir(root, principal) / HOT_DIRNAME
+
+
+def staging_lock_path(root: Path, principal: str) -> Path:
+    """``<root>/principals/p-<principal>/staging.lock`` — held while a review decides one item.
+
+    Per principal, not per stream: two reviews on two devices' streams of the same profile
+    must still see each other's decisions.
+    """
+    return principal_dir(root, principal) / STAGING_LOCK_FILENAME
