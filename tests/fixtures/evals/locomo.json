@@ -1,0 +1,88 @@
+[
+ {
+  "sample_id": "synth-conv-1",
+  "conversation": {
+   "speaker_a": "Priya",
+   "speaker_b": "Tomasz",
+   "session_1_date_time": "1:56 pm on 8 May, 2023",
+   "session_1": [
+    {
+     "speaker": "Priya",
+     "dia_id": "D1:1",
+     "text": "I started volunteering at the animal shelter on Saturdays."
+    },
+    {
+     "speaker": "Tomasz",
+     "dia_id": "D1:2",
+     "text": "That is great! I adopted my greyhound Biscuit from a shelter two years ago."
+    },
+    {
+     "speaker": "Priya",
+     "dia_id": "D1:3",
+     "text": "I am training for the Sampleton half marathon in October."
+    }
+   ],
+   "session_2_date_time": "7:10 pm on 22 May, 2023",
+   "session_2": [
+    {
+     "speaker": "Tomasz",
+     "dia_id": "D2:1",
+     "text": "Biscuit the greyhound passed his vet check with flying colours."
+    },
+    {
+     "speaker": "Priya",
+     "dia_id": "D2:2",
+     "text": "My sister Anika is visiting from Oslo next month for the half marathon."
+    },
+    {
+     "speaker": "Tomasz",
+     "dia_id": "D2:3",
+     "text": "I will bring Biscuit to cheer you both on at the finish."
+    }
+   ]
+  },
+  "qa": [
+   {
+    "question": "Where does Priya volunteer on Saturdays?",
+    "answer": "At the animal shelter",
+    "evidence": [
+     "D1:1"
+    ],
+    "category": 1
+   },
+   {
+    "question": "Who will cheer Priya and her sister Anika on at the half marathon finish?",
+    "answer": "Tomasz and his greyhound Biscuit",
+    "evidence": [
+     "D2:2",
+     "D2:3"
+    ],
+    "category": 2
+   },
+   {
+    "question": "How long ago did Tomasz adopt his greyhound Biscuit from a shelter?",
+    "answer": "Two years before May 2023",
+    "evidence": [
+     "D1:2"
+    ],
+    "category": 3
+   },
+   {
+    "question": "What sport is Priya training for the Sampleton half marathon in?",
+    "answer": "Running",
+    "evidence": [
+     "D1:3"
+    ],
+    "category": 4
+   },
+   {
+    "question": "Which marathon did Tomasz run with Biscuit?",
+    "adversarial_answer": "Tomasz never said he ran a marathon.",
+    "evidence": [
+     "D2:3"
+    ],
+    "category": 5
+   }
+  ]
+ }
+]
