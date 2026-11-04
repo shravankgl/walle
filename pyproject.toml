@@ -13,6 +13,7 @@ dependencies = [
 
 [project.scripts]
 walle = "walle.cli:main"
+walle-hook = "walle.hook:main"
 
 [dependency-groups]
 dev = [

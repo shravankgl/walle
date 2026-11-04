@@ -69,6 +69,42 @@ and carry it to a different model vendor.
 6. **Trust is earned per domain.** Observe → propose → act-with-confirm → autonomous-bounded.
    Trusted with your calendar is not trusted with your money.
 
+## Install the SessionStart hook
+
+Not usable yet (see the status above), but this is how the hot tier reaches Claude Code
+(D54). walle never edits your settings: you paste this into `~/.claude/settings.json`
+yourself, replacing the two paths and the name. Keep any `hooks` you already have.
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/walle/.venv/bin/walle-hook --root /path/to/walle-data --principal maya",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+- `/path/to/walle` is your checkout, after `uv sync`. `/path/to/walle-data` is the folder
+  that holds `principals/`, and `maya` is whose memory this session gets.
+- With no `matcher`, it runs on startup, resume, `/clear` and compaction alike.
+- The hook only reads the hot tier that `walle render` wrote. If anything is wrong, or it takes
+  more than 2 seconds, it prints nothing and the session starts without memory (D115).
+  `timeout` is Claude Code's own limit, a guard behind that one; without it the host waits
+  600 seconds.
+- To see what it injects and roughly how many tokens that is, run it by hand:
+  `echo '{"hook_event_name": "SessionStart"}' | /path/to/walle/.venv/bin/walle-hook --root
+  /path/to/walle-data --principal maya --measure`. The JSON goes to stdout, the count to
+  stderr.
+
 ## Documents
 
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — the system: layers, loops, event log, profiles
