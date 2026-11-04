@@ -62,9 +62,14 @@ _GAP = f"[{_GAP_CHARS}]*"
 _OPEN = "<\uff1c\ufe64\u2039\u3008"  # ASCII, fullwidth, small form, guillemet, CJK angle
 _CLOSE = ">\uff1e\ufe65\u203a\u3009"  # the same five, closing
 
-_FORGED_RE = re.compile(
-    rf"(?:[{_OPEN}]{_GAP}){{2,}}[\s/{_GAP_CHARS}]*untrusted[^\n]*?(?:(?:[{_CLOSE}]{_GAP}){{2,}}|$)",
-    re.IGNORECASE | re.MULTILINE,
+_NAME_RE = re.compile("untrusted", re.IGNORECASE)
+_GAP_SET = frozenset(chr(c) for c in (0xAD, *range(0x200B, 0x2010), *range(0x2060, 0x2065), 0xFEFF))
+_OPEN_SET = frozenset(_OPEN)
+# After the name: anything up to two or more closing brackets, or the end of the line. The
+# scan is lazy and each step fails at once on a non-bracket, so it is linear.
+_TAIL_RE = re.compile(
+    rf"[^\n]*?(?:(?:[{_CLOSE}]{_GAP}){{2,}}|$)",
+    re.MULTILINE,
 )
 _RUN_OPEN_RE = re.compile(rf"[{_OPEN}](?:{_GAP}[{_OPEN}]){{2,}}")
 _RUN_CLOSE_RE = re.compile(rf"[{_CLOSE}](?:{_GAP}[{_CLOSE}]){{2,}}")
@@ -81,9 +86,56 @@ def new_id() -> str:
     return secrets.token_hex(ID_HEX // 2)
 
 
+def _forged_spans(text: str) -> list[tuple[int, int]]:
+    """The spans rule 1 removes: two or more opening brackets (invisible characters allowed
+    between them), an optional ``/`` and whitespace, ``untrusted``, then up to the closing
+    brackets or the end of the line.
+
+    One pass, each character looked at a bounded number of times. A single regex for this
+    retries every start in a long run of brackets, which is quadratic on text that is exactly
+    what this module treats as hostile.
+    """
+    spans: list[tuple[int, int]] = []
+    floor = 0  # nothing before this belongs to a new span
+    for name in _NAME_RE.finditer(text):
+        if name.start() < floor:
+            continue
+        i = name.start()
+        while i > floor and _skippable(text[i - 1]):
+            i -= 1
+        count = 0
+        start = i
+        while True:
+            k = start
+            while k > floor and text[k - 1] in _GAP_SET:
+                k -= 1
+            if k > floor and text[k - 1] in _OPEN_SET:
+                count += 1
+                start = k - 1
+            else:
+                break
+        if count < 2:
+            continue
+        end = _TAIL_RE.match(text, name.end())
+        assert end is not None  # the tail can match the empty string at the end of a line
+        spans.append((start, end.end()))
+        floor = end.end()
+    return spans
+
+
+def _skippable(char: str) -> bool:
+    """Whitespace, ``/`` or an invisible format character: allowed before the name."""
+    return char.isspace() or char == "/" or char in _GAP_SET
+
+
 def deface(text: str) -> str:
     """``text`` with every marker-shaped span removed and every bracket run broken."""
-    text = _FORGED_RE.sub(FORGED, text)
+    pieces: list[str] = []
+    at = 0
+    for start, end in _forged_spans(text):
+        pieces += [text[at:start], FORGED]
+        at = end
+    text = "".join(pieces) + text[at:] if pieces else text
     text = _RUN_OPEN_RE.sub(lambda m: m.group().translate(_TO_GUILLEMET), text)
     return _RUN_CLOSE_RE.sub(lambda m: m.group().translate(_TO_GUILLEMET), text)
 

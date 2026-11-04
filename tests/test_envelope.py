@@ -98,3 +98,63 @@ def test_unwrap_refuses_anything_but_one_clean_envelope(block: str) -> None:
 def test_wrap_refuses_a_malformed_id() -> None:
     with pytest.raises(ValueError):
         wrap("x", token="not-hex")
+
+
+# --- cost: deface is linear (review finding on PR 41) -------------------------------------
+
+# The first rule as it was written when it was quadratic, kept as the oracle: the linear
+# scanner must agree with it on every small input.
+_OLD_GAP = f"[{'\u00ad\u200b-\u200f\u2060-\u2064\ufeff'}]*"
+_OLD_FORGED = re.compile(
+    rf"(?:[<\uff1c\ufe64\u2039\u3008]{_OLD_GAP}){{2,}}[\s/\u00ad\u200b-\u200f\u2060-\u2064\ufeff]*"
+    rf"untrusted[^\n]*?(?:(?:[>\uff1e\ufe65\u203a\u3009]{_OLD_GAP}){{2,}}|$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _old_deface(text: str) -> str:
+    from walle import envelope
+
+    text = _OLD_FORGED.sub(envelope.FORGED, text)
+    text = envelope._RUN_OPEN_RE.sub(lambda m: m.group().translate(envelope._TO_GUILLEMET), text)
+    return envelope._RUN_CLOSE_RE.sub(lambda m: m.group().translate(envelope._TO_GUILLEMET), text)
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "<" * 32_000,
+        "<\u200b" * 32_000,
+        "<" * 32_000 + "x",
+        "<" * 32_000 + " untrusted",
+        ("<" * 400 + "x") * 80,
+        "<<untrusted " * 4_000,
+        ("<\u200b" * 300 + "q") * 100,
+        "<<" + " " * 32_000,
+        "untrusted" * 8_000,
+        "<<untrusted>" * 8_000,
+        ">" * 32_000,
+        "<<untrusted" + ">\u200b" * 16_000 + "x",
+    ],
+    ids=lambda s: f"{s[:14]!r}-x{len(s)}",
+)
+def test_deface_takes_linear_time_on_hostile_input(hostile: str) -> None:
+    import time
+
+    start = time.perf_counter()
+    out = deface(hostile)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 1.0, f"deface took {elapsed:.1f}s on {len(hostile)} characters"
+    assert "<<<" not in out
+    assert deface(out) == out
+
+
+def test_deface_agrees_with_the_original_rule_on_small_inputs() -> None:
+    import random
+
+    rng = random.Random(7)
+    pieces = ["<", "<", ">", ">", "\u200b", "\uff1c", "\u3009", " ", "/", "\n", "x",
+              "untrusted", "UnTrUsTeD", ":", "9f3a", "[", "\u0435"]  # fmt: skip
+    for _ in range(4_000):
+        text = "".join(rng.choice(pieces) for _ in range(rng.randint(0, 24)))
+        assert deface(text) == _old_deface(text), repr(text)

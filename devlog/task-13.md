@@ -142,7 +142,35 @@ calls in one process lock against each other the same way two processes do.
   - No lock is held across an `await`.
   - Files are opened only inside the existing `with` blocks.
 
-**Review:** pending.
+**Review:** `agent-review` failed on `079c9a3` (1 high, 1 medium, 2 low, 1 nit). Fixed on the
+same branch:
+
+- **High, quadratic `_FORGED_RE`.** Rule 1 is now `envelope._forged_spans`: find each
+  `untrusted`, look backwards for the bracket run, scan forwards to the closing brackets or the
+  end of the line. Each character is visited a bounded number of times. `deface` on 32,000
+  brackets, with or without zero-width characters, now takes milliseconds (it took 38 s and
+  87 s). `tests/test_envelope.py` has hostile-input timing tests (limit 1 s), and an oracle test
+  that runs the old regex against the new scanner on 4,000 random small strings built from
+  brackets, gap characters, `untrusted` and newlines; they agree on all of them.
+- **Medium, unbounded `recall`.** Each body is cut to `RECALL_TEXT_LIMIT` (2,000 characters,
+  ending in an ellipsis), the same way `why` cuts to `WHY_TEXT_LIMIT`. The cut happens before
+  `deface`, so it is also a second bound on the work done.
+- **Low, a principal named `mcp`.** `build_server` refuses a principal named after any
+  non-person actor (`mcp`, `user`, `observer`, `proposer`, `curator`, `kernel`).
+- **Low, paths in `OSError` text.** `_describe` gives an `OSError` only its `strerror` (or "no
+  log for this principal"), never the file name.
+- **Low, stale check output.** Re-stated below.
+- **Nit.** The `recall` description is passed to `@server.tool(description=...)`; the `noqa` is
+  gone.
+
+Check output on the fixed head (after merging in `main` at `8e0565d`):
+```
+uv run pytest              920 passed, 5 skipped
+uv run ruff check          All checks passed!
+uv run ruff format --check 73 files already formatted
+uv run pyright             0 errors, 0 warnings, 0 informations
+```
+The 5 skips are the same chmod tests as above; none of the new tests assumes root.
 
 **Choices made inside the task:**
 - **`remember` writes as `mcp`, not `user`.** The text is the host model's words. Under D97,
@@ -171,7 +199,7 @@ calls in one process lock against each other the same way two processes do.
 - **Module name `mcp_server.py`, not `mcp.py`.** `walle.mcp` and the `mcp` SDK would share a
   name in every file that imports both.
 
-**What to read first:** `envelope.py`'s two deface rules and the `_FORGED_RE` pattern. That
+**What to read first:** `envelope.py`'s two deface rules and `_forged_spans`. That
 is the part most likely to have a hole. Then `labels.integrity`: one loop, and the whole of
 D97.
 

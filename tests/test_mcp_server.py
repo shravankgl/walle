@@ -445,6 +445,24 @@ def test_why_refusals_are_said_plainly(tmp_path: Path, ref: str, said: str) -> N
     assert said in texts(result)[0].text
 
 
+def test_recall_cuts_a_long_body_and_says_so(tmp_path: Path) -> None:
+    _kitchen(tmp_path)
+    long_body = "The basil needs light. " * 2_000
+    _append(tmp_path, _assertion(long_body, summary="basil light"))
+    result = call(tmp_path, "recall", query="light")
+    (block,) = results(result)
+    _, body = unwrap(block.text.partition("\n")[2])
+    assert len(body) <= mcp_server.RECALL_TEXT_LIMIT
+    assert body.endswith("…")
+
+
+def test_recall_leaves_a_body_under_the_limit_whole(tmp_path: Path) -> None:
+    _kitchen(tmp_path)
+    result = call(tmp_path, "recall", query="basil")
+    bodies = [unwrap(b.text.partition("\n")[2])[1] for b in results(result)]
+    assert "Maya waters the basil at 7 every morning." in bodies
+
+
 # --- errors -----------------------------------------------------------------------------
 
 
@@ -484,6 +502,30 @@ def test_an_error_quoting_the_log_arrives_enveloped(tmp_path: Path) -> None:
     token, body = unwrap(block.text.partition("\n")[2])
     assert "smuggled" in body  # the quoted line is there, inside the envelope
     assert MARKER.findall(block.text) == [f"<<<untrusted:{token}>>>", f"<<</untrusted:{token}>>>"]
+
+
+def test_a_principal_named_after_a_non_user_actor_is_refused(tmp_path: Path) -> None:
+    """Else ``labels.is_principals_own`` would call that actor's words the person's own."""
+    for name in ("mcp", "observer", "proposer", "curator", "kernel", "user"):
+        with pytest.raises(ValueError, match="reserved"):
+            mcp_server.build_server(tmp_path, name, D)
+
+
+def test_an_os_error_names_no_path_to_the_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _kitchen(tmp_path)
+
+    def broken(root: Path, principal: str) -> NoReturn:
+        raise OSError(5, "Input/output error", "/home/someone/walle/secret-dir/d-mbp.jsonl")
+
+    monkeypatch.setattr(index, "update", broken)
+    result = call(tmp_path, "recall", query="basil")
+    assert result.is_error
+    said = texts(result)[0].text
+    assert "Input/output error" in said
+    assert "/home/someone" not in said
+    assert "secret-dir" not in said
 
 
 def test_a_bad_principal_is_refused_before_serving(tmp_path: Path) -> None:
