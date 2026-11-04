@@ -304,3 +304,34 @@ def test_the_first_record_fsyncs_the_directory_even_if_the_file_already_exists(
     calls.clear()
     writer.append(_observation("the second"))
     assert calls == []  # already durable; not repeated on every append
+
+
+# --- a locked session (task 11) ------------------------------------------------------------
+
+
+def test_a_locked_session_reads_and_appends_under_one_lock(tmp_path: Path) -> None:
+    writer = StreamWriter(tmp_path, "maya", "mbp")
+    writer.append(_observation("before"))
+    with writer.locked() as stream:
+        assert [r.seq for r in stream.read()] == [1]
+        appended = [stream.append(_observation(f"in {i}")) for i in range(3)]
+        assert [r.seq for r in stream.read()] == [1, 2, 3, 4]
+    assert [e.seq for e in appended] == [2, 3, 4]
+    assert writer.append(_observation("after")).seq == 5
+
+
+def test_a_locked_session_holds_off_another_writer(tmp_path: Path) -> None:
+    """Another process's append waits until the session ends, and then follows it."""
+    writer = StreamWriter(tmp_path, "maya", "mbp")
+    with writer.locked() as stream:
+        child = subprocess.Popen(
+            [sys.executable, "-c", _CHILD, str(tmp_path), "maya", "mbp", "1"],
+            stderr=subprocess.PIPE,
+        )
+        with pytest.raises(subprocess.TimeoutExpired):
+            child.wait(timeout=1.5)  # blocked on the lock, not finished
+        stream.append(_observation("mine"))
+    _, err = child.communicate(timeout=60)
+    assert child.returncode == 0, err.decode()
+    first, second = (json.loads(line) for line in _lines(writer.path))
+    assert (first["body"], first["seq"], second["seq"]) == ("mine", 1, 2)
