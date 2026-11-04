@@ -13,6 +13,7 @@ from walle import index as walle_index
 from walle import proposer as walle_proposer
 from walle import staging as walle_staging
 from walle import why as walle_why
+from walle.evals import report as walle_evals
 from walle.events import AnyEvent, Assertion, FutureSchemaError, Proposal, Supersede
 from walle.paths import principal_dir
 from walle.reader import CorruptStreamError
@@ -541,3 +542,8 @@ def propose_command(root: Path, principal: str, device: str, model: str, score: 
         click.echo(f"  shadow: the shadow log is incomplete: {report.shadow_error}", err=True)
     if report.proposed:
         click.echo("Not in the hot tier until you keep them: run `walle review`.")
+
+
+# --- the evals (tasks 19-21) ---------------------------------------------------------------
+
+main.add_command(walle_evals.eval_command)
