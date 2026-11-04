@@ -6,8 +6,8 @@ beside it and none of them truth:
 ``events``      one row per event: ref, stream, seq, type, v, ts, actor, content hash, the line
                 it was read from, and the event as JSON so a fold can run off the index.
 ``edges``       ``(src, dst, 'caused_by')`` for every ref in an event's ``caused_by``: ``src``
-                is the event, ``dst`` the event it came from. ``why`` (task 12) is a
-                recursive query over this table (D59).
+                is the event, ``dst`` the event it came from. ``ancestors``, behind
+                ``walle why``, is a recursive query over this table (D59).
 ``events_fts``  FTS5 over each event's text: summary, body, reason or note.
 ``streams``     the tracking record, ``(stream, last_seq, last_hash)`` (D96).
 
@@ -238,6 +238,51 @@ def load_records(root: Path, principal: str) -> tuple[Record, ...]:
             if reason is not None:
                 raise StaleIndexError(f"{path}: {reason}. Run `walle rebuild`.")
             return _rows(db)
+
+
+# `why` (D59). `chain` carries (ref, depth); UNION drops a repeated pair, and the depth bound
+# (the number of events: no simple path is longer) ends a cycle a hand-edited log could hold.
+# Each ancestor is reported once, at the shortest distance it was reached by.
+_ANCESTORS = """
+WITH RECURSIVE chain (ref, depth) AS (
+    SELECT ref, 0 FROM events WHERE ref = ?
+    UNION
+    SELECT edges.dst, chain.depth + 1
+    FROM edges JOIN chain ON edges.src = chain.ref
+    WHERE edges.kind = 'caused_by' AND chain.depth < (SELECT COUNT(*) FROM events)
+)
+SELECT chain.ref, MIN(chain.depth), events.data
+FROM chain JOIN events ON events.ref = chain.ref
+GROUP BY chain.ref
+"""
+
+
+def ancestors(root: Path, principal: str, ref: str) -> tuple[tuple[str, int, AnyEvent], ...]:
+    """``ref`` and every event its ``caused_by`` reaches, as ``(ref, depth, event)`` (D59).
+
+    A ``WITH RECURSIVE`` query over ``edges``: ``ref`` itself at depth 0, what it cites at 1,
+    and so on, each event once at its shortest depth. Ordered by depth, then ref.
+
+    Reads the index only, under ``index.lock`` shared like ``load_records``, so it answers for
+    what the index holds. ``KeyError`` when ``ref`` is not in it; ``ValueError`` for a
+    malformed ref. Every ancestor is in the index whenever ``ref`` is, because a build refuses
+    a dangling ``caused_by`` (D111).
+    """
+    parse_ref(ref)  # a malformed ref is a ValueError, before any lock or file
+    root = Path(root)
+    path = index_path(root, principal)
+    with _shared(index_lock_path(root, principal)):
+        if not path.is_file():
+            raise FileNotFoundError(f"{path}: no index yet. Run `walle rebuild`.")
+        with contextlib.closing(_connect(path, mode="ro")) as db:
+            reason = _check(db)
+            if reason is not None:
+                raise StaleIndexError(f"{path}: {reason}. Run `walle rebuild`.")
+            rows = db.execute(_ANCESTORS, (ref,)).fetchall()
+    if not rows:
+        raise KeyError(f"no event {ref} in the index")
+    chain = [(r, depth, parse_event(json.loads(data))) for r, depth, data in rows]
+    return tuple(sorted(chain, key=lambda row: (row[1], parse_ref(row[0]))))
 
 
 def state_hash(resolution: Resolution) -> str:
