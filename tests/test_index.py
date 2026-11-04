@@ -794,3 +794,45 @@ def test_a_reader_that_cannot_lock_reports_its_own_error(tmp_path: Path) -> None
         assert not (folder / "index.lock").exists()
     finally:
         folder.chmod(0o755)
+
+
+# --- issue 23: low findings from the review of PR 26 -----------------------------------
+
+
+def test_a_disagreement_found_by_update_recreates_the_file(tmp_path: Path) -> None:
+    """A full rebuild that ``update`` decides on starts from a new file, like every other
+    full rebuild. Wiping tables in place would keep anything else the old file held."""
+    _write(tmp_path, "mbp", _obs("one"), _obs("two"))
+    update(tmp_path, P)
+    with contextlib.closing(sqlite3.connect(index_path(tmp_path, P))) as db:
+        db.execute("CREATE TABLE leftover (x)")
+        db.execute("UPDATE streams SET last_hash = ?", ("0" * 64,))
+        db.commit()
+
+    report = update(tmp_path, P)
+
+    assert report.full and "d-mbp" in report.reason and "seq 2" in report.reason
+    with contextlib.closing(sqlite3.connect(index_path(tmp_path, P))) as db:
+        names = {row[0] for row in db.execute("SELECT name FROM sqlite_master")}
+    assert "leftover" not in names
+    assert _index_state(tmp_path) == _log_state(tmp_path)
+
+
+def test_an_index_that_cannot_be_opened_is_a_stale_index_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A connect-time failure is reported like any other unusable index, not as a raw
+    ``sqlite3.OperationalError``. Here the file goes out of band between the existence
+    check and the open, which SQLite refuses at connect time (``SQLITE_CANTOPEN``)."""
+    _write(tmp_path, "mbp", _obs("one"))
+    update(tmp_path, P)
+    real = index_module._connect
+
+    def vanishing(path: Path, *, mode: str) -> sqlite3.Connection:
+        if mode == "ro":
+            path.unlink()
+        return real(path, mode=mode)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(index_module, "_connect", vanishing)
+    with pytest.raises(StaleIndexError, match="unreadable"):
+        load_records(tmp_path, P)
