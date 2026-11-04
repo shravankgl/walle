@@ -161,6 +161,23 @@ class StaleIndexError(Exception):
     """The index file cannot be read by this build. Run ``walle rebuild``."""
 
 
+class CorruptIndexError(StaleIndexError):
+    """A row in ``events`` does not parse as an event: the file was damaged or edited.
+
+    Raised instead of the parser's own error (pydantic's ``ValidationError``, a JSON error),
+    which quotes the row in its message. The row is log text, and a caller that shows this
+    message to a model must treat it as such; ``mcp_server`` envelopes it. The index is
+    derived, so the cure is the same as for any unusable index: ``walle rebuild``.
+    """
+
+    def __init__(self, path: Path, ref: str, cause: Exception) -> None:
+        super().__init__(
+            f"{path}: row {ref} in the index does not parse as an event ({cause}). "
+            "Run `walle rebuild`."
+        )
+        self.ref = ref
+
+
 @dataclass(frozen=True)
 class IndexReport:
     """What one ``update`` or ``rebuild`` did."""
@@ -215,6 +232,7 @@ def load_records(root: Path, principal: str) -> tuple[Record, ...]:
 
     Says nothing about freshness: this is what the index holds, which may be behind the log.
     A missing index raises ``FileNotFoundError``, because no index must not read as no history.
+    A row that does not parse raises ``CorruptIndexError``, never the parser's own error.
 
     Holds ``index.lock`` shared for the whole read, so a builder in progress is waited out
     and the rows are the state before or after its commit, never a file it has just created
@@ -237,7 +255,7 @@ def load_records(root: Path, principal: str) -> tuple[Record, ...]:
             reason = _check(db)
             if reason is not None:
                 raise StaleIndexError(f"{path}: {reason}. Run `walle rebuild`.")
-            return _rows(db)
+            return _rows(db, path)
 
 
 # `why` (D59). `chain` carries (ref, depth); UNION drops a repeated pair, and the depth bound
@@ -265,8 +283,8 @@ def ancestors(root: Path, principal: str, ref: str) -> tuple[tuple[str, int, Any
 
     Reads the index only, under ``index.lock`` shared like ``load_records``, so it answers for
     what the index holds. ``KeyError`` when ``ref`` is not in it; ``ValueError`` for a
-    malformed ref. Every ancestor is in the index whenever ``ref`` is, because a build refuses
-    a dangling ``caused_by`` (D111).
+    malformed ref; ``CorruptIndexError`` for a row that does not parse. Every ancestor is in
+    the index whenever ``ref`` is, because a build refuses a dangling ``caused_by`` (D111).
     """
     parse_ref(ref)  # a malformed ref is a ValueError, before any lock or file
     root = Path(root)
@@ -281,8 +299,21 @@ def ancestors(root: Path, principal: str, ref: str) -> tuple[tuple[str, int, Any
             rows = db.execute(_ANCESTORS, (ref,)).fetchall()
     if not rows:
         raise KeyError(f"no event {ref} in the index")
-    chain = [(r, depth, parse_event(json.loads(data))) for r, depth, data in rows]
+    chain = [(r, depth, _parsed(path, r, data)) for r, depth, data in rows]
     return tuple(sorted(chain, key=lambda row: (row[1], parse_ref(row[0]))))
+
+
+def _parsed(path: Path, ref: str, data: str) -> AnyEvent:
+    """The event in an index row, or ``CorruptIndexError`` naming the row.
+
+    ``ValueError`` covers pydantic's ``ValidationError`` and ``json.JSONDecodeError``, whose
+    messages quote the row. ``FutureSchemaError`` is not a ``ValueError`` and passes through:
+    it names a version, not the row, and every reader already treats it as log text.
+    """
+    try:
+        return parse_event(json.loads(data))
+    except ValueError as exc:
+        raise CorruptIndexError(path, ref, exc) from exc
 
 
 def state_hash(resolution: Resolution) -> str:
@@ -340,7 +371,7 @@ def _build(root: Path, principal: str, *, full: bool) -> IndexReport:
             tracked = {} if reason is not None else _tracked(conn)
             new = tuple(r for c in cut for r in c.records if r.seq > tracked.get(c.stream, 0))
             _write(conn, path, new, fresh=reason is not None)
-            committed = _rows(conn)  # still under index.lock: exactly what this build left
+            committed = _rows(conn, path)  # under index.lock: exactly what this build left
 
     return IndexReport(
         path=path,
@@ -509,10 +540,10 @@ def _unusable(path: Path) -> str | None:
         return _check(db)
 
 
-def _rows(db: sqlite3.Connection) -> tuple[Record, ...]:
+def _rows(db: sqlite3.Connection, path: Path) -> tuple[Record, ...]:
     rows = db.execute("SELECT ref, seq, line, data FROM events ORDER BY stream, seq")
     return tuple(
-        Record(ref=ref, seq=seq, event=parse_event(json.loads(data)), line=line)
+        Record(ref=ref, seq=seq, event=_parsed(path, ref, data), line=line)
         for ref, seq, line, data in rows
     )
 

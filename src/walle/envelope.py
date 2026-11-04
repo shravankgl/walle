@@ -15,18 +15,27 @@ Three rules, each closing a specific hole:
   password printed in the source.
 * **Anything shaped like a marker is defaced before wrapping**, so a forged closing marker
   never reaches the model and the only markers in a result are the envelope's own two.
-  "Shaped like a marker" is, after skipping invisible format characters:
+  "Shaped like a marker" is, after skipping invisible characters:
 
-  1. two or more opening angle brackets, an optional ``/``, then ``untrusted`` in any case,
-     up to the closing brackets or the end of the line. The whole span becomes
-     ``[forged marker removed]``. Two brackets, not three: a near miss reads as the real
-     thing to a model.
+  1. two or more opening angle brackets, with horizontal whitespace allowed between them
+     (``<< <``), an optional ``/``, then ``untrusted`` in any case, up to the closing
+     brackets or the end of the line. The whole span becomes ``[forged marker removed]``.
+     Two brackets, not three: a near miss reads as the real thing to a model. **A line break
+     ends it**: ``<<`` at the end of one line and ``untrusted`` at the start of the next are
+     two things (``x << 2`` in C, then a sentence), not a marker, and neither line is touched.
   2. any other run of three or more angle brackets, in either direction. Each bracket becomes
      a single guillemet (U+2039 or U+203A), so ``<<<`` and ``>>>`` appear nowhere in a body.
      A forged marker need not name ``untrusted`` to fool a model ("<<<end of data>>>").
 
-  Fullwidth and small-form brackets count as brackets. Defacing never looks at the id, so a
-  forged marker carrying the real id is removed like any other.
+  Fullwidth and small-form brackets count as brackets. "Invisible" is every Unicode format
+  character (category Cf: soft hyphen, zero-width space and joiners, direction marks and
+  isolates, the BOM, tag characters and the rest), plus the zero-width marks that are not Cf
+  (the combining grapheme joiner, variation selectors) and the Hangul fillers. They may sit
+  between the brackets, before the name, and **between the letters of the name**:
+  ``un\u200btrusted`` is ``untrusted`` to a model. ``_GAP_SET`` is written out rather than
+  computed from ``unicodedata`` at import; a test holds it to this runtime's Cf category.
+  Defacing never looks at the id, so a forged marker carrying the real id is removed like any
+  other.
 * **Unwrapping is strict.** ``unwrap`` accepts exactly one envelope, opening and closing ids
   equal, nothing before or after, and a body with no brackets left to deface. Anything else is
   a ``ValueError``; nothing is repaired. It exists for tests and for a host-side reader; the
@@ -55,16 +64,59 @@ FORGED = "[forged marker removed]"
 
 _ID_RE = re.compile(rf"[0-9a-f]{{{ID_HEX}}}")
 
-# Invisible format characters a forger could slip between brackets: soft hyphen, zero-width
-# space/joiners, direction marks, word joiner and friends, BOM.
-_GAP_CHARS = "\u00ad\u200b-\u200f\u2060-\u2064\ufeff"
+# Invisible characters a forger could slip between brackets or between the letters of the
+# name. Every Unicode 15 format character (category Cf), by range, then the zero-width marks
+# that are not Cf: the combining grapheme joiner, the variation selectors, and the Hangul
+# fillers. ``test_the_gap_set_covers_every_format_character`` checks the list against the
+# running Python's ``unicodedata``; a newer Unicode with a new Cf character fails it, which
+# is the cue to extend this list.
+_GAP_RANGES: tuple[tuple[int, int], ...] = (
+    (0x00AD, 0x00AD),  # soft hyphen
+    (0x034F, 0x034F),  # combining grapheme joiner (Mn)
+    (0x0600, 0x0605),  # Arabic number signs
+    (0x061C, 0x061C),  # Arabic letter mark
+    (0x06DD, 0x06DD),
+    (0x070F, 0x070F),
+    (0x0890, 0x0891),
+    (0x08E2, 0x08E2),
+    (0x115F, 0x1160),  # Hangul fillers (Lo)
+    (0x180E, 0x180E),  # Mongolian vowel separator
+    (0x200B, 0x200F),  # zero-width space, non-joiner, joiner; direction marks
+    (0x202A, 0x202E),  # bidi embeddings and overrides
+    (0x2060, 0x2064),  # word joiner and invisible operators
+    (0x2066, 0x206F),  # bidi isolates and deprecated format characters
+    (0x3164, 0x3164),  # Hangul filler (Lo)
+    (0xFE00, 0xFE0F),  # variation selectors (Mn)
+    (0xFEFF, 0xFEFF),  # BOM
+    (0xFFA0, 0xFFA0),  # halfwidth Hangul filler (Lo)
+    (0xFFF9, 0xFFFB),  # interlinear annotation
+    (0x110BD, 0x110BD),
+    (0x110CD, 0x110CD),
+    (0x13430, 0x1343F),  # Egyptian hieroglyph format controls
+    (0x1BCA0, 0x1BCA3),  # shorthand format controls
+    (0x1D173, 0x1D17A),  # musical symbol begin/end
+    (0xE0001, 0xE0001),  # language tag
+    (0xE0020, 0xE007F),  # tag characters
+    (0xE0100, 0xE01EF),  # variation selectors supplement (Mn)
+)
+_GAP_SET = frozenset(chr(c) for lo, hi in _GAP_RANGES for c in range(lo, hi + 1))
+_GAP_CHARS = "".join(f"{chr(lo)}-{chr(hi)}" if hi > lo else chr(lo) for lo, hi in _GAP_RANGES)
 _GAP = f"[{_GAP_CHARS}]*"
+_BLANK = " \t\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000"
+"""Horizontal whitespace, as a character class: every character ``str.isspace`` accepts
+except the line breaks in ``_LINE_BREAKS``. Allowed between the brackets and before the
+name; a line break is where a would-be marker ends."""
+_LINE_BREAKS = frozenset("\n\r\x0b\x0c\x1c\x1d\x1e\x1f\x85\u2028\u2029")
+_BLANK_SET = frozenset(" \t\u00a0\u1680\u202f\u205f\u3000") | frozenset(
+    chr(c) for c in range(0x2000, 0x200B)
+)
 _OPEN = "<\uff1c\ufe64\u2039\u3008"  # ASCII, fullwidth, small form, guillemet, CJK angle
 _CLOSE = ">\uff1e\ufe65\u203a\u3009"  # the same five, closing
 
-_NAME_RE = re.compile("untrusted", re.IGNORECASE)
-_GAP_SET = frozenset(chr(c) for c in (0xAD, *range(0x200B, 0x2010), *range(0x2060, 0x2065), 0xFEFF))
+# The name with invisible characters allowed between its letters.
+_NAME_RE = re.compile(_GAP.join("untrusted"), re.IGNORECASE)
 _OPEN_SET = frozenset(_OPEN)
+_BETWEEN_BRACKETS = _GAP_SET | _BLANK_SET
 # After the name: anything up to two or more closing brackets, or the end of the line. The
 # scan is lazy and each step fails at once on a non-bracket, so it is linear.
 _TAIL_RE = re.compile(
@@ -87,9 +139,10 @@ def new_id() -> str:
 
 
 def _forged_spans(text: str) -> list[tuple[int, int]]:
-    """The spans rule 1 removes: two or more opening brackets (invisible characters allowed
-    between them), an optional ``/`` and whitespace, ``untrusted``, then up to the closing
-    brackets or the end of the line.
+    """The spans rule 1 removes: two or more opening brackets (invisible characters and
+    horizontal whitespace allowed between them), an optional ``/`` with the same around it,
+    ``untrusted`` (invisible characters allowed inside it), then up to the closing brackets
+    or the end of the line. Nothing here crosses a line break.
 
     One pass, each character looked at a bounded number of times. A single regex for this
     retries every start in a long run of brackets, which is quadratic on text that is exactly
@@ -107,7 +160,7 @@ def _forged_spans(text: str) -> list[tuple[int, int]]:
         start = i
         while True:
             k = start
-            while k > floor and text[k - 1] in _GAP_SET:
+            while k > floor and text[k - 1] in _BETWEEN_BRACKETS:
                 k -= 1
             if k > floor and text[k - 1] in _OPEN_SET:
                 count += 1
@@ -124,8 +177,9 @@ def _forged_spans(text: str) -> list[tuple[int, int]]:
 
 
 def _skippable(char: str) -> bool:
-    """Whitespace, ``/`` or an invisible format character: allowed before the name."""
-    return char.isspace() or char == "/" or char in _GAP_SET
+    """Horizontal whitespace, ``/`` or an invisible character: allowed before the name. A
+    line break is not: it ends a would-be marker."""
+    return char in _BLANK_SET or char == "/" or char in _GAP_SET
 
 
 def deface(text: str) -> str:

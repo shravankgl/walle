@@ -210,3 +210,23 @@ def test_walle_why_on_a_missing_ref_fails_plainly(tmp_path: Path) -> None:
     assert result.exit_code == 1
     assert "no event d-mbp:99" in result.stderr
     assert "Traceback" not in result.output
+
+
+# --- issue #47 item 1: the status names other events, and the ledger says which ----------
+
+
+def test_the_ledger_says_which_events_a_status_quotes(tmp_path: Path) -> None:
+    """A status is built from other events' fields (a supersede's reason and day, the keep
+    that decided a proposal), so a label over the status must cover them (D84, D97)."""
+    refs = _chain_log(tmp_path)
+    gone = _append(
+        tmp_path,
+        "mbp",
+        Supersede(ts=now_instant(), actor=ACTOR_USER, target=refs["kept"], reason="forgotten"),
+    )
+    ledger = why.Ledger(index.update(tmp_path, P).records)
+    assert ledger.cited(refs["kept"]) == (gone,)
+    assert ledger.cited(refs["proposal"]) == (refs["kept"],)
+    assert ledger.cited(refs["restated"]) == ()  # current, and nothing closed it
+    assert ledger.cited(refs["obs_a"]) == ()  # an observation has no status
+    assert ledger.cited("d-mbp:99") == ()
