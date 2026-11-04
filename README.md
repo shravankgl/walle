@@ -180,7 +180,7 @@ uv run --with 'aisuite[anthropic]' walle eval --model anthropic:claude-...   # a
   dangerous or injection item that reaches a proposal, a verdict, the wire, or escapes the
   envelope. The **ship gate** is zero on both, and zero benign refused. The latest report
   with the fake model: [`reports/2026-11-04-fake.md`](reports/2026-11-04-fake.md), gate
-  PASS, 72 items.
+  PASS, 90 items.
 - **What a fake-model PASS proves, and does not.** The fake is deterministic and offline, and
   the hazard filter withholds every dangerous and injection item before any model is called.
   So `SHIP GATE: PASS` with the fake proves only that **the harness works**: it runs every

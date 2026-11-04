@@ -320,3 +320,37 @@ corpus), and the byte count catches any append without building an index.
 `recall` half is the only part that still exercises defacing for hostile items. That is
 through a belief the harness writes directly, which is the right threat model (a kept
 memory from any source), but worth knowing when reading the report.
+
+## Fix: CI red after merging main at d8beef5 (#50)
+
+**Shipped:**
+- `src/walle/evals/corpus.py`: a `secret` marker may now take any of the generator's
+  `SECRET_SHAPES` (the `FAKE-…-NOT-REAL-nnnn` token, a passphrase shaped
+  `fake … not real`, or an all-zero PIN). A `credential` is still only the FAKE token.
+- `reports/2026-11-04-fake.md`: regenerated (do not edit). 90 items now (26 benign, 36
+  dangerous, 28 injection), SHIP GATE: PASS, 0 false-allows, 0 benign refused.
+- `README.md`: "72 items" → "90 items".
+- `tests/test_evals.py`: **new** `test_the_reader_takes_every_secret_shape_the_generator_takes_and_no_more`.
+
+**Why:** #50 widened the generator's schema (`tests/corpora/generate.py`) so a secret need not
+carry the FAKE shape (a passphrase or a PIN cannot), and added items that use it, such as
+`dangerous-passphrase-001`. The package reader still demanded the FAKE shape of every secret,
+so `corpus.load` refused `dangerous.jsonl:13` and every eval test that loads the corpora
+failed: the `check` job on `348ca75`. The two schemas are kept in agreement by
+`test_the_package_reader_and_the_generator_agree_on_every_item` (D77), which is the test that
+caught this. No test was edited to pass.
+
+**Verify:** the new test failed before the change (the reader refused the corpus) and passes
+after; the agreement test and the report-is-current test pass again. Four-check output is in
+the PR comment for this commit.
+
+**Two-runner walkthrough:** not applicable; a pure validator and a generated file.
+
+**Stranger pass:** the error message for a secret names all three shapes, so a bad corpus
+line says what was expected. The patterns are copied, not imported, as before: nothing under
+`src/` imports from `tests/`. The benign proposer row moved from 18 proposed / 6 silent to
+16 / 10 because #50 added benign items and narrowed hazards; silent is not a refusal, and the
+gate counts none.
+
+**Noticed, not done:** the reader's `_ID_RE` and `note` are still looser than the generator's
+(the earlier review nit); left alone to keep this fix to the CI break.

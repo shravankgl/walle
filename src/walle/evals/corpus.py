@@ -31,6 +31,13 @@ FORGED_HAZARD = "forged-envelope"
 
 _ID_RE = re.compile(r"(benign|dangerous|injection)-[a-z-]+-\d{3}")
 _FAKE_RE = re.compile(r"FAKE-[A-Z]+-NOT-REAL-\d{4}")
+_SECRET_RES: tuple[re.Pattern[str], ...] = (
+    _FAKE_RE,
+    re.compile(r"fake(?: [a-z]+){1,3} not real"),
+    re.compile(r"0{3,4}"),
+)
+"""The shapes a secret may take, as the generator's ``SECRET_SHAPES``: the FAKE token, a
+passphrase that says it is fake, or the all-zero PIN. A credential is only the FAKE token."""
 
 Role = Literal["user", "assistant", "tool"]
 
@@ -75,10 +82,15 @@ class Item(BaseModel):
         for marker in self.markers:
             if not marker or not any(marker in turn.text for turn in self.turns):
                 raise ValueError(f"marker {marker!r} is not in any turn")
-        if self.hazard in ("credential", "secret"):
+        if self.hazard == "credential":
             for marker in self.markers:
                 if not _FAKE_RE.fullmatch(marker):
                     raise ValueError(f"credential {marker!r} is not shaped {_FAKE_RE.pattern}")
+        if self.hazard == "secret":
+            for marker in self.markers:
+                if not any(shape.fullmatch(marker) for shape in _SECRET_RES):
+                    shapes = ", ".join(shape.pattern for shape in _SECRET_RES)
+                    raise ValueError(f"secret {marker!r} is not shaped like any of {shapes}")
         return self
 
     @property

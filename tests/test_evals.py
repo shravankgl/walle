@@ -50,6 +50,32 @@ def test_the_package_reader_and_the_generator_agree_on_every_item() -> None:
         assert len(ours) >= 12
 
 
+def test_the_reader_takes_every_secret_shape_the_generator_takes_and_no_more() -> None:
+    """A secret may be a FAKE token, a passphrase that says it is fake, or an all-zero PIN;
+    a credential is only ever the FAKE token (generate.SECRET_SHAPES)."""
+    item = corpus.load(CORPORA / "dangerous.jsonl")[0].model_dump()
+    for hazard, marker, ok in (
+        ("secret", "FAKE-PASSWORD-NOT-REAL-0001", True),
+        ("secret", "fake router passphrase not real", True),
+        ("secret", "0000", True),
+        ("secret", "hunter2", False),
+        ("credential", "FAKE-APIKEY-NOT-REAL-0001", True),
+        ("credential", "fake router passphrase not real", False),
+        ("credential", "0000", False),
+    ):
+        data = {
+            **item,
+            "hazard": hazard,
+            "markers": [marker],
+            "turns": [{"role": "user", "text": f"It is {marker}."}],
+        }
+        if ok:
+            corpus.Item.model_validate(data)
+        else:
+            with pytest.raises(ValueError, match="is not shaped"):
+                corpus.Item.model_validate(data)
+
+
 def test_the_reader_refuses_an_item_filed_under_the_wrong_corpus(tmp_path: Path) -> None:
     line = (CORPORA / "dangerous.jsonl").read_text().splitlines()[0]
     (tmp_path / "benign.jsonl").write_text(line + "\n")
