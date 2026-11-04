@@ -159,6 +159,18 @@ def read_file(path: Path, stream: str) -> StreamContents:
     return _parse(data, path, stream)
 
 
+def parse_stream(data: bytes, path: Path, stream: str) -> StreamContents:
+    """Parse the bytes of one stream file that the caller read under its own ``LOCK_SH``.
+
+    For a caller that already holds the lock (the index holds every stream's at once). Going
+    through ``read_file`` instead would open the file again and ask for a second shared lock,
+    which can queue behind a writer waiting for ``LOCK_EX`` while the first is still held.
+    ``path`` is only used to name the file in errors and warnings.
+    """
+    make_ref(stream, 1)
+    return _parse(data, Path(path), stream)
+
+
 def _parse(data: bytes, path: Path, stream: str) -> StreamContents:
     # Split on the byte b"\n" only. ``str.splitlines`` would also break on U+2028 and other
     # separators, which ``encode`` writes raw (``ensure_ascii=False``) inside a body.
