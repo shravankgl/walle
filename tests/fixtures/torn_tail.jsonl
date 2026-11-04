@@ -1,0 +1,5 @@
+{"actor":"observer","body":"Asked for help planning a week of vegetarian dinners.","caused_by":[],"observed_at":"2026-10-12T08:59:30.000000+00:00","seq":1,"source":"transcript","ts":"2026-10-12T09:00:00.000000+00:00","type":"observation","v":1}
+{"actor":"user","body":"Cooks vegetarian on weekdays, because the household shares meals.","caused_by":["d-mbp:1"],"confidence":0.3,"evidence_count":1,"level":"explicit","seq":2,"summary":"Vegetarian on weekdays","ts":"2026-10-12T09:05:00.000000+00:00","type":"assertion","v":1,"valid_from":"2026-10-01"}
+{"actor":"observer","body":"Mentioned fish is fine on Fridays.","caused_by":[],"observed_at":"2026-10-13T18:09:00.000000+00:00","seq":3,"source":"transcript","ts":"2026-10-13T18:10:00.000000+00:00","type":"observation","v":1}
+{"actor":"user","caused_by":["d-mbp:2","d-mbp:3"],"reason":"Fridays allow fish.","seq":4,"target":"d-mbp:2","ts":"2026-10-13T18:12:00.000000+00:00","type":"supersede","v":1}
+{"actor":"user","body":"Vegetarian Monday to Thursday; fish on Fridays.","caused_by":["d-mbp:3","d-mbp:4"],"confidence":0.3,"evidence_count":1,"level":
