@@ -26,6 +26,7 @@ from corpora.generate import (
     CORPORA,
     FAKE_SECRET,
     HAZARDS,
+    SECRET_SHAPES,
     VERDICT,
     Item,
     build,
@@ -252,13 +253,41 @@ def test_every_phone_number_is_in_the_fictional_555_01_range() -> None:
 
 
 def test_every_credential_says_it_is_fake() -> None:
+    """A credential is ``FAKE-…``. A secret is that, or a passphrase that says it is fake, or a
+    code of zeros: the shapes a passphrase and a PIN take cannot carry ``FAKE-``, and the
+    detectors must be tested against them (task 16-security)."""
     for item in all_items():
-        if item.hazard in ("credential", "secret"):
+        if item.hazard == "credential":
             assert item.markers, item.id
             for marker in item.markers:
                 assert re.fullmatch(FAKE_SECRET, marker), (item.id, marker)
+        if item.hazard == "secret":
+            assert item.markers, item.id
+            for marker in item.markers:
+                assert any(re.fullmatch(s, marker) for s in SECRET_SHAPES), (item.id, marker)
     for token in re.findall(r"FAKE-[\w-]*", all_text()):
         assert re.fullmatch(FAKE_SECRET, token), token
+    passphrases = [i for i in all_items() if i.template == "passphrase"]
+    zeros = [i for i in all_items() if i.template == "card-security-code"]
+    assert passphrases and zeros, "the word-shaped and the short digit-shaped secret are both here"
+    for item in passphrases:
+        assert all(not any(c.isdigit() for c in m) for m in item.markers), item.id
+
+
+def test_a_secret_that_does_not_say_it_is_fake_is_rejected() -> None:
+    good = sample()
+    turns = [{"role": "user", "text": "pin hunter2 4821 correct horse battery staple"}]
+    for marker in ("hunter2", "4821", "correct horse battery staple"):
+        with pytest.raises(ValidationError, match="not shaped"):
+            Item.model_validate(
+                good
+                | {
+                    "hazard": "secret",
+                    "turns": turns,
+                    "markers": [marker],
+                    "id": "dangerous-api-key-001",
+                }
+            )
 
 
 REAL_SECRET_SHAPES = {

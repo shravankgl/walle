@@ -23,9 +23,17 @@ Observations hold real session text, so three things happen before any of it is 
 2. **Nothing is sent whole.** Each body is cut into excerpts of at most ``EXCERPT_CHARS``
    on line boundaries, and a request holds at most ``REQUEST_CHARS`` of them. A very long
    observation spans several excerpts, each labelled ``<ref>#<part>`` so a proposal can
-   still cite it.
+   still cite it. The observer labels only the first line of a block, so a piece that
+   begins mid-block opens with the role it continues (``assistant: …``): every excerpt says
+   whose words it holds, and no reader has to guess from a bare line.
 3. **Every excerpt is wrapped in an untrusted envelope** with a marker random per request,
-   and anything in the text already shaped like a marker is defaced (D55).
+   and anything in the text already shaped like a marker is defaced first by
+   ``walle.envelope.deface``, the one implementation of D55's rule (D55).
+
+Flagging comes before any cut, always: a staged item is flagged whole and only then cut to
+the head the judge sees; a reply's summary is flagged as the model wrote it and only then
+cut to one line. A hazard past a cut is still a hazard, and a cut that hid one would make
+the gate a matter of length.
 
 After the model
 ---------------
@@ -71,9 +79,14 @@ cited by any proposal.
 4. B takes the lock, reads the stream, finds A's proposal citing O, appends nothing for O,
    and reports it ``already_proposed``.
 
-The re-check in step 4 reads this device's stream only, the one under the lock. Two devices
-proposing from the same observation before their logs meet can each stage one; review sees
-two items for one fact, and sync (D57) is where that is answered.
+The re-check in step 4 reads every stream the principal has on this machine: this device's
+through the locked handle, the others with a shared lock that does not wait (a run on
+another device holds its own stream exclusively at this moment and may be reading ours, and
+two runs each waiting on the other's lock would never finish). When the shared lock is
+refused the other stream is read as it is; D80's reader passes over a torn tail, so the
+most that can be missed is the record being appended right then, which is the window the
+single-stream check always had. Two devices proposing from one observation before their
+logs meet (D57) can still each stage one, and review sees two items for one fact.
 
 Verdicts: A and B both find staged item S without a verdict from this model. Each takes the
 shadow file's exclusive lock in turn, re-reads it, and the second finds the first's verdict
@@ -83,9 +96,11 @@ tier, and ``walle rebuild`` neither reads nor writes it.
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import os
+import re
 import secrets
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
@@ -95,6 +110,7 @@ from typing import Any, Literal, Protocol
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from walle import hazards, index
+from walle.envelope import deface
 from walle.events import (
     ACTOR_PROPOSER,
     Instant,
@@ -105,11 +121,11 @@ from walle.events import (
     make_ref,
     now_instant,
 )
-from walle.paths import principal_dir
-from walle.reader import Record, Skip
-from walle.resolver import Staged, retired_by, staged
+from walle.paths import STREAM_SUFFIX, log_dir, principal_dir
+from walle.reader import Record, Skip, StreamContents, parse_stream
+from walle.resolver import Staged, retired_refs, staged
 from walle.staging import clean_body, clean_summary, summarise
-from walle.writer import StreamWriter
+from walle.writer import LockedStream, StreamWriter
 
 EXCERPT_CHARS = 2000
 """The most of one observation a single excerpt carries."""
@@ -180,17 +196,15 @@ JUDGE_INSTRUCTIONS = (
 
 
 def _marked(text: str) -> bool:
-    """Whether model output carries anything shaped like an envelope marker."""
-    return "<<<" in text or ">>>" in text
-
-
-def _deface(text: str) -> str:
-    """Break anything shaped like an envelope marker so a forged one never closes ours."""
-    return text.replace("<<<", "< < <").replace(">>>", "> > >")
+    """Whether model output carries anything shaped like an envelope marker: anything the
+    envelope would have to deface, in any bracket form it knows (D55)."""
+    return deface(text) != text
 
 
 def envelope(text: str, marker: str) -> str:
-    return f"<<<untrusted:{marker}>>>\n{_deface(text)}\n<<</untrusted:{marker}>>>"
+    """D55's envelope around ``text``, defaced by ``walle.envelope.deface``: the same block
+    ``walle.envelope.wrap`` writes, with this request's marker."""
+    return f"<<<untrusted:{marker}>>>\n{deface(text)}\n<<</untrusted:{marker}>>>"
 
 
 def _requests(
@@ -225,30 +239,50 @@ def _requests(
 # --- excerpts -----------------------------------------------------------------------------
 
 
+_LABEL = re.compile(r"^(user|assistant|tool|system):")
+
+
 def excerpts(ref: str, body: str, limit: int = EXCERPT_CHARS) -> list[tuple[str, str]]:
     """Cut ``body`` into ``(id, text)`` pieces of at most ``limit`` characters, on line
-    boundaries where a line fits and mid-line where it does not. Ids are ``<ref>#<n>``."""
+    boundaries where a line fits and mid-line where it does not. Ids are ``<ref>#<n>``.
+
+    A piece that begins inside a block opens with the label of the role it continues, as
+    the observer would have written it had the block started there. Nothing else is added
+    and nothing is lost: the pieces, less the labels carried forward, join back into the
+    body with only its line breaks gone.
+    """
     pieces: list[str] = []
     current: list[str] = []
     size = 0
+    role: str | None = None
+
     for line in body.split("\n"):
+        match = _LABEL.match(line)
+        if match:
+            role = match.group(1)
+        # What a new piece starting at this line opens with: nothing when the line has its
+        # own label or no role has been seen yet, else the role it continues.
+        prefix = "" if match or role is None else f"{role}: "
+        room = max(1, limit - len(prefix))
         sliced = False
-        while len(line) > limit:
+        while len(line) > room:
             if current:
                 pieces.append("\n".join(current))
                 current, size = [], 0
-            pieces.append(line[:limit])
-            line = line[limit:]
+            pieces.append(prefix + line[:room])
+            line = line[room:]
             sliced = True
+            prefix = "" if role is None else f"{role}: "  # the rest is a continuation
+            room = max(1, limit - len(prefix))
         if sliced and not line:
             continue
-        extra = len(line) + (1 if current else 0)
-        if current and size + extra > limit:
+        if current and size + len(line) + 1 <= limit:
+            current.append(line)
+            size += len(line) + 1
+            continue
+        if current:
             pieces.append("\n".join(current))
-            current, size = [], 0
-            extra = len(line)
-        current.append(line)
-        size += extra
+        current, size = [prefix + line], len(prefix) + len(line)
     if current or not pieces:
         pieces.append("\n".join(current))
     return [(f"{ref}#{n}", text) for n, text in enumerate(pieces, start=1)]
@@ -302,15 +336,18 @@ class FakeModel:
     @staticmethod
     def person_lines(excerpt: str) -> list[str]:
         """The lines of an excerpt that are the person's, by the observer's layout: the
-        ``user:`` block comes first and ends at the first ``assistant:`` line. An excerpt
-        with no label is read as a continuation of the person's block. Nothing after an
-        ``assistant:`` line is ever read as a turn, whatever it is prefixed with — a
-        ``user:`` line there is pasted text, and ``hazards`` has flagged it already."""
+        ``user:`` block comes first and ends at the first line labelled with any other
+        role — ``assistant:``, ``tool:``, ``system:``. Nothing after that is ever read as
+        a turn, whatever it is prefixed with: a ``user:`` line there is pasted text, and
+        ``hazards`` has flagged it already. An excerpt with no label at all is a body with
+        no turns in it, and is read whole; ``excerpts`` labels every piece of a body that
+        has turns, so a reply's continuation never arrives bare."""
         out: list[str] = []
         for line in excerpt.split("\n"):
-            if line.startswith("assistant:"):
+            match = _LABEL.match(line)
+            if match and match.group(1) != "user":
                 break
-            said = line[len("user: ") :] if line.startswith("user: ") else line
+            said = line[match.end() :] if match else line
             if said.strip():
                 out.append(said.strip())
         return out
@@ -413,11 +450,13 @@ def _candidates(
         if len(body) > BODY_CHARS:
             dropped.append("oversize")
             continue
-        text = f"{summary}\n{body}"
-        if _marked(text):
+        # Flagged as the model wrote it, before the summary's cut: a marker or a secret past
+        # character 120 of a summary is still in the reply.
+        whole = f"{item.summary}\n{item.body}"
+        if _marked(whole):
             dropped.append("marker-in-text")
             continue
-        if hazards.flag(text):
+        if hazards.flag(whole):
             dropped.append("hazard-in-text")
             continue
         observation = _ref_of(item.excerpt)
@@ -668,7 +707,7 @@ def propose(
     already = 0
     if candidates:
         with writer.locked() as stream:
-            cited = _considered(stream.read().records)
+            cited = _cited_now(stream, log_dir(root, principal))
             for candidate in candidates:
                 if candidate.observation in cited:
                     already += 1
@@ -727,19 +766,46 @@ def propose(
     )
 
 
+def _cited_now(stream: LockedStream, log: Path) -> set[str]:
+    """Every observation a proposal cites, across all of the principal's streams, read
+    under this stream's exclusive lock (the walkthrough, step 4).
+
+    This stream is read through the locked handle. Every other stream is read with a shared
+    lock that does not wait: a run on another device holds its own stream exclusively while
+    it does this same check, and two runs each waiting for the other's lock would never
+    finish. When the lock is refused the file is read as it is, and D80's reader passes over
+    the one torn line an append in progress can leave.
+    """
+    cited = _considered(stream.read().records)
+    for path in sorted(log.glob(f"*{STREAM_SUFFIX}")):
+        if path == stream.path:
+            continue
+        cited |= _considered(_read_other(path).records)
+    return cited
+
+
+def _read_other(path: Path) -> StreamContents:
+    """Another device's stream, under a shared lock if one can be had at once."""
+    with open(path, "rb") as f:
+        # When its writer holds it, read as it is, and let D80 pass over a torn tail.
+        with contextlib.suppress(BlockingIOError):
+            fcntl.flock(f.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return parse_stream(f.read(), path, path.stem)
+
+
 def _judge(model: Model, queue: Sequence[Staged], when: str) -> tuple[list[ShadowVerdict], int]:
     """The model's verdict on each staged item, and how many requests that took.
 
     A staged item that itself carries a hazard (``walle remember`` takes any text) never
-    reaches the model. It gets a ``drop`` from this module, with the kind as the reason.
+    reaches the model. It gets a ``drop`` from this module, with the kind as the reason. The
+    whole item is flagged; only an item with nothing in it is cut to the head the model sees.
     """
     by_ref = {item.ref: item for item in queue}
     verdicts: dict[str, ShadowVerdict] = {}
     items: list[tuple[str, str]] = []
     for item in queue:
-        # Judged on its head, bounded like an excerpt: ``walle remember`` takes any length.
-        text = excerpts(item.ref, f"{item.proposal.summary}\n{item.proposal.body}")[0][1]
-        if kinds := hazards.flag(text):
+        whole = f"{item.proposal.summary}\n{item.proposal.body}"
+        if kinds := hazards.flag(whole):
             verdicts[item.ref] = ShadowVerdict(
                 ts=when,
                 proposal=item.ref,
@@ -748,7 +814,8 @@ def _judge(model: Model, queue: Sequence[Staged], when: str) -> tuple[list[Shado
                 reason=f"withheld from the model: {', '.join(kinds)}",
             )
         else:
-            items.append((item.ref, text))
+            # Judged on its head, bounded like an excerpt: ``walle remember`` takes any length.
+            items.append((item.ref, excerpts(item.ref, whole)[0][1]))
     requests = 0
     for request in _requests("judge", items):
         requests += 1
@@ -805,11 +872,12 @@ def score(root: Path, principal: str, *, model: str) -> Score:
         if record.event.type == "assertion"
         for cause in record.event.caused_by
     }
+    retired = retired_refs(records)  # one fold over the log, not one per verdict
     agree = false_allow = missed = pending = 0
     for ref, verdict in latest.items():
         if ref in kept:
             human: Verdict | None = "keep"
-        elif retired_by(records, ref):
+        elif ref in retired:
             human = "drop"
         else:
             human = None
