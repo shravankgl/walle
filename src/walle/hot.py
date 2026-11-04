@@ -17,7 +17,9 @@ in full and the rest become ``[#ref] summary`` lines, with a note telling the mo
 before acting on anything a summary only hints at (D81). One-line entries come first, oldest
 first, and the full entries last, so a new assertion changes the end of the file and the start
 stays a stable prefix (R1). Mode is chosen by the render, so it is fixed for every session that
-reads that render.
+reads that render. The mode reported is the mode of the text written: when the full render
+is over the limit but holds no more than ``KEEP_FULL`` assertions, nothing can become a
+summary line, so the file is the full render and the mode is ``full``, over the limit or not.
 
 The files are derived from the log (D10), so they are written ``0444`` and the renderer
 records the SHA-256 of what it wrote in ``rendered.json`` (D107). A file whose bytes are not
@@ -74,6 +76,7 @@ Lock order is ``render.lock``, then ``index.lock``, then stream files. Nothing t
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -192,18 +195,23 @@ def compose(principal: str, resolution: Resolution, *, limit: int = FULL_LIMIT) 
     renderer skip a write when nothing changed and recognise its own files by hash.
     """
     beliefs = sorted(resolution.current, key=_newness)
-    conflicts: dict[str, list[str]] = {}
+    # A set per side: two contradiction events about one pair are one conflict to the reader,
+    # so they render as one line. ``_entry`` sorts what is left.
+    conflicts: dict[str, set[str]] = {}
     for conflict in resolution.conflicts:
         a, b = conflict.between
-        conflicts.setdefault(a, []).append(b)
-        conflicts.setdefault(b, []).append(a)
+        conflicts.setdefault(a, set()).add(b)
+        conflicts.setdefault(b, set()).add(a)
 
     fixed = {IDENTITY: _identity(principal), USER: _user(principal)}
     full = _learned(principal, beliefs, conflicts, summarised=0)
-    if sum(len(t) for t in fixed.values()) + len(full) <= limit:
+    summarised = max(0, len(beliefs) - KEEP_FULL)
+    # Full when it fits, and also when it does not but every assertion is among the newest
+    # KEEP_FULL: index mode would then summarise nothing, so the file is the full render and
+    # is reported as such. The mode must describe the text, because D81 fixes it per session.
+    if not summarised or sum(len(t) for t in fixed.values()) + len(full) <= limit:
         return Rendered(Mode.FULL, {**fixed, LEARNED: full}, len(beliefs), 0)
 
-    summarised = max(0, len(beliefs) - KEEP_FULL)
     learned = _learned(principal, beliefs, conflicts, summarised=summarised)
     return Rendered(Mode.INDEX, {**fixed, LEARNED: learned}, len(beliefs) - summarised, summarised)
 
@@ -256,7 +264,7 @@ def _user(principal: str) -> str:
 
 
 def _learned(
-    principal: str, beliefs: list[Belief], conflicts: dict[str, list[str]], *, summarised: int
+    principal: str, beliefs: list[Belief], conflicts: dict[str, set[str]], *, summarised: int
 ) -> str:
     out = [
         _banner(LEARNED, principal),
@@ -280,12 +288,12 @@ def _learned(
         out.extend(f"[#{b.ref}] {_one_line(b.assertion.summary)}\n" for b in beliefs[:summarised])
         out.append("\n## In full, newest last\n\n")
     out.append(
-        "\n".join(_entry(b, conflicts.get(b.ref, []), principal) for b in beliefs[summarised:])
+        "\n".join(_entry(b, conflicts.get(b.ref, set()), principal) for b in beliefs[summarised:])
     )
     return "".join(out)
 
 
-def _entry(belief: Belief, conflicts: list[str], principal: str) -> str:
+def _entry(belief: Belief, conflicts: set[str], principal: str) -> str:
     a = belief.assertion
     lines = [f"### [#{belief.ref}] {_one_line(a.summary)}\n\n", a.body.rstrip("\n"), "\n"]
     notes: list[str] = []
@@ -397,12 +405,22 @@ def _judge(path: Path, new: bytes, vouched: tuple[str, ...] | list[str]) -> str 
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except FileNotFoundError:
         return "write"  # gone since the lstat: nothing there to keep
+    except OSError as exc:
+        if exc.errno != errno.ELOOP:
+            raise
+        # A symlink swapped in since the lstat: O_NOFOLLOW refused it. Same verdict as a
+        # symlink found by the lstat, and nothing at the other end is opened.
+        return Preserved(path.name, path, None, "it is not a regular file walle wrote")
     with os.fdopen(fd, "rb") as f:
-        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+        # The descriptor is what is read, so its type and mode are the ones that count. The
+        # lstat above keeps the open off anything that is not a regular file, but the path can
+        # change between the two calls.
+        opened = os.fstat(f.fileno())
+        if not stat.S_ISREG(opened.st_mode):
             return Preserved(path.name, path, None, "it is not a regular file walle wrote")
         current = f.read()
     if current == new:
-        return "unchanged" if stat.S_IMODE(st.st_mode) == READ_ONLY else "write"
+        return "unchanged" if stat.S_IMODE(opened.st_mode) == READ_ONLY else "write"
     found = _sha(current)
     if found in vouched:
         return "write"

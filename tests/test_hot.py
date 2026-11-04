@@ -13,6 +13,7 @@ Every event here is synthetic: a made-up person's dinners and plants, no real da
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -20,7 +21,9 @@ import stat
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 from click.testing import CliRunner
@@ -533,3 +536,144 @@ def test_a_second_renderer_waits_and_renders_the_newer_log(tmp_path: Path) -> No
     assert out.strip() == "0"  # A reported no edit
     assert b.preserved == ()
     assert "Likes rosemary" in _text(tmp_path, LEARNED)  # B's newer render is what is left
+
+
+# --- task 7 follow-up (issue #28): the reported mode, duplicate conflicts, the open race ---
+
+
+def _long_few(root: Path, n: int = 3) -> list[str]:
+    """A few assertions, each long enough that together they pass the threshold."""
+    events = [
+        _assertion(
+            f"Long note {i}",
+            body=f"LONG-{i} " + "The fern by the north window wants damp soil. " * 80,
+            minute=i,
+        )
+        for i in range(n)
+    ]
+    return _write(root, "mbp", *events)
+
+
+def test_a_few_long_assertions_over_the_limit_report_the_mode_written(tmp_path: Path) -> None:
+    """Over the limit but with no more than KEEP_FULL assertions, nothing can be summarised,
+    so the file is the full render and the report and manifest must say full (D81)."""
+    refs = _long_few(tmp_path)
+    folder = hot_dir(tmp_path, P)
+    report = render(tmp_path, P)
+    learned = _text(tmp_path, LEARNED)
+
+    assert sum(len((folder / n).read_text(encoding="utf-8")) for n in FILES) > FULL_LIMIT
+    assert len(refs) <= KEEP_FULL
+    for i, ref in enumerate(refs):
+        assert f"### [#{ref}] Long note {i}" in learned
+        assert f"LONG-{i} " in learned
+    assert "index mode" not in learned
+    assert report.summarised == 0
+    assert report.mode is Mode.FULL
+    assert _manifest(tmp_path)["mode"] == Mode.FULL.value
+
+
+@pytest.mark.parametrize("n", [1, KEEP_FULL, KEEP_FULL + 1, 30])
+def test_the_reported_mode_always_matches_the_text(n: int) -> None:
+    """Whatever the count, index mode is reported exactly when the file is in index mode."""
+    events = [_assertion(f"n{i}", body=f"B{i} " + "x" * 3000, minute=i) for i in range(n)]
+    rendered = compose(P, resolve(_records(*events)))
+    in_index = "index mode" in rendered.files[LEARNED]
+    assert (rendered.mode is Mode.INDEX) is in_index
+    assert (rendered.summarised > 0) is in_index
+    assert rendered.in_full + rendered.summarised == n
+
+
+def test_duplicate_contradictions_for_one_pair_render_one_line() -> None:
+    a = _assertion("Lives in Pune", valid_from="2026-01-01")
+    b = _assertion("Lives in Bangalore", valid_from="2026-01-01", minute=1)
+    c1 = Contradiction(ts=_ts(2), actor=ACTOR_CURATOR, caused_by=["d-mbp:1", "d-mbp:2"])
+    c2 = Contradiction(ts=_ts(3), actor=ACTOR_CURATOR, caused_by=["d-mbp:2", "d-mbp:1"])
+    resolution = resolve(_records(a, b, c1, c2))
+    assert len(resolution.conflicts) == 2  # the fold reports both events; the render dedupes
+    learned = compose(P, resolution).files[LEARNED]
+    assert learned.count("conflicts with [#d-mbp:2]") == 1
+    assert learned.count("conflicts with [#d-mbp:1]") == 1
+
+
+def _after_lstat(
+    monkeypatch: pytest.MonkeyPatch, target: Path, act: Callable[[], None]
+) -> list[int]:
+    """Run ``act()`` once, right after the renderer's ``lstat`` of ``target``: the window
+    between that check and the ``open``. Returns a list that records the call."""
+    real = os.lstat
+    fired: list[int] = []
+
+    def lstat(path: str | os.PathLike[str], *args: Any, **kwargs: Any) -> os.stat_result:
+        st = real(path, *args, **kwargs)
+        if not fired and os.fspath(path) == os.fspath(target):
+            fired.append(1)
+            act()
+        return st
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    return fired
+
+
+def test_a_symlink_swapped_in_after_the_lstat_is_preserved_not_raised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real ELOOP from O_NOFOLLOW, not a mocked one: the file is a regular file at the
+    lstat and a symlink by the open."""
+    _few(tmp_path)
+    render(tmp_path, P)
+    learned = hot_dir(tmp_path, P) / LEARNED
+    elsewhere = tmp_path / "elsewhere.md"
+    elsewhere.write_text("not walle's\n", encoding="utf-8")
+
+    def swap() -> None:
+        learned.unlink()
+        learned.symlink_to(elsewhere)
+
+    fired = _after_lstat(monkeypatch, learned, swap)
+    _write(tmp_path, "mbp", _assertion("Likes rain", minute=9))
+    report = render(tmp_path, P)
+
+    assert fired
+    assert learned.is_symlink()
+    assert elsewhere.read_text(encoding="utf-8") == "not walle's\n"
+    assert [(p.name, p.found) for p in report.preserved] == [(LEARNED, None)]
+    assert _manifest(tmp_path)["kept"] == [LEARNED]
+
+
+def test_an_open_error_other_than_eloop_still_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the swapped-symlink case is a preserve; a real IO failure is not hidden."""
+    _few(tmp_path)
+    render(tmp_path, P)
+    real_open = os.open
+    learned = os.fspath(hot_dir(tmp_path, P) / LEARNED)
+
+    def failing_open(path: str | os.PathLike[str], flags: int, *args: Any, **kwargs: Any) -> int:
+        if os.fspath(path) == learned:
+            raise OSError(errno.EIO, "simulated I/O error", learned)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", failing_open)
+    with pytest.raises(OSError) as excinfo:
+        render(tmp_path, P)
+    assert excinfo.value.errno == errno.EIO
+
+
+def test_the_mode_is_checked_on_the_opened_file_not_the_lstat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Made writable between the lstat and the open, same bytes: the descriptor's mode is the
+    truth, so the file is rendered back to 0444 rather than reported unchanged."""
+    _few(tmp_path)
+    render(tmp_path, P)
+    learned = hot_dir(tmp_path, P) / LEARNED
+    fired = _after_lstat(monkeypatch, learned, lambda: learned.chmod(0o644))
+    report = render(tmp_path, P)
+
+    assert fired
+    assert report.preserved == ()
+    assert LEARNED in report.written
+    assert LEARNED not in report.unchanged
+    assert stat.S_IMODE(os.stat(learned).st_mode) == 0o444
