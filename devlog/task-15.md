@@ -65,6 +65,20 @@ Issue #12. Branch `task/15`. One commit. Built by the walle-author agent (Claude
   `Path.home()` raises if no home can be found, which refuses loudly rather than emitting a
   profile with no home rule.
 
+**Review fix (first review failed, medium + 2 low):**
+- Medium (srt tests never ran, CI skips them): still true, and not something this author can
+  clear, because `srt` and `bwrap` cannot be installed here and CI is a `.github/` path.
+  Fixed the part that was in reach: README no longer states the denials as proven; it says the
+  profile is untested under `srt` until the four tests are run, and names `bwrap` and `socat`.
+  Shravan can clear it for good by running `uv run pytest tests/test_sandbox.py -rs` on a
+  machine with `srt` and recording the result, or by overriding the status.
+- Low 1 (home-holding import path voids the home denial): fixed. `_interpreter_paths` drops an
+  entry that is the home folder or holds it. Test, written to fail first:
+  `test_an_import_path_that_holds_the_home_folder_does_not_reopen_it`.
+- Low 2 (loopback probe passes in a fresh network namespace regardless): not changed. A
+  non-loopback probe needs a reachable address, which a CI or sandbox host may not offer, and
+  the choice is a test-design call; left under *Noticed, not done*.
+
 **Review:** `scripts/review.sh` did not run: `ocr` is not installed in the author's
 environment (it exits 2 and says so). No independent pre-commit review happened; the PR review
 is the first.
@@ -92,6 +106,9 @@ have never run.
   seatbelt; the four `srt` tests should pass. If they pass, add `srt` to CI (a `.github/` change
   for Shravan).
 - On Linux `srt` needs `bwrap` and `socat`; the README does not say so yet.
+- `test_under_srt_there_is_no_network` probes loopback, which a fresh network namespace refuses
+  by itself, so it would pass even with `allowedDomains` set. A non-loopback probe would
+  prove more.
 - The profile has no `deniedDomainReasons`; with no allowed domains there is nothing to explain.
 
 **Cost:** not available to the author; Hyperagent holds it.

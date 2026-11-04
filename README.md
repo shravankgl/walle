@@ -142,12 +142,17 @@ srt --settings walle.srt.json walle-mcp --root /path/to/walle-data --principal m
 ```
 
 - **Reads:** Maya's folder and the Python that runs the server. The home folder and every
-  other principal's folder are denied.
+  other principal's folder are denied by the profile.
 - **Writes:** Maya's `log/` folder only. So `remember` still stages, and `recall` and `why`
   cannot refresh the index: they answer from the index as last built and say so. Refresh it
   with `walle` outside the sandbox.
 - **Network:** none.
 - The `log/` folder must exist first; a `walle` command run outside the sandbox makes it.
+- **Not yet verified under `srt`.** The profile's contents and the server's behaviour on
+  read-only files are tested here. The four tests that run the server under the real `srt`
+  skip where `srt` is absent, and have not yet been run on a machine with it. Until they
+  have, treat the profile as written to the `srt` documentation, not as proven. On Linux
+  `srt` also needs `bwrap` and `socat`.
 
 ## Documents
 

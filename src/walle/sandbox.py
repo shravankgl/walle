@@ -49,10 +49,11 @@ def srt_settings(root: Path, principal: str) -> dict[str, Any]:
     """
     root = Path(root)
     folder = _resolved(principal_dir(root, principal))
+    home = Path.home().resolve()
     return {
         "filesystem": {
-            "denyRead": [str(Path.home().resolve()), str(_resolved(root / "principals"))],
-            "allowRead": [str(folder), *_interpreter_paths(_resolved(root / "principals"))],
+            "denyRead": [str(home), str(_resolved(root / "principals"))],
+            "allowRead": [str(folder), *_interpreter_paths(_resolved(root / "principals"), home)],
             "allowWrite": [str(_resolved(log_dir(root, principal)))],
             "denyWrite": [],
         },
@@ -70,7 +71,7 @@ def _resolved(path: Path) -> Path:
     return path.resolve(strict=False)
 
 
-def _interpreter_paths(principals: Path) -> list[str]:
+def _interpreter_paths(principals: Path, home: Path) -> list[str]:
     """What Python needs to run the server: its prefixes, walle itself, and the import path.
 
     Without these, denying the home folder would deny a virtualenv or a ``uv`` Python that
@@ -80,7 +81,9 @@ def _interpreter_paths(principals: Path) -> list[str]:
 
     ``allowRead`` beats ``denyRead``, so an entry that holds ``principals`` (a ``PYTHONPATH``
     set to the data root) would hand back every principal's folder, and one inside it would
-    hand back a single other's. Both are dropped: the profile reads one folder there.
+    hand back a single other's. Both are dropped: the profile reads one folder there. The same
+    goes for an entry that is the home folder or holds it (``PYTHONPATH=$HOME``): it would void
+    the home denial, so it is dropped too. One inside home (a virtualenv) stays.
     """
     wanted = [sys.prefix, sys.base_prefix, str(Path(walle.__file__).parent), *sys.path]
     found: list[str] = []
@@ -90,6 +93,8 @@ def _interpreter_paths(principals: Path) -> list[str]:
             continue
         resolved = path.resolve()
         if resolved.is_relative_to(principals) or principals.is_relative_to(resolved):
+            continue
+        if home.is_relative_to(resolved):
             continue
         text = str(resolved)
         if text not in found:

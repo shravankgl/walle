@@ -171,6 +171,24 @@ def test_an_import_path_that_holds_the_principals_does_not_reopen_them(
     assert folder in allowed
 
 
+def test_an_import_path_that_holds_the_home_folder_does_not_reopen_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`allowRead` beats `denyRead`, so a `PYTHONPATH` of the home folder (or of a parent of
+    it) would void the home denial. Such entries are left out. One inside home stays: a
+    virtualenv there must still run."""
+    _profile_folder(tmp_path)
+    home = tmp_path / "home" / "maya"
+    venv = home / "venv"
+    venv.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(sys, "path", [*sys.path, str(home), str(home.parent), str(venv)])
+    allowed = _settings(tmp_path)["filesystem"]["allowRead"]
+    assert str(home.resolve()) not in allowed
+    assert str(home.parent.resolve()) not in allowed
+    assert str(venv.resolve()) in allowed
+
+
 def test_every_path_is_absolute_and_json_round_trips(tmp_path: Path) -> None:
     _profile_folder(tmp_path)
     settings = _settings(tmp_path)
