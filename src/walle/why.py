@@ -12,6 +12,11 @@ Each step also carries a **status**, from the resolver fold over the same record
   supersede states one, the world time it stopped being true (D93);
 * a proposal is ``staged``, ``kept as <assertion>`` or ``dropped by <supersede>``.
 
+A status is built from *other* events' fields: the supersede's reason and day, the refs of
+the assertions that replaced or closed one. ``Ledger.cited`` says which, so that a caller
+putting a status under an information-flow label (the MCP server, D84) can label it over
+every event it quotes and not only the step's own closure.
+
 A forgotten assertion is still explained, because forgetting is a ``supersede`` and the
 assertion never leaves the log (hard constraint 2). The fold hides it from ``current``; it does
 not hide it from ``why``.
@@ -77,29 +82,50 @@ class Ledger:
 
     def status(self, ref: str) -> str | None:
         """A plain account of where ``ref`` stands, or ``None`` if there is nothing to say."""
+        return self._account(ref)[0]
+
+    def cited(self, ref: str) -> tuple[str, ...]:
+        """The refs whose events ``status(ref)`` is built from, besides ``ref`` itself.
+
+        A supersede's reason, day and world time, the assertions that replaced or closed
+        one, the keep that decided a proposal: text under a label must have every one of
+        them in the label's closure (D84, D97). Empty when the status is ``None`` or quotes
+        nothing but ``ref``.
+        """
+        return self._account(ref)[1]
+
+    def _account(self, ref: str) -> tuple[str | None, tuple[str, ...]]:
         event = self.events.get(ref)
         if isinstance(event, Assertion):
             return self._assertion(ref)
         if isinstance(event, Proposal):
             return self._proposal(ref)
-        return None
+        return None, ()
 
-    def _assertion(self, ref: str) -> str | None:
+    def _assertion(self, ref: str) -> tuple[str | None, tuple[str, ...]]:
         belief = self.current.get(ref)
         if belief is not None:
             if not belief.closed_by:
-                return "current"
+                return "current", ()
             took_over = ", ".join(belief.closed_by)
-            return f"current, true until {belief.window.valid_to} ({took_over} took over)"
+            return (
+                f"current, true until {belief.window.valid_to} ({took_over} took over)",
+                belief.closed_by,
+            )
         retired = self.retired.get(ref)
         if retired is None:  # pragma: no cover - every assertion is current or retired
-            return None
-        parts = [self._retirement(s) for s in retired.by]
+            return None, ()
+        parts, cited = [], []
+        for supersede_ref in retired.by:
+            text, replaced = self._retirement(supersede_ref)
+            parts.append(text)
+            cited += [supersede_ref, *replaced]
         if retired.valid_to is not None:
             parts.append(f"true until {retired.valid_to}")
-        return "; ".join(parts)
+        return "; ".join(parts), tuple(cited)
 
-    def _retirement(self, supersede_ref: str) -> str:
+    def _retirement(self, supersede_ref: str) -> tuple[str, list[str]]:
+        """What one supersede did to an assertion, and the assertions it named as replacements."""
         supersede = self.events[supersede_ref]
         assert isinstance(supersede, Supersede)
         replaced = [c for c in supersede.caused_by if isinstance(self.events.get(c), Assertion)]
@@ -111,19 +137,19 @@ class Ledger:
         text += f" on {supersede.ts[:10]}"
         if supersede.reason:
             text += f" ({supersede.reason})"
-        return text
+        return text, replaced
 
-    def _proposal(self, ref: str) -> str:
+    def _proposal(self, ref: str) -> tuple[str, tuple[str, ...]]:
         if ref in self._staged:
-            return "staged"
+            return "staged", ()
         kept = sorted(
             (r for r, e in self.events.items() if isinstance(e, Assertion) and ref in e.caused_by),
             key=parse_ref,
         )
         if kept:
-            return f"kept as {', '.join(kept)}"
+            return f"kept as {', '.join(kept)}", tuple(kept)
         by = retired_by(self.records, ref)
-        return f"dropped by {', '.join(by)}" if by else "dropped"
+        return (f"dropped by {', '.join(by)}", by) if by else ("dropped", ())
 
 
 def explain(root: Path, principal: str, ref: str) -> Explanation:
