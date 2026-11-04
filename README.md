@@ -2,8 +2,8 @@
 
 > A forward deployment engineer for anyone.
 
-**Status:** Phase 0 implementation, one task a day — see [PLAN.md](PLAN.md) §9 and
-[DEVLOG.md](DEVLOG.md). Package name: `walle` (D105).
+**Status:** Phase 0 implementation, not yet usable. Agents are building it and code lands before
+human review (R6) — see [PLAN.md](PLAN.md) §9 and [devlog/](devlog/). Package name: `walle` (D105).
 
 Built solo, evenings and weekends. Each phase ships an article alongside the code — see
 [PLAN.md](PLAN.md) §4.

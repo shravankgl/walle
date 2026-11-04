@@ -1,7 +1,11 @@
 name: ci
 on:
+  # Task branches run through pull_request only. A push run on the same commit would report
+  # `gate` as skipped, and a skipped required check counts as passing.
   push:
+    branches: [main]
   pull_request:
+    types: [opened, edited, synchronize, reopened]
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -15,3 +19,25 @@ jobs:
       - run: uv run ruff format --check
       - run: uv run pyright
       - run: uv run pytest
+  # Agent PRs must link an issue and carry their log (R6). Shravan's own PRs are exempt.
+  gate:
+    if: github.event_name == 'pull_request' && github.event.pull_request.user.login != 'shravankgl'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: PR links an issue and adds a devlog entry
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+          PR: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! printf '%s' "$BODY" | grep -Eiq '(closes|fixes) #[0-9]+'; then
+            echo "::error::PR body must contain 'Closes #<issue>'"
+            exit 1
+          fi
+          if ! gh pr diff "$PR" -R "$GITHUB_REPOSITORY" --name-only | grep -Eq '^devlog/task-[0-9]+[a-z0-9-]*\.md$'; then
+            echo "::error::PR must add devlog/task-NN.md"
+            exit 1
+          fi

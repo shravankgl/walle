@@ -24,7 +24,7 @@ green, explained before it lands.
 - `README.md` — the pitch
 
 `CONVERSATION.md` is the important one. Decisions carry numbers (D1–D119) and revisions carry
-R1–R5; **cite them when you build on or challenge a decision** rather than re-deriving it. If
+R1–R7; **cite them when you build on or challenge a decision** rather than re-deriving it. If
 you disagree with a settled decision, say so explicitly and reference its number — do not
 quietly design around it.
 
@@ -96,6 +96,14 @@ These are settled. Violating one is a bug, not a style choice.
   never the employer's (D40). Commit only after Shravan has seen the explanation.
 - **Libraries, not frameworks** (D87): Pydantic, `click`, FastMCP, aisuite. Nothing that owns
   the loop.
+
+## Agent build period (R6, until 2026-11-27)
+
+Agents build `PLAN.md` §9 tasks from GitHub issues and auto-merge when `check`, `gate` and
+`agent-review` pass. For that work, `.github/agent-brief.md` replaces "explain before landing",
+"commit only after Shravan has seen the explanation", "Shravan reads every diff" and the
+pre-merge `scripts/review.sh`. Shravan reviews afterwards from `devlog/task-NN.md` and the
+`to-learn` label. The hard constraints above still apply.
 
 ## Working style
 

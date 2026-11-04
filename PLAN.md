@@ -1,7 +1,7 @@
 # Plan
 
-**Status:** design phase, nothing built. Last updated 2026-09-18.
-**Resourcing:** solo, evenings and weekends.
+**Status:** Phase 0 implementation; tasks 1–3 shipped, agents building the rest until 2026-11-27 (R6). Last updated 2026-11-04.
+**Resourcing:** agents on Hyperagent credit to 2026-11-27, then solo review (R6).
 **Objective:** a working system *and* a public writing track — the second is not a by-product
 of the first.
 
@@ -218,18 +218,19 @@ Revised at each phase gate against hours actually logged.
 
 ## 9. Phase 0 task list
 
-One task a day (D104). Each has a binary verify criterion that becomes a test (D69). `→` marks
-today. Done tasks get their date. Tasks that spill are split, never left half-done. Estimates
+One task a day (D104), or as many as agents finish during the credit period (R6). Each has a
+binary verify criterion that becomes a test (D69). `→` marks the next task, and from task 4 the
+GitHub issue carries the live status. Done tasks get their date. Tasks that spill are split, never left half-done. Estimates
 are the §8 table's, cut into days; the honest number for each is 1–2 hours of focused work.
 
 ### Week 1 — the log
 
 | # | Task | Verify | Decisions | Status |
 |---|---|---|---|---|
-| 1 | Repo scaffold: `uv`, `pyproject` (`walle`, MIT, py ≥ 3.12, `src/` layout), `ruff`, `pyright`, `pytest`, `pre-commit`, GitHub Actions, `DEVLOG.md` | `uv run pytest` green on one trivial test; `ruff`, `pyright` clean; CI green on the private remote | D104–D106 | → |
-| 2 | Event schema: base event (`v`, `ts`, `actor`, `caused_by` as `d-<dev>:<seq>` refs, type discriminator), `observation` (`observed_at`), `assertion` (`level`, `confidence`, `evidence_count`, `summary`, `valid_from`/`valid_to`, `about`), `supersede` (`target`, `valid_to`), `snapshot` (`forgets`), `contradiction`; `extra="forbid"` + upcast-chain scaffold; canonical JSON + hash | round-trip test per type; hash stable across key order; unknown field rejected; `v` present on every event | §5.1–5.2, D57, D58, D66, D85, D89, D93, D94, D96 | |
-| 3 | Stream writer: append to `principals/p-<name>/log/d-<device>.jsonl`, fsync, per-stream `seq`, path-segment validation, cross-process lock | two concurrent writer processes → contiguous seqs, no torn line; a traversal id is rejected | D10, D57, D80, D85 | |
-| 4 | Stream reader: iterate in seq order, tolerate a torn tail and report it, parse refs | fixture with a truncated last line loads N−1 events and reports exactly one skip | D80 | |
+| 1 | Repo scaffold: `uv`, `pyproject` (`walle`, MIT, py ≥ 3.12, `src/` layout), `ruff`, `pyright`, `pytest`, `pre-commit`, GitHub Actions, `DEVLOG.md` | `uv run pytest` green on one trivial test; `ruff`, `pyright` clean; CI green on the private remote | D104–D106 | 2026-09-19 |
+| 2 | Event schema: base event (`v`, `ts`, `actor`, `caused_by` as `d-<dev>:<seq>` refs, type discriminator), `observation` (`observed_at`), `assertion` (`level`, `confidence`, `evidence_count`, `summary`, `valid_from`/`valid_to`, `about`), `supersede` (`target`, `valid_to`), `snapshot` (`forgets`), `contradiction`; `extra="forbid"` + upcast-chain scaffold; canonical JSON + hash | round-trip test per type; hash stable across key order; unknown field rejected; `v` present on every event | §5.1–5.2, D57, D58, D66, D85, D89, D93, D94, D96 | 2026-10-10 |
+| 3 | Stream writer: append to `principals/p-<name>/log/d-<device>.jsonl`, fsync, per-stream `seq`, path-segment validation, cross-process lock | two concurrent writer processes → contiguous seqs, no torn line; a traversal id is rejected | D10, D57, D80, D85 | 2026-10-10 |
+| 4 | Stream reader: iterate in seq order, tolerate a torn tail and report it, parse refs | fixture with a truncated last line loads N−1 events and reports exactly one skip | D80 | → |
 | 5 | Resolver fold: current assertions honoring `supersede`; validity windows; overlap-only contradiction rule; no IO, no model | pure-function tests: supersede hides; non-overlapping windows never conflict; overlapping later-valid closes earlier | D8, D93 | |
 | 6 | SQLite index: `events`, `edges`, FTS5; tracking record per stream; `walle rebuild` | destroy the index → rebuild → resolved-state hash equal (D66); incremental rebuild picks up only new seqs; **an event whose `v` exceeds this build halts the fold by name; a dangling `caused_by` ref fails the rebuild** | D10, D59, D66, D96, D111 | |
 | 7 | Hot-tier renderer: identity / user / rules / learned, self-describing headers, index mode past threshold, `[#ref] summary` lines; rendered `0444`, hash recorded | over-threshold fixture flips to index mode; under-threshold renders in full; `rules` untouched by the renderer; **a render over an out-of-band edit preserves the edit and reports it instead of overwriting** | D50, D64, D81, D107 | |

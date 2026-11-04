@@ -1,9 +1,9 @@
 # Architecture
 
-A forward deployment engineer for anyone. Design phase — nothing built.
+A forward deployment engineer for anyone. Phase 0 in progress — see [PLAN.md](PLAN.md) §9.
 
 Rationale, rejected alternatives and revisions live in [CONVERSATION.md](CONVERSATION.md) as
-numbered decisions (D1–D119). Repos reviewed for adoption are cataloged in
+numbered decisions (D1–D119, R1–R7). Repos reviewed for adoption are cataloged in
 [REFERRALS.md](REFERRALS.md). This document is the synthesized current view; where the two
 disagree, the decision log is the record.
 
