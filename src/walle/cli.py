@@ -10,6 +10,7 @@ from walle import __version__
 from walle import context as walle_context
 from walle import hot as walle_hot
 from walle import index as walle_index
+from walle import proposer as walle_proposer
 from walle import staging as walle_staging
 from walle import why as walle_why
 from walle.events import AnyEvent, Assertion, FutureSchemaError, Proposal, Supersede
@@ -464,3 +465,77 @@ def context_command(root: Path, principal: str, device: str) -> None:
     for ref in applied.added:
         click.echo(f"  added {ref}")
     click.echo("Run `walle render` to put this in the hot tier.")
+
+
+# --- the proposer (tasks 16-18) ---------------------------------------------------------
+
+
+@main.command("propose")
+@_ROOT
+@click.option("--principal", required=True, help="Whose log to read, without the p- prefix.")
+@_DEVICE
+@click.option(
+    "--model",
+    required=True,
+    type=click.Choice(sorted(walle_proposer.MODELS)),
+    help="Only `fake` exists yet: deterministic, offline, proposes the person's own lasting "
+    "statements. A provider adapter is a later task.",
+)
+@click.option(
+    "--score",
+    is_flag=True,
+    help="Propose nothing; print how the model's shadow verdicts compare with your reviews.",
+)
+def propose_command(root: Path, principal: str, device: str, model: str, score: bool) -> None:
+    """Read the log and stage what is worth remembering; judge the queue in shadow (D44, D82).
+
+    Proposals go to the same queue as `walle remember`, and only `walle review` decides
+    them. The shadow verdicts are recorded beside the log and act on nothing. A run with
+    nothing new prints nothing (D63).
+    """
+    try:
+        if score:
+            result = walle_proposer.score(root, principal, model=model)
+            click.echo(
+                f"{principal}: shadow score for {result.model}: {result.decided} decided "
+                f"({result.agree} agree, {result.false_allow} would have kept a dropped item, "
+                f"{result.missed} would have dropped a kept item), {result.pending} still staged."
+            )
+            return
+        report = walle_proposer.propose(root, principal, device, walle_proposer.MODELS[model]())
+    except walle_proposer.ModelReplyError as exc:
+        raise click.ClickException(f"nothing written: {exc}") from exc
+    except _LOG_ERRORS as exc:
+        raise click.ClickException(_describe(exc)) from exc
+
+    for stream, skip in report.skips:
+        click.echo(f"skipped {stream} line {skip.line}: {skip.reason}", err=True)
+    if report.silent:
+        return
+    if report.proposed:
+        click.echo(
+            f"{principal}: proposed {_plural(len(report.proposed), 'item')} to the staging "
+            f"queue: {', '.join(report.proposed)}."
+        )
+    else:
+        click.echo(f"{principal}: nothing new to propose.")
+    if report.withheld:
+        kinds = ", ".join(f"{w.ref} ({', '.join(w.hazards)})" for w in report.withheld)
+        click.echo(
+            f"  withheld {_plural(len(report.withheld), 'observation')} from the model: {kinds}"
+        )
+    if report.dropped:
+        click.echo(
+            f"  refused {_plural(len(report.dropped), 'reply item')}: {', '.join(report.dropped)}"
+        )
+    if report.already_proposed:
+        click.echo(f"  {report.already_proposed} already proposed by another run meanwhile")
+    if report.verdicts:
+        click.echo(
+            f"  shadow: recorded {_plural(report.verdicts, 'verdict')} for {report.model}; "
+            "they act on nothing (D82)."
+        )
+    if report.shadow_error:
+        click.echo(f"  shadow: the shadow log is incomplete: {report.shadow_error}", err=True)
+    if report.proposed:
+        click.echo("Not in the hot tier until you keep them: run `walle review`.")
