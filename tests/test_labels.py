@@ -138,3 +138,35 @@ def test_labels_do_no_io_and_call_no_model() -> None:
     source = inspect.getsource(labels)
     for word in ("open(", "Path(", "sqlite3", "import os", "aisuite", "anthropic"):
         assert word not in source
+
+
+# --- issue #47 item 6: reserved actors and observations are never the principal's own -----
+
+
+def test_an_observation_is_not_the_principals_own_whoever_wrote_it() -> None:
+    """A transcript turn holds the assistant's replies and tool output, whatever ``actor``
+    the row carries (D97)."""
+    events: dict[str, AnyEvent] = {"d-mbp:1": _obs().model_copy(update={"actor": P})}
+    assert not labels.is_principals_own(events["d-mbp:1"], P)
+    assert integrity(events, "d-mbp:1", P) == UNTRUSTED
+
+
+@pytest.mark.parametrize("actor", sorted(labels.RESERVED_ACTORS))
+def test_a_reserved_actor_is_not_the_principals_own_even_as_the_principal(actor: str) -> None:
+    """``mcp_server`` refuses such a principal name; the label must not rely on that."""
+    events: dict[str, AnyEvent] = {"d-mbp:1": _proposal(actor)}
+    assert not labels.is_principals_own(events["d-mbp:1"], actor)
+    assert integrity(events, "d-mbp:1", actor) == UNTRUSTED
+    assert actor != ACTOR_USER
+
+
+def test_ifc_all_is_the_most_restrictive_over_several_refs() -> None:
+    events: dict[str, AnyEvent] = {
+        "d-mbp:1": _assertion(ACTOR_USER),
+        "d-mbp:2": _proposal(ACTOR_PROPOSER),
+    }
+    assert labels.ifc_all(events, ["d-mbp:1"], P) == ifc(events, "d-mbp:1", P)
+    assert labels.ifc_all(events, ["d-mbp:1", "d-mbp:2"], P)["integrity"] == UNTRUSTED
+    assert labels.ifc_all(events, ["d-mbp:2", "d-mbp:1"], P)["integrity"] == UNTRUSTED
+    with pytest.raises(ValueError):
+        labels.ifc_all(events, [], P)
