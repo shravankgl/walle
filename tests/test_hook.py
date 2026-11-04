@@ -304,6 +304,14 @@ def _break_lock_missing(folder: Path) -> None:
     (folder / hot.RENDER_LOCK).unlink()
 
 
+def _break_learned_blank(folder: Path) -> None:
+    (folder / hot.LEARNED).write_text(" \n\n", encoding="utf-8")
+
+
+def _break_identity_empty(folder: Path) -> None:
+    (folder / hot.IDENTITY).write_bytes(b"")
+
+
 BROKEN_FOLDERS = {
     "learned.md is a symlink": _break_learned_symlink,
     "learned.md is not utf-8": _break_learned_bytes,
@@ -311,6 +319,8 @@ BROKEN_FOLDERS = {
     "rules.md is too big": _break_rules_huge,
     "learned.md is missing": _break_missing_learned,
     "render.lock is missing": _break_lock_missing,
+    "learned.md is blank": _break_learned_blank,
+    "identity.md is empty": _break_identity_empty,
 }
 
 
@@ -450,3 +460,38 @@ def test_cold_start_through_the_install_snippet(tmp_path: Path) -> None:
         f"characters, about {math.ceil(len(context) / hook.CHARS_PER_TOKEN):,} tokens"
     )
     assert median < hook.BUDGET
+
+
+# --- issue 23: low findings from the review of PR 30 -----------------------------------
+
+
+def test_a_blank_rules_file_is_skipped_and_the_rest_injected(tmp_path: Path) -> None:
+    """``rules.md`` is optional, so blank is the same as absent. Only it may be blank."""
+    folder = _rendered(tmp_path)
+    (folder / hot.RULES).write_text("\n", encoding="utf-8")
+
+    done, _ = _run(tmp_path)
+
+    assert done.returncode == 0
+    text = _context(done)
+    assert "Waters the fern on Sundays" in text
+    assert f"{hot.RULES}, {P}'s own rules" not in text
+
+
+def test_measure_as_an_option_value_is_not_the_measure_flag(tmp_path: Path) -> None:
+    """``--principal --measure`` is bad arguments, not a request to measure: stay silent."""
+    _rendered(tmp_path)
+
+    done, _ = _run(tmp_path, args=["--root", str(tmp_path), "--principal", "--measure"])
+
+    _silent(done)
+
+
+def test_measure_still_explains_bad_arguments(tmp_path: Path) -> None:
+    """Asked for properly, ``--measure`` reports an argument error too."""
+    _rendered(tmp_path)
+
+    done, _ = _run(tmp_path, args=["--measure", "--root", str(tmp_path)])
+
+    assert (done.returncode, done.stdout) == (0, b"")
+    assert done.stderr.decode().startswith("walle hook: emitted nothing: bad arguments")

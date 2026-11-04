@@ -225,7 +225,15 @@ def load_records(root: Path, principal: str) -> tuple[Record, ...]:
     with _shared(index_lock_path(root, principal)):
         if not path.is_file():
             raise FileNotFoundError(f"{path}: no index yet. Run `walle rebuild`.")
-        with contextlib.closing(_connect(path, mode="ro")) as db:
+        try:
+            db = _connect(path, mode="ro")
+        except sqlite3.DatabaseError as exc:
+            if exc.sqlite_errorname in _BUSY:
+                raise
+            raise StaleIndexError(
+                f"{path}: the index file is unreadable ({exc}). Run `walle rebuild`."
+            ) from exc
+        with contextlib.closing(db):
             reason = _check(db)
             if reason is not None:
                 raise StaleIndexError(f"{path}: {reason}. Run `walle rebuild`.")
@@ -282,12 +290,11 @@ def _build(root: Path, principal: str, *, full: bool) -> IndexReport:
         if dangling:
             raise DanglingRefError(dangling, log)
 
-        conn, fresh_reason = _open_index(path, full=full)
+        conn, reason = _open_index(path, cut, full=full)
         with contextlib.closing(conn):
-            reason = fresh_reason if fresh_reason is not None else _disagreement(conn, cut)
             tracked = {} if reason is not None else _tracked(conn)
             new = tuple(r for c in cut for r in c.records if r.seq > tracked.get(c.stream, 0))
-            _write(conn, path, new, fresh=fresh_reason is not None, wipe=reason is not None)
+            _write(conn, path, new, fresh=reason is not None)
             committed = _rows(conn)  # still under index.lock: exactly what this build left
 
     return IndexReport(
@@ -475,21 +482,32 @@ def _remove(path: Path) -> None:
         leftover.unlink(missing_ok=True)
 
 
-def _open_index(path: Path, *, full: bool) -> tuple[sqlite3.Connection, str | None]:
+def _open_index(
+    path: Path, cut: tuple[StreamContents, ...], *, full: bool
+) -> tuple[sqlite3.Connection, str | None]:
     """A connection to the index, and why it is starting from an empty file (``None`` if not).
 
-    ``full`` always starts from an empty file. Reusing the old one would mean reading and
-    deleting its rows, and a file damaged past ``meta`` fails exactly there. Readers wait on
+    Every full rebuild starts from an empty file: ``full``, an unusable file, and tracking
+    records that disagree with ``cut``. Reusing the old one would mean reading and deleting
+    its rows, and a file damaged past ``meta`` fails exactly there. Readers wait on
     ``index.lock`` (``load_records``), so none has the old file open while it is removed.
     """
     if not path.exists():
         reason: str | None = "no index yet"
     else:
         reason = _unusable(path)
-        if reason is None:
-            if not full:
-                return _connect(path, mode="rw"), None
+        if reason is None and full:
             reason = "a full rebuild was asked for"
+        elif reason is None:
+            conn = _connect(path, mode="rw")
+            try:
+                reason = _disagreement(conn, cut)
+            except BaseException:
+                conn.close()
+                raise
+            if reason is None:
+                return conn, None
+            conn.close()  # closed before the file is removed below
         _remove(path)
     return _connect(path, mode="rwc"), reason
 
@@ -526,10 +544,9 @@ def _write(
     records: tuple[Record, ...],
     *,
     fresh: bool,
-    wipe: bool,
 ) -> None:
     """Write ``records`` and their tracking records in one transaction."""
-    if not records and not fresh and not wipe:
+    if not records and not fresh:
         return
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -537,9 +554,6 @@ def _write(
             for statement in _SCHEMA:
                 conn.execute(statement)
             conn.execute("INSERT INTO meta VALUES ('index_schema', ?)", (str(INDEX_SCHEMA),))
-        elif wipe:
-            for table in _TABLES:
-                conn.execute(f"DELETE FROM {table}")  # names from _TABLES, never input
         last: dict[str, Record] = {}
         for record in records:
             event = record.event
