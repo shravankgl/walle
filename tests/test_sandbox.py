@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import json
 import os
+import shlex
 import shutil
 import socket
 import stat
@@ -277,20 +278,50 @@ def _srt_or_skip(settings: Path) -> str:
     if srt is None:
         pytest.skip("srt is not installed (npm install -g @anthropic-ai/sandbox-runtime)")
     probe = subprocess.run(
-        [srt, "--settings", str(settings), "true"], capture_output=True, text=True, timeout=60
+        _srt_argv(srt, settings, ["true"]), capture_output=True, text=True, timeout=60
     )
     if probe.returncode != 0:
         pytest.skip(f"srt cannot start a sandbox here: {probe.stderr.strip()[:200]}")
     return srt
 
 
+def _srt_argv(srt: str, settings: Path, command: list[str]) -> list[str]:
+    """`srt` with `command` as one shell-quoted string after `-c`.
+
+    srt 0.0.81 joins separate arguments with spaces, without escaping, and runs the result in
+    a shell, so quotes and spaces in an argument break it. It also reads a `-c` meant for
+    Python as its own option. `-c` with `shlex.join` hands it one string it runs as written.
+    """
+    return [srt, "--settings", str(settings), "-c", shlex.join(command)]
+
+
 def _inside(srt: str, settings: Path, code: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [srt, "--settings", str(settings), sys.executable, "-c", code],
+        _srt_argv(srt, settings, [sys.executable, "-c", code]),
         capture_output=True,
         text=True,
         timeout=60,
     )
+
+
+def test_a_command_reaches_srt_as_one_string_it_does_not_reparse(tmp_path: Path) -> None:
+    """srt 0.0.81 joins separate arguments with spaces and hands them to a shell, and takes
+    `-c` as its own option. A stand-in with that argument handling, and no sandbox, shows the
+    command arrives whole: quotes, brackets and spaces intact. Runs without the real srt."""
+    fake = tmp_path / "srt"
+    fake.write_text(
+        "#!/bin/sh\n"
+        '[ "$1" = "--settings" ] && shift 2\n'
+        'if [ "$1" = "-c" ]; then exec /bin/sh -c "$2"; fi\n'
+        'exec /bin/sh -c "$*"\n'
+    )
+    fake.chmod(0o755)
+    spaced = tmp_path / "a folder"
+    spaced.mkdir()
+    target = spaced / "it's here"
+    done = _inside(str(fake), tmp_path / "unused.json", f"open({str(target)!r}, 'w').close()")
+    assert done.returncode == 0, done.stderr
+    assert target.exists()
 
 
 def test_the_server_passes_under_srt(tmp_path: Path) -> None:
@@ -300,9 +331,8 @@ def test_the_server_passes_under_srt(tmp_path: Path) -> None:
     settings = _write_settings(tmp_path, tmp_path)
     srt = _srt_or_skip(settings)
     before = len(read_stream(tmp_path, P, D).events)
-    transport = StdioTransport(
-        command=srt, args=["--settings", str(settings), sys.executable, *_server_args(tmp_path)]
-    )
+    srt_argv = _srt_argv(srt, settings, [sys.executable, *_server_args(tmp_path)])
+    transport = StdioTransport(command=srt_argv[0], args=srt_argv[1:])
     remembered, recalled = _run(_remember_and_recall(transport))
     assert not remembered.is_error, _text(remembered)
     assert not recalled.is_error, _text(recalled)

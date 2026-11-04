@@ -15,7 +15,7 @@ Issue #12. Branch `task/15`. One commit. Built by the walle-author agent (Claude
 - `src/walle/mcp_server.py` (changed). `walle-mcp --srt-profile` prints the profile on stdout
   and exits, after `build_server` has validated the names. The module docstring's pointer to
   task 15 now says what the profile does to the file-mode behaviour.
-- `tests/test_sandbox.py` (new). 16 tests, described under Verify.
+- `tests/test_sandbox.py` (new). 18 tests, described under Verify.
 - `README.md` (changed). "Running the server sandboxed": the two commands and what the profile
   allows.
 
@@ -45,16 +45,50 @@ Issue #12. Branch `task/15`. One commit. Built by the walle-author agent (Claude
 - Under the real `srt` (four tests): the server runs and `remember`/`recall` work; a write to
   the log folder succeeds and a write beside it is refused; Maya's log is readable and
   Ravi's is not; a loopback connection is refused.
-- **These four did not run in this task.** `srt` could not be installed in the agent's
-  environment (npm returned 403) and there is no bubblewrap. They skip with the reason when
-  `srt` is missing or cannot start a sandbox, so CI, which does not install `srt`, skips them
-  too. I checked their wiring against a throwaway stand-in `srt` that only forwards the
-  command: the server test passed and the three refusal tests failed, as they must when nothing
-  enforces. So the enforcement half of the criterion is **unverified until someone runs the
-  suite on a machine with `srt`**. See *Noticed, not done*.
-- Checks, at head: `uv run pytest` 931 passed, 10 skipped. Five of the skips are new: 4 need `srt`, and 1
-  needs a process that cannot write a read-only folder, which this environment's user can, so
-  I ran it with capabilities dropped via `setpriv` and it passed. `ruff check`, `ruff format --check`, `pyright` clean.
+- **The `srt` tests are confirmed on macOS by the owner, not by the author.** `srt` cannot
+  be installed or run in the author's environment (npm returns 403, no bubblewrap), so the
+  author has never run them and makes no claim about their result. They skip with the
+  reason when `srt` is missing or cannot start a sandbox, so CI, which does not install `srt`,
+  skips them too.
+  - Owner's run, macOS on Apple Silicon, `srt` 0.0.81, against the head before the fix below:
+    the profile enforces what it claims. Probed by a script under `srt --settings`: reading and
+    writing the own log were allowed. Reading or writing another principal, writing elsewhere
+    in the own profile folder, listing `~/.ssh` and the network were all refused.
+  - Same run, `tests/test_sandbox.py`: 3 failed, 14 passed. The failures were the test harness,
+    not the profile. Fixed below. Whether the fixed tests pass on macOS is for the owner's
+    re-run to confirm.
+- Checks, at the fix head: `uv run pytest` 947 passed, 10 skipped (the merge from `main` brought
+  in the extra tests). 5 of the skips are this task's: 4 need `srt`, and 1 needs a process that
+  cannot write a read-only folder, which this environment's user can. `ruff check` and
+  `ruff format --check` are clean, and `pyright` reports 0 errors.
+
+**Fix after the owner's macOS run (one further commit):**
+- Cause, as the owner found it: `_inside` passed `python -c <code>` to `srt` as separate
+  arguments. `srt` 0.0.81 joins its arguments with spaces, without escaping, and runs the
+  result in a shell, so the quotes and brackets in `code` broke the shell parse. `srt` also
+  has a `-c <command>` option of its own, so the `-c` meant for Python could be taken by `srt`.
+  Either way, the command never ran as written.
+- Change, `tests/test_sandbox.py` only: a new helper, `_srt_argv`, gives
+  `srt --settings <file> -c <shlex.join(command)>`, so `srt` receives one string that the
+  shell splits back into the original argv. `_inside`, the `_srt_or_skip` probe and the server
+  transport in `test_the_server_passes_under_srt` all use it now. No assertion changed.
+- New test, `test_a_command_reaches_srt_as_one_string_it_does_not_reparse`, written first and
+  seen failing with the same shell syntax error. It runs `_inside` through a stand-in `srt`
+  that copies 0.0.81's argument handling (it joins unescaped and honours `-c`) and enforces
+  nothing, then writes a file whose path has a space and a quote. It runs in CI, where the real
+  `srt` tests skip.
+- `test_the_server_passes_under_srt`, checked for the same cause: its transport had the same
+  separate-argument wiring, so it now goes through `_srt_argv` as well. But the same cause may
+  not explain its MCP error. Through the 0.0.81-style stand-in, the old wiring for the server
+  **passed** here, because its arguments (interpreter path, `-m walle.mcp_server`, `--root`,
+  `--principal`, `--device`) hold no quote, space or bracket for the shell to re-parse.
+  Unless a path on the Mac holds such a character, the MCP error probably has another cause.
+  See *Noticed, not done*.
+- Through the same stand-in, with the fix: the server test passes, the allowed halves of the
+  write and read tests pass, and all three refusal assertions fail, as they must when nothing
+  enforces. That stand-in run was a one-off and is not in the diff.
+- Stranger pass on the fix: `shlex.join` quotes for a POSIX shell, which is what `srt` runs the
+  `-c` string with on macOS and Linux. Windows `srt` is out of scope here.
 
 **Stranger pass:**
 - Found: `allowRead` beats `denyRead`, so a `PYTHONPATH` entry above `principals/` would have
@@ -98,13 +132,24 @@ is the first.
   CODEOWNERS paths I may not change. The server itself is what runs under `srt` here.
 
 **What to read first:** `_interpreter_paths` in `sandbox.py` (the one place the profile can be
-widened by something outside walle), then the four `srt` tests, which are the real proof and
-have never run.
+widened by something outside walle), then `_srt_argv` and the four `srt` tests. The owner ran them on macOS; the author
+never has.
 
 **Noticed, not done:**
-- Run `uv run pytest tests/test_sandbox.py -rs` on a machine with `srt` and bubblewrap or
-  seatbelt; the four `srt` tests should pass. If they pass, add `srt` to CI (a `.github/` change
-  for Shravan).
+- Owner to re-run `uv run pytest tests/test_sandbox.py -rs` on macOS with `srt` at this head.
+  If they pass, add `srt` to CI (a `.github/` change for Shravan).
+- If `test_the_server_passes_under_srt` still fails, the MCP error text and the server's
+  stderr will name the cause. Candidates not checked, because `srt` cannot run here: the server
+  reading something under the denied home folder at start-up (its working directory is the
+  repo, and fastmcp's settings look for `.env` there, and on Python 3.12 `Path.is_file()`
+  raises on EPERM rather than returning False), or `srt` itself writing to stdout. An
+  unreadable working directory alone did not stop the server importing on Linux.
+- `test_under_srt_there_is_no_network` passed in the owner's failing run only because the
+  broken command exited non-zero: it asserts only `returncode != 0`, so a command that never
+  ran passes it. Having the probe exit with a code of its own when the connection is refused,
+  and asserting that code, would make the pass mean something.
+- The README still calls the profile untested under `srt`. The owner's probe has since
+  confirmed it on macOS, so the README is now behind the evidence.
 - On Linux `srt` needs `bwrap` and `socat`; the README does not say so yet.
 - `test_under_srt_there_is_no_network` probes loopback, which a fresh network namespace refuses
   by itself, so it would pass even with `allowedDomains` set. A non-loopback probe would
