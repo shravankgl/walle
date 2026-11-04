@@ -1,0 +1,97 @@
+# Task 15: srt profile for the server, and the tests that hold it
+
+Issue #12. Branch `task/15`. One commit. Built by the walle-author agent (Claude Sonnet 5.5).
+
+**Shipped:**
+- `src/walle/sandbox.py` (new). `srt_settings(root, principal)` builds the `srt` settings dict
+  and `srt_settings_json` renders it. It only builds a dict: no file read, none written, no
+  process started. A bad principal raises `ValueError` before anything exists.
+  - Reads: `denyRead` is the home folder and `<root>/principals`; `allowRead` re-allows this
+    principal's folder and the Python that runs the server (`sys.prefix`, `sys.base_prefix`,
+    walle's own folder, absolute existing `sys.path` entries).
+  - Writes: `allowWrite` is the principal's `log/` folder and nothing else.
+  - Network: `allowedDomains` is empty.
+  - Every path is absolute and symlink-resolved, because `srt` matches resolved paths.
+- `src/walle/mcp_server.py` (changed). `walle-mcp --srt-profile` prints the profile on stdout
+  and exits, after `build_server` has validated the names. The module docstring's pointer to
+  task 15 now says what the profile does to the file-mode behaviour.
+- `tests/test_sandbox.py` (new). 16 tests, described under Verify.
+- `README.md` (changed). "Running the server sandboxed": the two commands and what the profile
+  allows.
+
+**Why:**
+- **D52.** We are the third party. A memory layer that cannot run sandboxed has no business
+  asking to be trusted.
+- **D99.** The Phase 0 server ships its own `srt` profile: read the profile folder, write only
+  the log, no network, and is tested under it.
+- **Hard constraint 6.** Denying `<root>/principals` and re-allowing one folder makes another
+  principal's facts unreadable by the OS, not by a resolver.
+- **Existing file-mode behaviour.** Task 13 already made the server survive a read-only
+  profile: `remember` writes only the log, and `recall` and `why` fall back to the index as
+  last built and say so. The profile relies on exactly that; it adds no server code for it.
+
+**Verify:** "server passes tests sandboxed: profile folder read, log write only, no network."
+- Profile content: `test_the_profile_writes_the_log_folder_and_nothing_else`,
+  `..._allows_no_network`, `..._reads_the_profile_folder_and_denies_every_other_principal`,
+  `..._lets_the_interpreter_run`, and the path-shape, relative-root, bad-name and
+  not-yet-created-folder tests.
+- The command: prints the profile, changes nothing on disk, refuses a bad device before
+  printing.
+- The same split as real file modes (`test_the_server_stages_into_the_log_when_everything_else_is_read_only`):
+  principal folder read-only except `log/`, then `remember` appends exactly one event and
+  `recall` answers "as last built". It runs where modes are enforced and skips, found by
+  trying to write, where they are not. Nothing in the suite asks who the user is or assumes
+  root.
+- Under the real `srt` (four tests): the server runs and `remember`/`recall` work; a write to
+  the log folder succeeds and a write beside it is refused; Maya's log is readable and
+  Ravi's is not; a loopback connection is refused.
+- **These four did not run in this task.** `srt` could not be installed in the agent's
+  environment (npm returned 403) and there is no bubblewrap. They skip with the reason when
+  `srt` is missing or cannot start a sandbox, so CI, which does not install `srt`, skips them
+  too. I checked their wiring against a throwaway stand-in `srt` that only forwards the
+  command: the server test passed and the three refusal tests failed, as they must when nothing
+  enforces. So the enforcement half of the criterion is **unverified until someone runs the
+  suite on a machine with `srt`**. See *Noticed, not done*.
+- Checks, at head: `uv run pytest` 931 passed, 10 skipped. Five of the skips are new: 4 need `srt`, and 1
+  needs a process that cannot write a read-only folder, which this environment's user can, so
+  I ran it with capabilities dropped via `setpriv` and it passed. `ruff check`, `ruff format --check`, `pyright` clean.
+
+**Stranger pass:**
+- Found: `allowRead` beats `denyRead`, so a `PYTHONPATH` entry above `principals/` would have
+  re-allowed every principal's folder through the interpreter paths. Fixed: entries that hold
+  or sit inside `principals/` are dropped. Test: `test_an_import_path_that_holds_the_principals_does_not_reopen_them`,
+  written to fail first.
+- Not an issue: no IO beyond `Path.resolve` and `exists`; no lock, no error path swallowed.
+  `Path.home()` raises if no home can be found, which refuses loudly rather than emitting a
+  profile with no home rule.
+
+**Review:** `scripts/review.sh` did not run: `ocr` is not installed in the author's
+environment (it exits 2 and says so). No independent pre-commit review happened; the PR review
+is the first.
+
+**Choices made inside the task:**
+- Generate the profile from `--root`/`--principal` instead of shipping a fixed JSON file: the
+  paths are per-install, and a static file would need hand-editing, which is how a profile gets
+  loosened.
+- Deny `<root>/principals` as well as home, because a root outside the home folder would
+  otherwise leave other principals readable.
+- Writable set is the whole `log/` folder, not one stream file: the writer may create the
+  device's stream file and cannot do so in a folder it cannot write.
+- No index write access, per D99's "write only the log". The cost is that `recall` can be
+  behind the log until `walle` refreshes the index outside the sandbox.
+- A test of the whole pytest suite *run under* `srt` is not added: it would need a second
+  profile (temp dirs, cache dirs) that is not the server's, and `scripts/` and `.github/` are
+  CODEOWNERS paths I may not change. The server itself is what runs under `srt` here.
+
+**What to read first:** `_interpreter_paths` in `sandbox.py` (the one place the profile can be
+widened by something outside walle), then the four `srt` tests, which are the real proof and
+have never run.
+
+**Noticed, not done:**
+- Run `uv run pytest tests/test_sandbox.py -rs` on a machine with `srt` and bubblewrap or
+  seatbelt; the four `srt` tests should pass. If they pass, add `srt` to CI (a `.github/` change
+  for Shravan).
+- On Linux `srt` needs `bwrap` and `socat`; the README does not say so yet.
+- The profile has no `deniedDomainReasons`; with no allowed domains there is nothing to explain.
+
+**Cost:** not available to the author; Hyperagent holds it.

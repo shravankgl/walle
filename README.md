@@ -131,6 +131,24 @@ untrusted envelope with a random per-result id, labelled `_meta.ifc` from its pr
 - The envelope cannot stop the host from acting on what it reads. A memory layer runs inside
   the host and cannot taint its session or refuse its tool calls (D55).
 
+### Running the server sandboxed
+
+D99: the server should run under [`srt`](https://github.com/anthropic-experimental/sandbox-runtime)
+(seatbelt on macOS, bubblewrap on Linux). walle prints the profile for you:
+
+```sh
+walle-mcp --root /path/to/walle-data --principal maya --device mbp --srt-profile > walle.srt.json
+srt --settings walle.srt.json walle-mcp --root /path/to/walle-data --principal maya --device mbp
+```
+
+- **Reads:** Maya's folder and the Python that runs the server. The home folder and every
+  other principal's folder are denied.
+- **Writes:** Maya's `log/` folder only. So `remember` still stages, and `recall` and `why`
+  cannot refresh the index: they answer from the index as last built and say so. Refresh it
+  with `walle` outside the sandbox.
+- **Network:** none.
+- The `log/` folder must exist first; a `walle` command run outside the sandbox makes it.
+
 ## Documents
 
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — the system: layers, loops, event log, profiles
