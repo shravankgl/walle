@@ -25,6 +25,8 @@ D89      ``snapshot`` names the refs it stands in for, rather than implying "eve
 D93      Two clocks. ``ts`` is when the log learned something; ``valid_from`` / ``valid_to``
          are when it was true in the world. ``observed_at`` is the source's own time.
 D94      An assertion carries how it was reached (``level``) and, rarely, who it is about.
+D49/D60  ``proposal`` is an item in the staging queue: a belief someone would like kept,
+         waiting for a human yes. It is never folded into what walle believes.
 D111     An event whose ``v`` is newer than this build halts loading by name. Reading it
          "best effort" would mean silently misinterpreting a field we do not know about.
 """
@@ -297,7 +299,7 @@ class Event(BaseModel):
         return data
 
 
-# --- the five types task 2 covers -------------------------------------------------------
+# --- the five types task 2 covers, and task 9's proposal --------------------------------
 #
 # §5.2's taxonomy also has utterance, capability, mission, trust, feedback and outcome.
 # They belong to phases that do not exist yet; adding them now would be guessing at their
@@ -357,6 +359,39 @@ class Assertion(Event):
     observer is; this says who is observed."""
 
 
+class Proposal(Event):
+    """A belief waiting in the staging queue for a human yes (D49, D60).
+
+    The staging queue *is* D49's review batch, and it lives in the log rather than in a file
+    beside it: a drop has to leave a tombstone (hard constraint 2), and a tombstone needs an
+    event to point at. A ``supersede`` targeting a proposal is a drop. An ``assertion`` whose
+    ``caused_by`` names it is a keep or an edit. Anything else is still staged.
+
+    Its own type, not an ``assertion`` with a flag, so that nothing which folds assertions
+    can pick one up by forgetting to check the flag. The resolver never puts a proposal in
+    ``current``, so the hot tier cannot carry one (D86: ``remember`` only stages).
+
+    The fields are the ones a keep copies onto the assertion. ``confidence`` and
+    ``evidence_count`` are absent on purpose: they describe a belief, and this is not one yet.
+    """
+
+    type: Literal["proposal"] = "proposal"
+
+    body: str = Field(min_length=1)
+    """What would be remembered, with the why."""
+
+    summary: str = Field(min_length=1, max_length=120)
+    """One line, written when the item is proposed, because the assertion it becomes needs
+    one and deriving it later is the migration D81 warns about."""
+
+    level: Level = Level.EXPLICIT
+
+    valid_from: WorldTime | None = None
+    valid_to: WorldTime | None = None
+    """World time, when the text carries a marker that resolves without guessing (D103).
+    Editable in review whenever set."""
+
+
 class Supersede(Event):
     """Retract or replace an earlier event. The target is never deleted — it stays in the
     log, with this event shadowing it (D8)."""
@@ -400,7 +435,7 @@ class Contradiction(Event):
 
 
 type AnyEvent = Annotated[
-    Observation | Assertion | Supersede | Snapshot | Contradiction,
+    Observation | Assertion | Proposal | Supersede | Snapshot | Contradiction,
     Field(discriminator="type"),
 ]
 
@@ -409,6 +444,7 @@ _ADAPTER: TypeAdapter[AnyEvent] = TypeAdapter(AnyEvent)
 EVENT_TYPES: dict[str, type[Event]] = {
     "observation": Observation,
     "assertion": Assertion,
+    "proposal": Proposal,
     "supersede": Supersede,
     "snapshot": Snapshot,
     "contradiction": Contradiction,

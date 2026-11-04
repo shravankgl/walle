@@ -7,9 +7,11 @@ import click
 from walle import __version__
 from walle import hot as walle_hot
 from walle import index as walle_index
+from walle import staging as walle_staging
 from walle.events import FutureSchemaError
 from walle.reader import CorruptStreamError
 from walle.resolver import ResolutionError, resolve
+from walle.writer import CorruptLogError
 
 
 @click.group(invoke_without_command=True)
@@ -145,3 +147,184 @@ def render_command(root: Path, principal: str) -> None:
         )
     if report.preserved:
         raise SystemExit(1)
+
+
+# --- the staging queue (task 9) ---------------------------------------------------------
+
+_ROOT = click.option(
+    "--root",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=".",
+    show_default=True,
+    help="The folder that holds principals/.",
+)
+_DEVICE = click.option(
+    "--device",
+    required=True,
+    help="This machine's stream, without the d- prefix. What this command writes goes there.",
+)
+
+# Everything reading or appending to the log can raise, said plainly rather than as a
+# traceback. ValueError covers pydantic's ValidationError and an unsafe name.
+_LOG_ERRORS = (
+    walle_index.DanglingRefError,
+    FutureSchemaError,
+    CorruptStreamError,
+    CorruptLogError,
+    ResolutionError,
+    OSError,
+    ValueError,
+)
+
+
+@main.command("remember")
+@_ROOT
+@click.option("--principal", required=True, help="Whose memory, without the p- prefix.")
+@_DEVICE
+@click.option(
+    "--summary",
+    default=None,
+    help=f"One line for the index, {walle_staging.SUMMARY_LIMIT} characters at most. "
+    "Defaults to the text's first line.",
+)
+@click.argument("text")
+def remember_command(
+    root: Path, principal: str, device: str, summary: str | None, text: str
+) -> None:
+    """Stage TEXT as something to remember (D49, D86).
+
+    It is not remembered yet: nothing staged reaches the hot tier until `walle review` keeps
+    it.
+    """
+    try:
+        item = walle_staging.remember(root, principal, device, text, summary=summary)
+    except _LOG_ERRORS as exc:
+        raise click.ClickException(_describe(exc)) from exc
+    click.echo(f"{principal}: staged {item.ref}: {item.proposal.summary}")
+    click.echo("Not in the hot tier until you keep it: run `walle review`.")
+
+
+_CHOICES = {"k": "keep", "e": "edit", "d": "drop", "s": "skip", "q": "quit"}
+
+
+def _choice(value: str) -> str:
+    answer = value.strip().lower()
+    for letter, word in _CHOICES.items():
+        if answer in (letter, word):
+            return letter
+    raise click.UsageError("answer k(eep), e(dit), d(rop), s(kip) or q(uit)")
+
+
+def _summary(value: str) -> str:
+    try:
+        return walle_staging.clean_summary(value)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+
+
+def _body(value: str) -> str:
+    try:
+        return walle_staging.clean_body(value)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+
+
+def _show(position: str, item: walle_staging.Staged) -> None:
+    proposal = item.proposal
+    click.echo(f"\n{position} {item.ref}, staged {proposal.ts[:10]} by {proposal.actor}")
+    click.echo(f"  summary: {proposal.summary}")
+    for line in proposal.body.splitlines():
+        click.echo(f"  | {line}")
+    if proposal.valid_from or proposal.valid_to:
+        click.echo(f"  true from {proposal.valid_from or '?'} to {proposal.valid_to or 'now'}")
+
+
+@main.command("review")
+@_ROOT
+@click.option("--principal", required=True, help="Whose staging queue, without the p- prefix.")
+@_DEVICE
+def review_command(root: Path, principal: str, device: str) -> None:
+    """Keep, edit or drop each staged item, one batch (D49).
+
+    A keep or an edit appends an assertion; a drop appends a supersede, and the dropped item
+    stays in the log. Each answer is written as it is given, so quitting part-way keeps the
+    answers already made.
+    """
+    try:
+        walle_staging.check_device(device)
+        items = walle_staging.pending(root, principal)
+    except _LOG_ERRORS as exc:
+        raise click.ClickException(_describe(exc)) from exc
+    if not items:
+        click.echo(f"{principal}: nothing staged.")
+        return
+
+    click.echo(f"{principal}: {_plural(len(items), 'item')} staged.")
+    done = {"k": 0, "e": 0, "d": 0, "s": 0, "elsewhere": 0}
+    reviewed = 0
+
+    def report() -> None:
+        line = (
+            f"\n{principal}: kept {done['k']}, edited {done['e']}, dropped {done['d']}, "
+            f"skipped {done['s']}"
+        )
+        if done["elsewhere"]:
+            line += f", {done['elsewhere']} already decided elsewhere"
+        if reviewed < len(items):
+            line += f", {len(items) - reviewed} not reached"
+        click.echo(line + ".")
+        if done["k"] or done["e"]:
+            click.echo("Run `walle render` to put what you kept in the hot tier.")
+
+    for position, item in enumerate(items, start=1):
+        _show(f"[{position}/{len(items)}]", item)
+        try:
+            answer = click.prompt(
+                "keep, edit, drop, skip or quit? [k/e/d/s/q]",
+                value_proc=_choice,
+                prompt_suffix=" ",
+            )
+        except click.Abort:
+            report()  # what was already answered is in the log; say so before stopping
+            raise
+        if answer == "q":
+            break
+        if answer == "s":
+            reviewed += 1
+            done["s"] += 1
+            click.echo("  skipped; still staged")
+            continue
+        try:
+            if answer == "k":
+                new = walle_staging.keep(root, principal, device, item.ref)
+                click.echo(f"  kept as {new}")
+            elif answer == "e":
+                click.echo("  Enter keeps the current text.")
+                summary = click.prompt(
+                    "  summary", default=item.proposal.summary, value_proc=_summary
+                )
+                body = click.prompt(
+                    "  body", default=item.proposal.body, show_default=False, value_proc=_body
+                )
+                new = walle_staging.edit(
+                    root, principal, device, item.ref, body=body, summary=summary
+                )
+                click.echo(f"  edited, kept as {new}")
+            else:
+                new = walle_staging.drop(root, principal, device, item.ref)
+                click.echo(f"  dropped {item.ref}: {new} retires it; it stays in the log")
+        except walle_staging.NotStagedError as exc:
+            reviewed += 1
+            done["elsewhere"] += 1
+            click.echo(f"  {exc}; left as it is")
+            continue
+        except click.Abort:
+            report()
+            raise
+        except _LOG_ERRORS as exc:
+            report()
+            raise click.ClickException(f"{item.ref} was not decided: {_describe(exc)}") from exc
+        reviewed += 1
+        done[answer] += 1
+
+    report()

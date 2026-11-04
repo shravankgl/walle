@@ -30,6 +30,7 @@ from walle.events import (
     FutureSchemaError,
     Level,
     Observation,
+    Proposal,
     Snapshot,
     Supersede,
     canonical_json,
@@ -69,6 +70,14 @@ def _one_of_each() -> list[AnyEvent]:
             target="d-mbp:44881",
             reason="moved to Pune",
             valid_to="2027-01-01",
+        ),
+        Proposal(
+            ts=TS,
+            actor=ACTOR_USER,
+            body="Maya keeps the basil on the east windowsill.",
+            summary="basil on the east windowsill",
+            level=Level.EXPLICIT,
+            valid_from="2026-05-01",
         ),
         Snapshot(
             ts=TS,
