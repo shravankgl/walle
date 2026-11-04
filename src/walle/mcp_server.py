@@ -5,8 +5,10 @@
 D48's first shippable surface is an MCP server plus a CLI. The CLI already holds the
 human-in-the-loop operations (``review``, ``context``, ``forget``, ``rebuild``); this is the
 part the host's model calls. Three tools, no more (D102), on FastMCP over stdio (D87, D106).
-The hot tier is not here: it is injected by the ``SessionStart`` hook (D54). ``recall`` is for
-the cold tier and for D81's index mode, where a ``[#ref] summary`` line is fetched in full.
+The hot tier is not a tool: the ``SessionStart`` hook injects it (D54), and this server also
+publishes it as the Resource ``memory://hot-tier``, read by the host and updated on every
+change (D83, ``hot_resource.py``). ``recall`` is for the cold tier and for D81's index mode,
+where a ``[#ref] summary`` line is fetched in full.
 
 ``recall(query)``
     Current beliefs only, never a staged proposal or a retired assertion. A query that is a
@@ -129,7 +131,7 @@ from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
 from mcp.types import TextContent, ToolAnnotations
 
-from walle import hazards, index, staging
+from walle import hazards, hot_resource, index, staging
 from walle.envelope import wrap
 from walle.events import (
     ACTOR_MCP,
@@ -221,10 +223,13 @@ _ROOT_HIDDEN = "<root>"
 # --- the server -------------------------------------------------------------------------
 
 
-def build_server(root: Path, principal: str, device: str) -> FastMCP:
+def build_server(
+    root: Path, principal: str, device: str, *, poll: float = hot_resource.POLL_SECONDS
+) -> FastMCP:
     """The server for one principal, appending to one device's stream.
 
-    Both names are validated here, before anything is served (D85).
+    Both names are validated here, before anything is served (D85). ``poll`` is how often the
+    hot-tier watcher looks for a new render (``hot_resource.Watch``).
     """
     root = Path(root)
     check_name(principal, kind="principal")
@@ -234,7 +239,9 @@ def build_server(root: Path, principal: str, device: str) -> FastMCP:
             "that is not a person"
         )
     check_name(device, kind="device")
-    server = FastMCP("walle", mask_error_details=True)
+    watch = hot_resource.Watch(root, principal, poll=poll)
+    server = FastMCP("walle", mask_error_details=True, lifespan=watch.lifespan)
+    hot_resource.publish(server, watch, hide=lambda text: _hide_paths(text, root))
 
     @server.tool(annotations=_READS, description=_RECALL_DESCRIPTION)
     async def recall(query: str) -> ToolResult:
@@ -579,7 +586,7 @@ def schema_cost(server: FastMCP) -> SchemaCost:
     help="Print the `srt` sandbox settings for this profile on stdout and exit (D52, D99).",
 )
 def main(root: Path, principal: str, device: str, measure: bool, srt_profile: bool) -> None:
-    """Serve walle's recall, remember and why over MCP on stdio."""
+    """Serve walle's recall, remember and why, and the hot tier, over MCP on stdio."""
     try:
         server = build_server(root, principal, device)
     except ValueError as exc:
