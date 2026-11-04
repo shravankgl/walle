@@ -1,15 +1,20 @@
 """The `walle` command. Every later task adds a subcommand here."""
 
+import logging
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
 import click
+from pydantic import ValidationError
 
 from walle import __version__
 from walle import context as walle_context
 from walle import hot as walle_hot
 from walle import index as walle_index
+from walle import observer as walle_observer
 from walle import proposer as walle_proposer
 from walle import staging as walle_staging
 from walle import why as walle_why
@@ -17,7 +22,7 @@ from walle.events import AnyEvent, Assertion, FutureSchemaError, Proposal, Super
 from walle.paths import principal_dir
 from walle.reader import CorruptStreamError
 from walle.resolver import ResolutionError, resolve
-from walle.writer import CorruptLogError
+from walle.writer import CorruptLogError, StreamWriter
 
 
 @click.group(invoke_without_command=True)
@@ -541,3 +546,85 @@ def propose_command(root: Path, principal: str, device: str, model: str, score: 
         click.echo(f"  shadow: the shadow log is incomplete: {report.shadow_error}", err=True)
     if report.proposed:
         click.echo("Not in the hot tier until you keep them: run `walle review`.")
+
+
+# --- the transcript observer (issue #40) ------------------------------------------------
+
+
+def _without_content(exc: BaseException) -> str:
+    """Like ``_describe``, minus anything pydantic quotes from its input.
+
+    The stream holds transcript text, and pydantic's message for a line it refuses quotes the
+    offending value. So a validation failure is said as where it is (the file and line, from
+    the reader's own words before " — ") and which field failed in what way, by pydantic's
+    error code. Never by its message, which can name an input value too ("Input tag 'x'").
+    """
+    validation = exc if isinstance(exc, ValidationError) else exc.__cause__
+    if not isinstance(validation, ValidationError):
+        return _describe(exc)
+    problems = "; ".join(
+        f"{'.'.join(str(part) for part in error['loc']) or 'line'}: {error['type']}"
+        for error in validation.errors(include_url=False, include_input=False)
+    )
+    if validation is exc:
+        where = validation.title
+    else:  # the reader writes "<file>:<line>: … — <pydantic's message>"; keep only the left
+        head, dash, _ = str(exc).partition(" — ")
+        where = head if dash else type(exc).__name__
+    return "\n".join([f"{where} ({problems})", *getattr(exc, "__notes__", [])])
+
+
+@contextmanager
+def _quiet_transcript_warnings() -> Iterator[None]:
+    """Keep the transcript reader's warnings off the terminal for one command.
+
+    They name transcript files and uuids, one line per skipped line, repair and conflicting
+    duplicate, and a real folder has hundreds. With no logging configured, Python prints them
+    to stderr through its last-resort handler. A ``NullHandler`` stops that and nothing else:
+    the records still propagate to any handler the caller did configure. What they report is
+    in the counts.
+    """
+    log = logging.getLogger("walle.transcript")
+    handler = logging.NullHandler()
+    log.addHandler(handler)
+    try:
+        yield
+    finally:
+        log.removeHandler(handler)
+
+
+@main.command("observe")
+@_ROOT
+@click.option("--principal", required=True, help="Whose log, without the p- prefix.")
+@_DEVICE
+@click.option(
+    "--projects-dir",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="The Claude Code projects folder to read. Required, with no default: walle reads "
+    "only a folder you name.",
+)
+def observe_command(root: Path, principal: str, device: str, projects_dir: Path) -> None:
+    """Append one observation per completed turn in the transcripts under --projects-dir.
+
+    Safe to re-run: a turn the stream already holds is not appended again, and two runs at
+    once with the same --device append each turn once (D92). A turn still in progress is
+    pending and is appended by a later run (D56). Only counts are printed, never transcript
+    text.
+    """
+    try:
+        writer = StreamWriter(root, principal, device)  # an unsafe name fails before any read
+        with _quiet_transcript_warnings():
+            report = walle_observer.observe_projects(projects_dir)
+        result = walle_observer.append_observations(report, writer)
+    except _LOG_ERRORS as exc:
+        raise click.ClickException(_without_content(exc)) from exc
+
+    transcripts = report.transcripts
+    click.echo(f"{principal}: observed transcripts into {writer.stream}")
+    click.echo(f"  turns seen: {len(report.turns) + len(report.pending)}")
+    click.echo(f"  appended: {len(result.appended)}")
+    click.echo(f"  already logged: {len(result.already_logged)}")
+    click.echo(f"  pending: {len(report.pending)}")
+    click.echo(f"  skipped lines: {len(transcripts.skips)}")
+    click.echo(f"  duplicate entries: {len(transcripts.duplicates)}")
