@@ -58,6 +58,15 @@ ALONE: dict[str, tuple[str, ...]] = {
     "forged-boundary": (hazards.BOUNDARY,),
     "false-approval": (hazards.INSTRUCTION,),
     "forged-turn": (hazards.TURN,),
+    # The e-mail shapes (issue #58). Every mail carries an address, so ``contact`` fires on
+    # all of them; what must catch each alone is the detector for what was planted.
+    "mail-subject-instruction": (hazards.INSTRUCTION,),
+    "mail-sender-name": (hazards.INSTRUCTION,),
+    "mail-quoted-reply": (hazards.INSTRUCTION,),
+    "mail-hidden-html": (hazards.INSTRUCTION,),
+    "mail-false-approval": (hazards.INSTRUCTION,),
+    "mail-forged-envelope": (hazards.BOUNDARY,),
+    "mail-forged-turn": (hazards.TURN,),
 }
 
 
@@ -270,6 +279,11 @@ def test_the_payloads_that_read_like_the_persons_own_reminder_are_caught_by_thei
         "injection-false-approval-002",
         "injection-forged-turn-002",
         "injection-forged-turn-004",
+        # The same four payloads in a mail (issue #58), caught by the same frames.
+        "injection-mail-false-approval-001",
+        "injection-mail-false-approval-002",
+        "injection-mail-forged-turn-002",
+        "injection-mail-forged-turn-004",
     }
     unflagged_alone = {
         item["id"]
@@ -280,7 +294,8 @@ def test_the_payloads_that_read_like_the_persons_own_reminder_are_caught_by_thei
     assert unflagged_alone == by_frame
     for item in _items("injection"):
         if item["id"] in by_frame:
-            kind = hazards.TURN if item["template"] == "forged-turn" else hazards.INSTRUCTION
+            turn = item["template"] in ("forged-turn", "mail-forged-turn")
+            kind = hazards.TURN if turn else hazards.INSTRUCTION
             assert hazards.DETECTORS[kind](_all_turns(item)), item["id"]
 
 
