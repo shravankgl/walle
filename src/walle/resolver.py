@@ -22,6 +22,7 @@ The rules
 3. **Overlap only (D93).** Validity windows are half-open, ``[valid_from, valid_to)``, with a
    null start meaning "no known start" and a null end meaning "still true". Two sides whose
    windows do not overlap never conflict: someone can have lived in Pune and then Bangalore.
+   A window whose start is at or after its end holds no moment, so it overlaps nothing.
 4. **Later-valid closes earlier (D93).** When the windows overlap and one side starts strictly
    later, the earlier side's window closes at the later side's ``valid_from``. The closing is
    computed here, every fold; the event in the log is never rewritten. An assertion closed by
@@ -49,16 +50,19 @@ events, raises ``ResolutionError``: no answer would be true.
 World time and precision
 ------------------------
 ``valid_from`` and ``valid_to`` are dates or instants (D103 keeps a date a date). Two instants
-are compared in UTC. Two dates compare as dates. A date and an instant compare by the instant's
-written calendar date. On the same day the order cannot be known without inventing a time zone
-for the date, so that comparison is *unknown*. Unknown never closes a window, and it never
-counts as disjoint. It is reported as an open conflict, because guessing would look precise.
+are compared in UTC. Two dates compare as dates. A date carries no time zone, so the day it
+names runs, in UTC, somewhere between its midnight at UTC+14 and its end at UTC-12. An instant
+outside that span is ordered against the date; inside it the order cannot be known without
+inventing a time zone for the date, so that comparison is *unknown*. It depends only on the
+instant's moment, so two spellings of one moment always agree. Unknown never closes a window,
+and it never counts as disjoint. It is reported as an open conflict, because guessing would
+look precise.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from pydantic import TypeAdapter
@@ -80,6 +84,11 @@ if TYPE_CHECKING:  # annotations only: the fold takes records, it never reads th
 
 
 _WORLD_TIME: TypeAdapter[str] = TypeAdapter(WorldTime)
+
+# The widest a calendar day can be once a time zone is put on it: from its midnight in the
+# earliest zone (UTC+14) to the end of the day in the latest (UTC-12), relative to UTC midnight.
+_DAY_STARTS_FROM = timedelta(hours=-14)
+_DAY_ENDS_BY = timedelta(days=1, hours=12)
 
 
 class ResolutionError(Exception):
@@ -185,12 +194,31 @@ def _compare(a: str, b: str) -> int | None:
         left, right = datetime.fromisoformat(a), datetime.fromisoformat(b)
     elif not a_instant and not b_instant:
         left, right = date.fromisoformat(a), date.fromisoformat(b)
+    elif a_instant:
+        return _against_day(a, b)
     else:
-        # A date and an instant: compare calendar days, the instant's as written.
-        left, right = date.fromisoformat(a[:10]), date.fromisoformat(b[:10])
-        if left == right:
-            return None
+        order = _against_day(b, a)
+        return None if order is None else -order
     return (left > right) - (left < right)
+
+
+def _against_day(instant: str, day: str) -> int | None:
+    """-1 if ``instant`` is before ``day`` in every time zone, 1 if after it in every one."""
+    moment = datetime.fromisoformat(instant)
+    midnight = datetime.fromisoformat(f"{day}T00:00:00+00:00")
+    if moment < midnight + _DAY_STARTS_FROM:
+        return -1
+    if moment >= midnight + _DAY_ENDS_BY:
+        return 1
+    return None
+
+
+def _empty(window: Window) -> bool:
+    """Whether ``[valid_from, valid_to)`` is known to hold no moment: start at or after end."""
+    if window.valid_from is None or window.valid_to is None:
+        return False
+    order = _compare(window.valid_from, window.valid_to)
+    return order is not None and order >= 0
 
 
 def _starts_before_end(start: str | None, end: str | None) -> bool | None:
@@ -203,6 +231,8 @@ def _starts_before_end(start: str | None, end: str | None) -> bool | None:
 
 def windows_overlap(a: Window, b: Window) -> bool | None:
     """Whether two half-open windows share any moment. ``None`` when that cannot be known."""
+    if _empty(a) or _empty(b):
+        return False
     first = _starts_before_end(a.valid_from, b.valid_to)
     second = _starts_before_end(b.valid_from, a.valid_to)
     if first is False or second is False:
@@ -307,7 +337,7 @@ def resolve(records: Iterable[Record]) -> Resolution:
             )
 
     # Rules 2-5, on live contradictions whose sides are both live.
-    closers: dict[str, list[str]] = {}
+    closers: dict[str, set[str]] = {}  # a set: two contradictions about one pair close once
     conflicts: list[Conflict] = []
     for ref in ordered:
         event = events[ref]
@@ -336,9 +366,9 @@ def resolve(records: Iterable[Record]) -> Resolution:
         if overlap is False:
             continue  # rule 3
         if overlap is True and starts_later(b_window, a_window) is True:
-            closers.setdefault(a_ref, []).append(b_ref)
+            closers.setdefault(a_ref, set()).add(b_ref)
         elif overlap is True and starts_later(a_window, b_window) is True:
-            closers.setdefault(b_ref, []).append(a_ref)
+            closers.setdefault(b_ref, set()).add(a_ref)
         else:
             conflicts.append(Conflict(ref, (a_ref, b_ref)))  # rule 5
 
