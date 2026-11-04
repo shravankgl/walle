@@ -22,6 +22,13 @@ the principal's own name. Everything else is text from a non-principal:
 * the proposer and the curator are models; another principal is not this one;
 * an actor this build has never heard of is not the principal either. Fail closed.
 
+Two things never count as the principal's own, whatever the actor says. An **observation**
+is the transcript: the assistant's replies and tool output are in its body however the row
+is attributed. A **reserved actor** (``RESERVED_ACTORS``: the observer, the proposer, the
+curator, the kernel and the MCP server) is never a person, so a principal who shares such a
+name does not make that actor's words their own. ``mcp_server`` refuses such a name at
+start-up; the label does not rely on that.
+
 A human keep on top of any of those does not launder it: the assertion's closure still holds
 the proposal. A ref the map does not hold (a dangling ``caused_by``, which a built index
 refuses, D111) cannot be checked, so it makes the closure untrusted rather than raising.
@@ -36,14 +43,30 @@ profile and its label is ``private``. Combined over the closure, most restrictiv
 is still ``private``. ``user-identity`` is D18's pseudonymization boundary and nothing marks it
 yet; when something does, it joins ``_RANK`` and the fold below picks it up.
 
+Several refs at once
+--------------------
+A ``why`` step quotes more than one event: the step's own text, and a status built from the
+supersede that retired it or the assertion that kept it. ``ifc_all`` labels such a block over
+every ref it quotes, most restrictive wins, so no text sits under a label that did not look
+at it.
+
 Pure functions over events: no IO, no clock, no model (hard constraint 3).
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 
-from walle.events import ACTOR_USER, AnyEvent
+from walle.events import (
+    ACTOR_CURATOR,
+    ACTOR_KERNEL,
+    ACTOR_MCP,
+    ACTOR_OBSERVER,
+    ACTOR_PROPOSER,
+    ACTOR_USER,
+    AnyEvent,
+    Observation,
+)
 
 TRUSTED = "trusted"
 UNTRUSTED = "untrusted"
@@ -54,6 +77,12 @@ USER_IDENTITY = "user-identity"
 
 _RANK = {PUBLIC: 0, PRIVATE: 1, USER_IDENTITY: 2}
 """Confidentiality, least to most restrictive. The combination is the maximum."""
+
+RESERVED_ACTORS = frozenset(
+    {ACTOR_OBSERVER, ACTOR_PROPOSER, ACTOR_CURATOR, ACTOR_KERNEL, ACTOR_MCP}
+)
+"""Actors that are never a person. Their words are never the principal's own, even for a
+principal of the same name."""
 
 
 def closure(events: Mapping[str, AnyEvent], ref: str) -> frozenset[str]:
@@ -77,7 +106,12 @@ def closure(events: Mapping[str, AnyEvent], ref: str) -> frozenset[str]:
 
 
 def is_principals_own(event: AnyEvent, principal: str) -> bool:
-    """Whether ``event`` is the principal's own words: written by ``user`` or by them."""
+    """Whether ``event`` is the principal's own words: written by ``user`` or by them.
+
+    Never for an observation, whose body is the transcript, and never for a reserved actor.
+    """
+    if isinstance(event, Observation) or event.actor in RESERVED_ACTORS:
+        return False
     return event.actor in (ACTOR_USER, principal)
 
 
@@ -104,4 +138,18 @@ def ifc(events: Mapping[str, AnyEvent], ref: str, principal: str) -> dict[str, s
     return {
         "integrity": integrity(events, ref, principal),
         "confidentiality": confidentiality(events, ref),
+    }
+
+
+def ifc_all(events: Mapping[str, AnyEvent], refs: Iterable[str], principal: str) -> dict[str, str]:
+    """``_meta.ifc`` for text that quotes every ref in ``refs``: most restrictive wins.
+
+    ``ValueError`` for no refs at all: a label that covers nothing is not a label.
+    """
+    found = [ifc(events, ref, principal) for ref in refs]
+    if not found:
+        raise ValueError("ifc_all needs at least one ref to label")
+    return {
+        "integrity": TRUSTED if all(f["integrity"] == TRUSTED for f in found) else UNTRUSTED,
+        "confidentiality": max((f["confidentiality"] for f in found), key=_RANK.__getitem__),
     }

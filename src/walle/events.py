@@ -201,6 +201,8 @@ ACTOR_OBSERVER = "observer"
 ACTOR_PROPOSER = "proposer"
 ACTOR_CURATOR = "curator"
 ACTOR_KERNEL = "kernel"
+ACTOR_MCP = "mcp"
+"""The MCP server's ``remember``: the host model's words, not the person's (D97)."""
 
 
 # --- errors -----------------------------------------------------------------------------
