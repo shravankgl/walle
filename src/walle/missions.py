@@ -46,6 +46,12 @@ The rules
    step is about to read, write and send to, and refuses anything the node did not declare,
    naming every undeclared item — before the step starts and again at each tool call while
    it runs. The matching rules are ``walle.manifest``'s.
+8. **The floor is under the manifest (D72).** A write to a file that governs permission —
+   ``kernel/``, ``shared/``, a principal's ``grants/``, ``keys/`` or ``hot/``, anything under
+   one or any parent of one — is refused whether or not the node declared it, and before
+   every other reason, the switch included: the same refusal in every mode. ``admit`` asks
+   ``walle.floors.hit`` by name; a runner with a root asks ``walle.floors.floored`` as well,
+   which follows links. Nothing in the log, the environment or a call lifts it.
 
 Anything the fold cannot apply is **reported, not dropped**, as the resolver does: a step
 whose mission the fold was not given, whose ``mission`` ref is not a mission, or whose node
@@ -72,6 +78,7 @@ from walle.events import (
     find_cycle,
     parse_ref,
 )
+from walle.floors import Kind, hit
 from walle.manifest import Touch, undeclared
 from walle.resolver import live_events
 
@@ -304,13 +311,17 @@ def admit(
     touch: Touch = NOTHING,
     environ: Mapping[str, str] | None = None,
 ) -> Refusal | None:
-    """The gate before a step touches anything (rules 5 to 7). ``None`` means go.
+    """The gate before a step touches anything (rules 5 to 8). ``None`` means go.
 
-    Refuses, in this order and with the first reason that holds: missions are off; the
-    mission is paused; the mission is aborted on a breach; the node is unknown, finished, or
-    not ready; something in ``touch`` is not in the node's manifest, every such item named.
-    A ``running`` node is admitted, because this is also the check at each tool call.
+    Refuses, in this order and with the first reason that holds: a write in ``touch`` is
+    floored (rule 8, in any mode, declared or not); missions are off; the mission is paused;
+    the mission is aborted on a breach; the node is unknown, finished, or not ready;
+    something in ``touch`` is not in the node's manifest, every such item named. A
+    ``running`` node is admitted, because this is also the check at each tool call.
     """
+    for path in touch.writes:
+        if (floor := hit(path)) is not None:
+            return Refusal(node_id, floor.reason(Kind.WRITE, path))
     if (held := _held(state, environ)) is not None:
         return Refusal(node_id, held)
     try:
