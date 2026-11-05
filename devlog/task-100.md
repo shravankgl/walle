@@ -109,6 +109,48 @@ uv run ruff format --check  173 files already formatted
 uv run pyright              0 errors, 0 warnings, 0 informations
 ```
 
+After merging `main` (PR #112, osusers), with the clash below fixed:
+
+```
+uv run pytest               3655 passed, 35 skipped in 128.16s
+uv run ruff check           All checks passed!
+uv run ruff format --check  184 files already formatted
+uv run pyright              0 errors, 0 warnings, 0 informations
+```
+
+**Clash with #105 (osusers), decided by the owner on #100:** after `main` was merged into this
+branch, `tests/test_osusers.py::test_only_the_isolation_test_names_the_three_commands` failed
+with "test_matching.py mentions sudo". That test banned the *words* `sudo`, `dscl` and
+`useradd` from every test file but the isolation test; D74 requires all three in the bypass
+corpus. The owner's comment on #100 decides it: the rule on #105 is that no code path *calls*
+the three outside the test setup, not that the words are banned as data. Done here, on this
+branch, as the comment says, and it is the one edit to a test to make it pass (brief, *Never*):
+
+- The spawn-call logic of `test_no_shipped_module_spawns_sudo_dscl_or_useradd` is now one
+  function, `_spawns_of(source)`: every `(word, argument)` where a call to one of
+  `SPAWN_CALLS` (unchanged set) carries a string constant naming one of `THE_THREE`. The
+  source check calls it and asserts the same thing it did, over the same modules, so it is
+  not weakened; a synthetic-file test runs every call in the set through it.
+- `test_only_the_isolation_test_names_the_three_commands` became
+  `test_only_the_isolation_test_spawns_the_three_commands`: the same check over every test
+  file but the isolation test. `test_osusers.py` itself is no longer exempt, because it has
+  nothing to exempt.
+- Proof it bites: `test_the_spawn_check_bites_on_a_spawn_and_not_on_data` — a synthetic file
+  spawning `sudo`, `dscl` and `useradd` is caught (through each of the fifteen spawn calls,
+  and inside a nested `sh -c` string); a synthetic file holding `"sudo git status"` in a
+  list, a dict, an assert, a docstring, a comment and an f-string, beside spawns of other
+  things, is not, and the test records that the old word ban would have refused it.
+  `test_the_isolation_test_itself_would_be_caught` shows the exemption is doing work. And
+  before committing, a planted `tests/test_zz_planted.py` spawning `sudo` failed the new
+  test, and was removed.
+- The corpus cases in `test_matching.py` are as they were.
+
+A limit worth knowing: the check sees string constants that are direct arguments of a spawn
+call. The isolation test reaches `useradd` through its own `_sudo(...)` wrapper, so only its
+`sudo` is seen directly; the same wrapper in any other file would still be caught by its
+`sudo`. A wrapper that hides all three behind a variable would pass — the same limit the
+source check has had since #105, left as it is because widening it is #105's call.
+
 **Two-runner walkthrough:** not applicable. The module touches no log, no lock and no derived
 file; it reads nothing but its arguments and the one environment variable, and holds no
 state. Two kernels calling `match` at once share nothing.
@@ -184,6 +226,9 @@ a part fails, in order), then `split`, `Rule.__post_init__` and `match`. In the 
 whole design rests on.
 
 **Noticed, not done:**
+- **The spawn check reads string constants only.** A spawn whose program name arrives in a
+  variable is invisible to it, in the shipped modules as in the tests. Tracing names is a
+  bigger check and #105's to widen.
 - **Wiring.** Nothing calls `match` yet. `grants.check` matches the exact bytes of one call
   (D62 as it was); when the dispatcher asks whether a standing rule covers a shell command,
   this is the function, and the rule file (D100: justification, examples, `host_executable`)
