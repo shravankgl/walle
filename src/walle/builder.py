@@ -23,7 +23,9 @@ Three rules, and where each lives
    like any other proposal; ``walle review`` shows it, and the person keeps, edits or drops it.
    No mission, no assertion, no file outside the log. ``workflow`` reads a kept one back, and
    only one whose proposal was the Builder's: a kept memory that merely looks like a workflow
-   is not one. A workflow lapses when the approval it was built from is superseded: the
+   is not one. A workflow lapses when the approval it was built from is superseded, or was
+   never an approval at all: ``workflow`` asks ``approved`` about the source, the same
+   question ``build`` asked, and the proposal a keep cites must itself still be live. The
    grant is bound to what it was given for (D117).
 3. **Its output runs in the executor and nowhere else (D68, D99).** ``run_step`` is the only
    way a step runs, and its only way is ``executor.run``: the workspace bind-mounted and
@@ -33,6 +35,27 @@ Three rules, and where each lives
    itself and runs only a step of a workflow a person kept and nobody has superseded, refuses
    a workspace that is, holds or sits inside the walle root (a container there could write
    the log), and passes the step's argv to the container unchanged.
+4. **A step runs through the whole chain, or not at all (#121; D6, D32, D67, D72).** A kept
+   workflow that runs is an automation, so ``run_step`` first requires an active entry in the
+   register (``walle.automations``) whose ``caused_by`` names the kept workflow: one nobody
+   added under the WIP cap, or one a person retired, does not run. Then the step is a node of
+   a mission (``Workflow.mission``), and ``walle.missions.admit`` is the one door: the floor
+   under every declared write (D72, in any mode), the missions switch, a pause, a breach,
+   step order (step 2 waits for step 1 to be completed, D67) and the manifest, all in
+   ``missions``' words and none of them copied here, so a fix to ``admit`` applies to the
+   Builder on the day it lands. The mission is the log's: ``run_step`` reads the latest open
+   mission the Builder appended for this workflow, or appends a new one when none is open,
+   and records each step as ``running`` before the container starts and ``completed`` or
+   ``failed`` after, so a later run sees the order and D91's recovery sees what was cut off.
+   A step already ``running`` is not started again. The decision and the appends that say
+   "started" happen under ``missions.lock`` (one per principal), so two runners cannot both
+   start the same step or each open a mission for the same workflow; the lock is released
+   before the container runs. Nothing is appended on a refusal.
+
+   The floor is also checked where a workflow is *read* — a model's reply and a staged or
+   kept body alike — so a draft that would be refused by the mission gate is never staged,
+   and a kept body a person edited onto the floor is refused before the log is asked for a
+   mission. Both call ``walle.floors.hit``; neither restates it.
 
 Fail closed
 -----------
@@ -43,7 +66,8 @@ details is a refusal with no call — the kind named, the text never quoted (D18
 goes inside a fresh untrusted envelope (D55). The reply must be a JSON object with exactly
 ``title`` and ``steps``, each step exactly ``id``, ``title``, ``command``, ``reads`` and
 ``writes``; a step id is a node id; a command is a non-empty list of strings with no NUL; a
-path is relative and stays inside the workspace. Nesting past the recursion limit is "not
+path is relative, stays inside the workspace and, when written, is off the floor (D72,
+#121). Nesting past the recursion limit is "not
 JSON" like a fence, not an exception; a string that cannot be written as UTF-8 is refused
 here rather than by the event model inside ``stage``; a title holds no line break of any
 kind; the words of a command, the paths of a step, each path and the whole staged body are
@@ -60,25 +84,48 @@ The dormant rule
 ----------------
 Off unless the owner sets ``WALLE_BUILDER=on`` in the environment, outside the log (D117).
 Off, ``build`` refuses without calling a model, ``stage`` raises before writing, and
-``run_step`` refuses before the client is looked for. On, a step still runs only when the
-owner has *also* turned the container executor on (``WALLE_CONTAINER_EXECUTOR=on``), because
-``executor.run`` checks its own switch: two people's worth of consent is not needed, but two
-switches are, and either one off means nothing runs. There is no command.
+``run_step`` refuses before the log is read. On, a step still runs only when the owner has
+*also* turned missions on (``WALLE_MISSIONS=on``, which ``missions.admit`` checks) and the
+container executor on (``WALLE_CONTAINER_EXECUTOR=on``, which ``executor.run`` checks): two
+people's worth of consent is not needed, but three switches are, and any one off means
+nothing runs and nothing is appended. There is no command.
+
+Two runners, step by step
+-------------------------
+Writers A and B, on two devices, each ask for step 1 of the same kept workflow at once.
+
+1. A takes ``missions.lock``. B blocks here, having read nothing.
+2. A reads the log and folds it: the workflow is kept and live, an active automation names
+   it, no mission is open for it. ``admit`` says go on a fresh mission.
+3. A appends the mission, then ``running`` for step 1, each under the stream's own lock, and
+   releases ``missions.lock``. The container starts.
+4. B wakes and only now reads: the mission is there and step 1 is ``running``. B is refused
+   ("already running"), appends nothing, starts nothing.
+5. A's container exits; A appends ``completed`` (or ``failed``) without ``missions.lock``: a
+   status on a running node is recorded whatever else is happening, as rule 5 of
+   ``walle.missions`` says, and nothing decides on it until the next hold of the lock.
+
+Had B folded before waiting, it would have started step 1 a second time with a second
+mission. Lock order is ``missions.lock``, then the index lock inside ``index.update``, then
+one stream's lock for each append; nothing takes ``missions.lock`` while holding another, so
+there is no cycle. The lock is held for one decision, never across the container.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import posixpath
-from collections.abc import Iterable, Mapping, Sequence
+import sys
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
 from pydantic import ValidationError
 
-from walle import envelope, executor, hazards, index
+from walle import automations, envelope, executor, floors, hazards, index, missions
 from walle.events import (
     ACTOR_USER,
     Assertion,
@@ -86,13 +133,26 @@ from walle.events import (
     Mission,
     Node,
     Proposal,
+    Step,
+    StepStatus,
+    StepVerb,
     make_ref,
     now_instant,
     parse_ref,
 )
+from walle.manifest import Touch
+from walle.paths import log_dir, missions_lock_path
 from walle.reader import Record
 from walle.resolver import Staged, live_events
 from walle.writer import StreamWriter
+
+if sys.platform == "win32":  # pragma: no cover - POSIX only in Phase 0
+    raise ImportError(
+        "walle's Builder needs POSIX file locking (fcntl); Windows is not supported in "
+        "Phase 0. Run it under WSL."
+    )
+
+import fcntl
 
 __all__ = [
     "ACTOR_BUILDER",
@@ -311,6 +371,10 @@ def _kept(records: Iterable[Record], ref: str) -> tuple[Assertion, Proposal, str
         raise NotApprovedError(f"{ref} was not kept from a proposal")
     (cause, proposal) = proposals[0]
     assert isinstance(proposal, Proposal)
+    if not live[cause]:
+        raise NotApprovedError(
+            f"the proposal {cause} that {ref} was kept from has been superseded (#121)"
+        )
     return event, proposal, cause
 
 
@@ -340,12 +404,13 @@ def workflow(records: Iterable[Record], ref: str) -> Workflow:
             f"{ref} names source {source}, but its proposal {cause} was built from "
             f"{', '.join(proposal.caused_by) or 'nothing'}"
         )
-    _, live = live_events(records)
-    if not live.get(source, False):
+    try:
+        approved(records, source)  # the same question ``build`` asked, asked again now
+    except NotApprovedError as why:
         raise NotApprovedError(
-            f"the approval {source} that {ref} was built from has been superseded; "
+            f"the approval {source} that {ref} was built from does not stand ({why}); "
             "the workflow lapsed with it (D117)"
-        )
+        ) from None
     return Workflow(ref, cause, source, title, steps)
 
 
@@ -513,7 +578,7 @@ def _read_step(item: object) -> WorkflowStep | str:
         if len(value) > PATH_COUNT:
             return f"{key} names more than {PATH_COUNT} paths"
         for path in value:
-            if (why := _inside(path)) is not None:
+            if (why := _inside(path, write=key == "writes")) is not None:
                 return f"{key}: {why}"
         paths[key] = tuple(value)
     try:
@@ -523,8 +588,9 @@ def _read_step(item: object) -> WorkflowStep | str:
     return WorkflowStep(step_id, title, tuple(command), paths["reads"], paths["writes"])
 
 
-def _inside(path: str) -> str | None:
-    """``None`` when ``path`` names something inside the workspace, or why not."""
+def _inside(path: str, *, write: bool = False) -> str | None:
+    """``None`` when ``path`` names something inside the workspace — and, for a write, off the
+    floor (D72) — or why not. The path is the model's word and is never quoted."""
     if not path or path.strip() != path:
         return "a path is empty or padded"
     if len(path) > PATH_CHARS:
@@ -534,6 +600,13 @@ def _inside(path: str) -> str | None:
     norm = posixpath.normpath(path)
     if norm == "." or norm == ".." or norm.startswith("../"):
         return "a path names the workspace itself or climbs out of it"
+    if write and (floor := floors.hit(norm)) is not None:
+        how = floor.how if floor.how == "is" else f"is {floor.how}"
+        return (
+            f"a write is floored: the path {how} a floor path (the kernel, shared "
+            "capabilities, or a principal's grants, keys or hot tier), which nothing the agent "
+            "does may write, in any mode (D72)"
+        )
     return None
 
 
@@ -626,9 +699,105 @@ def _overlaps(workspace: Path, root: Path) -> bool:
     return ws == rt or rt in ws.parents or ws in rt.parents
 
 
+@contextlib.contextmanager
+def _exclusive(lock: Path) -> Iterator[None]:
+    """Hold ``missions.lock`` exclusively: one decision to start a step per principal at a
+    time (the walkthrough in the module docstring)."""
+    with open(lock, "ab") as f:  # "a": opening never truncates, and the file stays empty
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        yield
+        # The lock goes with close.
+
+
+def _automation(records: Sequence[Record], ref: str) -> str | None:
+    """Why no active automation runs the workflow at ``ref`` (D6, hard constraint 9), or
+    ``None`` when one does: an active register entry whose add names ``ref`` in ``caused_by``."""
+    register = automations.fold_automations(records)
+    bound = [e for e in register.entries if ref in e.caused_by]
+    if any(e.status == "active" for e in bound):
+        return None
+    if bound:
+        gone = ", ".join(f"'{e.name}' ({e.ref}, retired as {e.retired_ref})" for e in bound)
+        return (
+            f"the automation that ran workflow {ref} was retired: {gone}; a retired automation "
+            "does not run (D6, D114)"
+        )
+    return (
+        f"workflow {ref} is not in the register of active automations (D6, hard constraint 9): "
+        f"a person adds it with automations.add(..., workflow={ref!r}) before it runs"
+    )
+
+
+def _same_plan(logged: Mission, plan: Mission) -> bool:
+    """Whether a mission in the log is this workflow's plan: the same nodes and links, as
+    declared. ``ts`` differs by nature and is not compared."""
+    return logged.nodes == plan.nodes and logged.links == plan.links and logged.title == plan.title
+
+
+def _mission_state(
+    records: Sequence[Record], flow: Workflow, plan: Mission
+) -> tuple[str | None, missions.MissionState] | Refusal:
+    """The mission this run belongs to: the latest live, open mission the Builder appended for
+    ``flow`` (its ref and state), or a fresh fold of ``plan`` with no ref when none is open,
+    for the caller to append once the step is admitted. A refusal when an open mission names
+    the workflow but is not its plan: the runner trusts neither then."""
+    folded = missions.fold_missions(records)
+    open_ones = [
+        m
+        for m in folded.missions
+        if m.mission.actor == ACTOR_BUILDER
+        and m.mission.caused_by == [flow.ref]
+        and m.outcome == "open"
+    ]
+    if open_ones:
+        state = open_ones[-1]
+        if not _same_plan(state.mission, plan):
+            return Refusal(
+                f"mission {state.ref} names workflow {flow.ref} but does not match it; it is not "
+                "run"
+            )
+        return state.ref, state
+    fresh = missions.fold_missions([Record(_PENDING, 1, plan, 1)]).mission(_PENDING)
+    return None, fresh
+
+
+_PENDING = "d-pending:1"
+"""A stand-in ref for the mission ``run_step`` has not appended yet; it never reaches the log."""
+
+NOTE_CHARS = 200
+"""The most of the executor's refusal that a step's note carries: enough to say why the
+client could not start the container, not enough to put a daemon's whole stderr in the log."""
+
+
+def _status(mission: str, node: str, status: StepStatus, note: str | None = None) -> Step:
+    return Step(
+        ts=now_instant(),
+        actor=ACTOR_BUILDER,
+        mission=mission,
+        verb=StepVerb.STATUS,
+        node=node,
+        status=status,
+        note=note,
+    )
+
+
+def _ended(result: executor.Refusal | executor.Outcome) -> tuple[StepStatus, str]:
+    """How the step ended, for the log: the executor's refusal (the container never started),
+    a timeout, or the command's exit status. Never the command's own output, which is where a
+    secret would travel."""
+    if isinstance(result, executor.Refusal):
+        return StepStatus.FAILED, f"the container did not start: {result.reason[:NOTE_CHARS]}"
+    if result.timed_out:
+        return StepStatus.FAILED, "timed out"
+    if result.exit_code == 0:
+        return StepStatus.COMPLETED, "exit 0"
+    return StepStatus.FAILED, f"exit {result.exit_code}"
+
+
 def run_step(
     root: Path,
     principal: str,
+    device: str,
     ref: str,
     node: str,
     workspace: Path,
@@ -637,37 +806,89 @@ def run_step(
     docker: Sequence[str] = ("docker",),
     token: str | None = None,
 ) -> Refusal | executor.Refusal | executor.Outcome:
-    """Run step ``node`` of the workflow a person kept at ``ref``, in the container, or refuse.
+    """Run step ``node`` of the workflow a person kept at ``ref``, in the container, through
+    the whole chain (rule 4 of the module docstring), or refuse.
 
-    Refuses while the Builder is off; when ``ref`` is not a live, person-kept Builder workflow
-    (read from the log as it is now); when the workflow has no such step; and when
-    ``workspace`` is, holds or sits inside ``root``. Otherwise hands the step to
-    ``executor.run``, which refuses in turn unless the container executor is on. There is no
+    Refuses, with the first reason that holds and nothing appended: the Builder is off;
+    ``workspace`` is, holds or sits inside ``root``; ``ref`` is not a live, person-kept
+    Builder workflow built from a live approval (read from the log as it is now); the
+    workflow has no such step; no active automation names the workflow; the open mission in
+    the log for it is not its plan; ``missions.admit`` refuses (a floored write, missions
+    off, paused, a breach, the step finished or not ready, the manifest); the step is already
+    running; or the container executor is off. Otherwise appends the mission (when none is
+    open) and ``running`` for the step on ``device``'s stream, hands the step to
+    ``executor.run``, and appends ``completed`` or ``failed`` with how it ended. There is no
     other way for a step to run.
 
-    Raises, rather than refusing: ``ValueError`` for a malformed ref, and for a workspace or
-    token the executor's own checks refuse (missing, the home folder, root-owned); and the
-    index's ``FileNotFoundError`` for a principal with no log. Each is a caller's mistake, not
-    an answer about the workflow.
+    Raises, rather than refusing: ``ValueError`` for a malformed ref or an unsafe principal or
+    device name, and for a workspace or token the executor's own checks refuse (missing, the
+    home folder, root-owned) — the step is then recorded as ``failed`` before the error
+    leaves; and ``FileNotFoundError`` for a principal with no log. Each is a caller's mistake,
+    not an answer about the workflow.
     """
     if not enabled(environ):
         return Refusal(_off())
     root = Path(root)
-    try:
-        flow = workflow(index.update(root, principal).records, ref)
-    except NotApprovedError as error:
-        return Refusal(str(error))
-    step = flow.step(node)
-    if step is None:
-        return Refusal(f"workflow {ref} has no step {node!r}")
+    writer = StreamWriter(root, principal, device)  # validates both names first
+    parse_ref(ref)  # a malformed ref is a ValueError, before any lock or file
     workspace = Path(workspace)
     if _overlaps(workspace, root):
         return Refusal(
             f"workspace {str(workspace)!r} overlaps the walle root; a container there could "
             "reach the log"
         )
+    log = log_dir(root, principal)
+    if not log.is_dir():
+        # Checked before missions.lock is created: a misspelt principal must not get a folder.
+        raise FileNotFoundError(f"{log}: no log for principal {principal!r}, nothing to run")
+
+    with _exclusive(missions_lock_path(root, principal)):
+        records = index.update(root, principal).records
+        try:
+            flow = workflow(records, ref)
+        except NotApprovedError as error:
+            return Refusal(str(error))
+        step = flow.step(node)
+        if step is None:
+            return Refusal(f"workflow {ref} has no step {node!r}")
+        if (why := _automation(records, ref)) is not None:
+            return Refusal(why)
+        plan = flow.mission(now_instant())
+        found = _mission_state(records, flow, plan)
+        if isinstance(found, Refusal):
+            return found
+        mission_ref, state = found
+        touch = Touch(reads=step.reads, writes=step.writes)
+        if (refused := missions.admit(state, node, touch, environ)) is not None:
+            return Refusal(refused.reason)
+        if state.node(node).status is StepStatus.RUNNING:
+            # ``admit`` lets a running node through because it is also the check at each tool
+            # call; starting a step is not a tool call, and its outcome is still unknown (D91).
+            return Refusal(f"already running: step {node!r} of mission {state.ref} has not ended")
+        if not executor.enabled(environ):
+            # The executor would refuse this itself, but after the appends below; asked first,
+            # so a run the owner has not turned on leaves no mission and no step in the log.
+            return executor.Refusal("container executor is off")
+        if mission_ref is None:
+            written = writer.append(plan)
+            assert written.seq is not None  # the writer always assigns one
+            mission_ref = make_ref(writer.stream, written.seq)
+        writer.append(_status(mission_ref, node, StepStatus.RUNNING))
+
     job = executor.Job(workspace=workspace, command=step.command)
-    return executor.run(job, environ=environ, docker=docker, token=token)
+    try:
+        result = executor.run(job, environ=environ, docker=docker, token=token)
+    except Exception as error:
+        # The executor's own checks (workspace, token) and a client that cannot be started
+        # raise before any container exists, so ``failed`` is the truth. An interrupt is not
+        # caught: the container may be alive, and a node left ``running`` is what D91's
+        # recovery looks for. The class is recorded, never the message, which may carry a path.
+        name = type(error).__name__
+        writer.append(_status(mission_ref, node, StepStatus.FAILED, f"{name} from the executor"))
+        raise
+    status, note = _ended(result)
+    writer.append(_status(mission_ref, node, status, note))
+    return result
 
 
 # --- the fake ---------------------------------------------------------------------------------

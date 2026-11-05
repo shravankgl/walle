@@ -166,6 +166,11 @@ class Entry:
     """The pin that holds it, while it is pinned."""
     retired_ref: str | None = None
     """The retire that took it out, once it is retired."""
+    caused_by: tuple[str, ...] = ()
+    """The add's ``caused_by``, as written: the kept workflow it runs, when ``add`` was given
+    one (``workflow=``), and the retire it swapped with. ``walle.builder.run_step`` looks for
+    the kept workflow here, so a workflow runs only while an active automation names it
+    (D6, #121)."""
 
     @property
     def status(self) -> Status:
@@ -279,7 +284,13 @@ def _apply(register: Register, ref: str, event: Automation) -> Register:
     """``register`` with ``event`` applied. The caller has already checked ``refusal``."""
     if event.verb is AutomationVerb.ADD:
         assert event.name is not None and event.title is not None
-        added = Entry(ref=ref, name=event.name, title=event.title, added=event.ts)
+        added = Entry(
+            ref=ref,
+            name=event.name,
+            title=event.title,
+            added=event.ts,
+            caused_by=tuple(event.caused_by),
+        )
         return replace(register, entries=(*register.entries, added))
     entries = []
     for e in register.entries:
@@ -350,13 +361,19 @@ def add(
     title: str,
     note: str | None = None,
     retire: str | None = None,
+    workflow: str | None = None,
     actor: str = ACTOR_USER,
     environ: Mapping[str, str] | None = None,
 ) -> Entry:
     """Add an automation to the register, active, and return it.
 
-    With ``retire``, the active automation of that name is retired first, in the same hold of
-    ``automations.lock``, and the add's ``caused_by`` names that retire (rule 2). Raises
+    With ``workflow``, the ref of a kept workflow (``walle.builder.workflow``), the add's
+    ``caused_by`` names it: that is what binds the automation to the workflow it runs, and
+    what ``walle.builder.run_step`` requires before a step of that workflow runs (#121). The
+    ref is checked for shape only; whether it is a live, kept workflow is the Builder's
+    question, asked at every run. With ``retire``, the active automation of that name is
+    retired first, in the same hold of ``automations.lock``, and the add's ``caused_by``
+    names that retire as well (rule 2). Raises
     ``AutomationsOffError`` while off; ``RefusedError`` for a machine actor, a name already
     active, or a ``retire`` that names nothing active or something pinned; and
     ``CapReachedError`` when the register is full, naming which one to retire. All before
@@ -373,6 +390,7 @@ def add(
         name=name,
         title=title,
         note=note,
+        caused_by=[] if workflow is None else [workflow],
     )
     _require_person(actor)
     with _exclusive(root, principal):
@@ -401,12 +419,18 @@ def add(
             event = Automation.model_validate(
                 {
                     **event.model_dump(exclude_none=True),
-                    "caused_by": [make_ref(writer.stream, retired.seq)],
+                    "caused_by": [*event.caused_by, make_ref(writer.stream, retired.seq)],
                 }
             )
         written = writer.append(event)
     assert written.seq is not None
-    return Entry(ref=make_ref(writer.stream, written.seq), name=name, title=title, added=written.ts)
+    return Entry(
+        ref=make_ref(writer.stream, written.seq),
+        name=name,
+        title=title,
+        added=written.ts,
+        caused_by=tuple(written.caused_by),
+    )
 
 
 def retire(
