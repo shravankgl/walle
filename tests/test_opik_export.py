@@ -61,6 +61,7 @@ from walle.opik_export import (
     endpoint,
     export,
     scan,
+    span_payload,
     traces,
 )
 from walle.paths import log_dir
@@ -375,6 +376,37 @@ def test_times_are_by_clock_when_streams_interleave() -> None:
     assert trace.end == "2026-11-08T10:06:00.000000+00:00"
     buy = next(s for s in trace.spans if s.end == "2026-11-08T10:02:00.000000+00:00")
     assert buy.start == "2026-11-08T10:02:00.000000+00:00"
+
+
+def test_a_node_started_on_the_phone_and_finished_on_the_laptop_is_one_span() -> None:
+    """Issue #120 (audit 5.2): the fold applies steps in time order across streams, so the
+    laptop's ``completed`` at 10:05 is the last delta after the phone's ``running`` at
+    10:01. The mission is finished and exported, and the span runs from the one to the
+    other, never backwards. Folded in stream order it stayed ``running`` and sent nothing."""
+    mission = Mission(
+        ts="2026-11-05T10:00:00.000000+00:00",
+        actor=ACTOR_USER,
+        title="Plan the zucchini party",
+        nodes=[Node(id="buy-zucchini", title="x")],
+    )
+    on_mbp = _stream(
+        mission,
+        _status("buy-zucchini", StepStatus.COMPLETED, "2026-11-05T10:05:00.000000+00:00"),
+    )
+    on_phone = _stream(
+        _status("buy-zucchini", StepStatus.RUNNING, "2026-11-05T10:01:00.000000+00:00"),
+        device="phone",
+    )
+    (trace,) = traces([*on_mbp, *on_phone])
+    (span,) = trace.spans
+    assert span.status is StepStatus.COMPLETED
+    assert span.start == "2026-11-05T10:01:00.000000+00:00"
+    assert span.end == "2026-11-05T10:05:00.000000+00:00"
+    assert trace.end == span.end
+    payload = span_payload(trace, "p")["spans"][0]
+    assert payload["end_time"] > payload["start_time"]
+    assert payload["metadata"]["duration_ms"] == 240_000
+    assert traces([*on_phone, *on_mbp]) == (trace,)
 
 
 def test_ids_are_uuid7_and_the_same_on_every_fold() -> None:

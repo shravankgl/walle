@@ -14,7 +14,7 @@ The rules
    other way is reported, with the item it repeats. A run that restarts and re-issues its call
    does not ask the person twice.
 2. **Resolved once; the first answer wins.** An item goes ``pending -> resolved`` exactly once.
-   The first live ask's first fitting answer *in ref order* is the resolution, and every later
+   The first live ask's first fitting answer *in merge order* is the resolution, and every later
    answer is reported as late. ``answer`` takes ``inbox.lock`` before it reads, so on one
    machine the second responder waits, reads the first answer, writes nothing and is told it.
 3. **An answer must fit.** ``FITS`` says which outcomes fit which kind of item; a question with
@@ -66,8 +66,9 @@ lock is held for one decision, never across waiting on a person.
 
 What this does not cover: two devices that do not share a filesystem. Each takes its own
 ``inbox.lock``, and an item answered on both before their logs meet has two answers. Rule 2
-still gives one result on every machine once they meet — the first in ref order, which is
-stream order and then seq, not wall-clock order — and the other is reported as late.
+still gives one result on every machine once they meet — the first in ``walle.merge``'s
+order, which is by stamp across streams and by seq within one (issue #120) — and the other
+is reported as late.
 """
 
 from __future__ import annotations
@@ -95,6 +96,7 @@ from walle.events import (
     now_instant,
     parse_ref,
 )
+from walle.merge import fold_order
 from walle.paths import inbox_lock_path, log_dir
 from walle.reader import Record, read_file
 from walle.resolver import live_events, retired_by
@@ -204,7 +206,7 @@ class Unapplied:
 
 @dataclass(frozen=True)
 class InboxState:
-    """The fold's answer: every item in ref order of its ask, and what could not be applied."""
+    """The fold's answer: every item in merge order of its ask, and what could not be applied."""
 
     items: tuple[Item, ...]
     unapplied: tuple[Unapplied, ...]
@@ -232,10 +234,10 @@ def fold_inbox(records: Iterable[Record]) -> InboxState:
     """Fold records from any number of streams into the inbox as it stands.
 
     ``records`` is what ``walle.reader`` returns. The same record passed twice counts once, and
-    the order they arrive in does not matter: asks and answers are applied in ref order.
+    the order they arrive in does not matter: asks and answers are applied in merge order.
     """
     events, live = live_events(records)
-    ordered = sorted(events, key=parse_ref)
+    ordered = fold_order(events)
 
     items: dict[str, Item] = {}
     by_call: dict[tuple[str, str], str] = {}
@@ -305,7 +307,7 @@ class Resolution:
 
 
 def pending(root: Path, principal: str) -> tuple[Item, ...]:
-    """Every pending item, in ref order, from the log as it is now. Works while the inbox is
+    """Every pending item, in merge order, from the log as it is now. Works while the inbox is
     off: reading is not acting. A principal with no log raises ``FileNotFoundError``."""
     log = log_dir(Path(root), principal)
     if not log.is_dir():
@@ -422,7 +424,7 @@ def orphan(
     """Resolve, as ``orphaned``, every pending item whose session is not in ``alive`` (rule 4).
 
     ``alive`` is the caller's knowledge of which sessions are still running — at startup,
-    none of the previous process's are. Returns the items this call resolved, in ref order.
+    none of the previous process's are. Returns the items this call resolved, in merge order.
     A principal with no log has nothing to orphan, and nothing is created for it.
     """
     _require_on(environ)
