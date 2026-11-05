@@ -13,8 +13,9 @@ test, not a quiet pass. Without it, the skip reason says how to set it.
 What is attempted, and what must hold, each in its own test:
 
   write outside the workspace      the root filesystem is read-only; ``/``, ``/etc``, ``/usr``
-                                   and ``/var`` refuse a new file, and nothing lands on the host
-                                   (``/root`` is not tried: the host cannot look there either)
+                                   and ``/root`` refuse a new file, and nothing lands on the host
+  not root                         the process inside is the host user, ``id -u`` is the host's
+                                   uid and not 0, so nothing root-only is reachable to begin with
   read beside the workspace        a sibling folder of the workspace, holding a synthetic
                                    secret, is not in the container at any path
   keep a capability                the effective capability set is empty; ``mount`` and
@@ -128,25 +129,29 @@ def _containers(label: str) -> list[str]:
 # --- the workspace itself works ---------------------------------------------------------------
 
 
-def test_a_write_inside_the_workspace_reaches_the_host_and_belongs_to_its_owner(
+def test_a_write_inside_the_workspace_reaches_the_host_and_belongs_to_the_host_user(
     workspace: Path,
 ) -> None:
     outcome = _sh(workspace, "cat inside.txt && echo made-inside > made.txt")
     assert outcome.exit_code == 0, outcome.stderr
     assert outcome.stdout == "synthetic workspace file\n"
     assert (workspace / "made.txt").read_text() == "made-inside\n"
-    assert (workspace / "made.txt").stat().st_uid == workspace.stat().st_uid
+    assert (workspace / "made.txt").stat().st_uid == os.getuid()
 
 
 # --- write outside the workspace ----------------------------------------------------------------
 
 
-@pytest.mark.parametrize("target", ["/escaped", "/etc/escaped", "/usr/escaped", "/var/escaped"])
+@pytest.mark.parametrize("target", ["/escaped", "/etc/escaped", "/usr/escaped", "/root/escaped"])
 def test_a_write_outside_the_workspace_is_refused(workspace: Path, target: str) -> None:
+    """The container may say "Read-only file system" (root) or "Permission denied" (a non-root
+    user hits the mode bits first); both are the refusal. The host-side check is
+    ``os.path.exists``, which answers ``False`` for a ``/root`` this process cannot stat
+    rather than raising, as ``Path.exists`` did on the CI runner."""
     outcome = _sh(workspace, f"echo x > {target}")
     assert outcome.exit_code != 0
     assert "read-only" in outcome.stderr.lower() or "permission" in outcome.stderr.lower()
-    assert not Path(target).exists()
+    assert not os.path.exists(target)
 
 
 def test_tmp_is_writable_but_nothing_in_it_can_run(workspace: Path) -> None:
@@ -185,12 +190,23 @@ def test_only_one_mount_is_a_bind_from_the_host(workspace: Path) -> None:
     )
 
 
+# --- not root -----------------------------------------------------------------------------------
+
+
+def test_the_process_inside_is_the_host_user_not_root(workspace: Path) -> None:
+    outcome = _sh(workspace, "id -u; id -g")
+    assert outcome.exit_code == 0, outcome.stderr
+    assert outcome.stdout.split() == [str(os.getuid()), str(os.getgid())]
+    assert outcome.stdout.split()[0] != "0"
+
+
 # --- keep a capability ------------------------------------------------------------------------
 
 
 def test_the_effective_capability_set_is_empty(workspace: Path) -> None:
-    """``CapBnd`` is the one that matters for a non-root process: nothing ``setuid`` or
-    file-capability could ever hand back."""
+    """For a non-root process ``CapEff`` and ``CapPrm`` are zero anyway; ``CapBnd`` is the one
+    that carries weight — with it empty, nothing ``setuid`` or a file capability could ever
+    hand back, so becoming root would not help."""
     outcome = _sh(workspace, "grep -E '^Cap(Eff|Prm|Bnd):' /proc/self/status")
     assert outcome.exit_code == 0, outcome.stderr
     values = {line.split()[0]: line.split()[1] for line in outcome.stdout.splitlines()}
@@ -202,10 +218,15 @@ def test_the_effective_capability_set_is_empty(workspace: Path) -> None:
 
 
 def test_mount_and_chown_fail_without_capabilities(workspace: Path) -> None:
+    """Each fails for two reasons that coincide: the process is not root, and even root here
+    would lack ``CAP_SYS_ADMIN`` (mount) and ``CAP_CHOWN`` (chown) with ``CapBnd`` empty. The
+    test cannot tell the two apart and does not claim to; the capability test above is what
+    shows the second reason holds on its own. ``/tmp`` is writable, so the refusal is not the
+    read-only root."""
     outcome = _sh(workspace, "mkdir -p /tmp/m && mount -t tmpfs none /tmp/m")
     assert outcome.exit_code != 0
     outcome = _sh(workspace, "touch /tmp/f && chown 1234 /tmp/f")
-    assert outcome.exit_code != 0, "/tmp is writable, so only the missing CAP_CHOWN refuses this"
+    assert outcome.exit_code != 0, outcome.stdout
 
 
 # --- gain a privilege -------------------------------------------------------------------------

@@ -50,6 +50,7 @@ from walle.executor import (
     Refusal,
     check_workspace,
     enabled,
+    host_user,
     plan,
     reap,
     run,
@@ -114,13 +115,13 @@ def test_only_the_workspace_is_mounted(tmp_path: Path) -> None:
     assert _flag(argv, "--workdir") == [MOUNT_POINT]
 
 
-def test_the_process_runs_as_the_workspace_owner_not_as_root(tmp_path: Path) -> None:
+def test_the_process_runs_as_the_host_user_not_as_root(tmp_path: Path) -> None:
     """With every capability dropped, root has no ``CAP_DAC_OVERRIDE`` and cannot write a
-    folder it does not own; the owner can, and what the step leaves behind is the owner's."""
-    ws = _workspace(tmp_path)
-    owner = ws.stat()
-    argv = plan(Job(ws, ("true",)), token=TOKEN)
-    assert _flag(argv, "--user") == [f"{owner.st_uid}:{owner.st_gid}"]
+    bind mount the host user owns; the host user can, and what the step leaves behind is
+    theirs. The ids come from one function, so this test and ``run`` agree on them."""
+    argv = plan(_job(tmp_path), token=TOKEN)
+    assert _flag(argv, "--user") == [host_user()] == [f"{os.getuid()}:{os.getgid()}"]
+    assert host_user() != "0:0" or os.getuid() == 0
     assert "--privileged" not in argv
 
 

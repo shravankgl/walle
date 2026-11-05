@@ -5,12 +5,14 @@ task (R8). Nothing in this build calls it: there is still no runner, and the swi
 is the executor a runner will hand a step to once `admit` (task 68) has let it through, and the
 exact shape of the container it gets.
 
-**The escape attempts have run once on the Mac, at the first commit: 18 of 19 passed** (see
-*First Mac run*). This VM has no `docker` client and no daemon, so every test in
-`tests/test_executor_escape.py` skipped here, with that reason. They also run on GitHub's Linux
-runner, which turned out to have a daemon (see *Fourth commit*). The one Mac failure was the
-test's fault, fixed in the fifth commit; the Mac has not yet run the head that carries the
-fixes, and the issue asks for that run before this merges — see *Verify* for the one command.
+**Where the escape tests run.** The issue said CI and agent VMs have no real container. Half
+right: this VM has no `docker` client and no daemon, so every test in
+`tests/test_executor_escape.py` skipped here, with that reason — but **GitHub's `ubuntu-latest`
+runner has a Docker daemon, and the escape tests run there on Linux on every push** (the owner
+read the first CI log and corrected his note). They have also run once on the Mac under OrbStack,
+at the first commit: 18 of 19 (see *First Mac run*). The Linux run found the most useful thing
+this task learned (see *The Linux finding*), and the Mac has not yet run the head that carries
+the fix; the issue asks for that run before this merges — see *Verify* for the one command.
 
 **Shipped:**
 - `src/walle/executor.py`, new, about 370 lines, half of them docstring. Imports `os`, `re`,
@@ -173,7 +175,7 @@ uv run ruff format --check  138 files already formatted
 uv run pyright              0 errors, 0 warnings, 0 informations
 ```
 
-**Fourth commit, with the CI log in hand.** Red again on the third commit, so I stopped
+**The Linux finding (fourth and sixth commits).** Red again on the third commit, so I stopped
 guessing and read the job log through the skill's token (`GET
 /repos/…/actions/jobs/<id>/logs`, a read of this PR's own CI; the GitHub integration's scope
 has no Actions tool). The facts: **`2 failed, 2248 passed, 4 skipped`** — the runner has a
@@ -188,25 +190,33 @@ FAILED test_a_write_outside_the_workspace_is_refused[/root/escaped]
 ```
 
 - **Root with every capability dropped has no `CAP_DAC_OVERRIDE`**, so it cannot write a
-  bind-mounted folder owned by uid 1001 and mode 755. The boundary was *stronger* than the
-  harness assumed — the one positive test failed, not an escape. The fix is `--user
-  <uid>:<gid>`, the workspace's owner as the host `stat`s it: on Linux that is the one identity
-  that can write the one folder it is given, and it also closes the "noticed, not done" item
-  about root-owned files in the person's workspace. On the Mac, OrbStack remaps bind-mount
-  ownership to the container's user under runc (orbstack/orbstack#2530: "the host→container
-  ownership remap that makes bind mounts writable under runc"), so the same flag holds there;
-  Docker Desktop behaves alike. `test_the_process_runs_as_the_workspace_owner_not_as_root` pins
-  it, and the positive escape test now also asserts the file it made belongs to the owner.
+  bind mount owned by the host user (uid 1001 on the runner, mode 755). A real executor bug,
+  not a test bug: the first three commits ran the container as root, and OrbStack's file
+  sharing hid it on the Mac, where the Mac run's positive test passed. The boundary was
+  *stronger* than the harness assumed — the one positive test failed, not an escape. The fix,
+  in `plan`, is `--user <uid>:<gid>`: the fourth commit took the ids from the workspace's
+  `stat`; the sixth, on the owner's instruction, takes them from the host process itself,
+  `os.getuid()` and `os.getgid()`, in one small function `host_user()` so the plan test and
+  `run` agree on them. The container therefore also stops running as root at all. On Linux
+  that is the one identity that can write the one folder it is given; on the Mac, OrbStack
+  remaps bind-mount ownership to the container's user under runc, so the same flag holds.
+  `test_the_process_runs_as_the_host_user_not_as_root` pins the plan; in the escape tests the
+  positive write now asserts the file belongs to the host uid, and a new
+  `test_the_process_inside_is_the_host_user_not_root` checks `id -u` and `id -g` inside.
 - **`/root/escaped`** was the host-side check raising, not the container: `Path.exists()` under
-  a `/root` the runner user cannot enter raises `PermissionError` on that kernel. Replaced by
-  `/var/escaped`; the container's own refusal of `/root` adds nothing a non-root process cannot
-  already not do.
+  a `/root` the runner user cannot enter raises `PermissionError`. A test bug. Now
+  `os.path.exists`, which answers `False` there; `/root` stays in the list and the in-container
+  refusal assertions are unchanged (non-root reports "Permission denied" where root reported
+  "Read-only file system"; the test accepted both from the start).
 
-What this does to the other escape tests, thought through for a non-root process: `CapPrm`
-and `CapEff` are zero for any non-root process, so `CapBnd` zero is now the assertion that
-carries weight (the docstring says so); `chown` on the writable `/tmp` file fails with
-"Operation not permitted" rather than by read-only root, which is the test's point; cgroup
-files are world-readable; `/proc/self/*` is its own. The fork storm, the timeout and the orphan
+What this does to the other escape tests, re-checked for a non-root process: `CapPrm` and
+`CapEff` are zero for any non-root process, so `CapBnd` zero is the assertion that carries
+weight (its docstring says so). `mount` and `chown` now fail for two reasons that coincide —
+not root, and no `CAP_SYS_ADMIN` / `CAP_CHOWN` even for root with `CapBnd` empty — and the test
+no longer claims only the capability refuses them; it says it cannot tell the two apart, and
+points at the capability test for the second reason standing alone. The cgroup files are
+world-readable and `/proc/self/*` is the process's own, so the cap and `NoNewPrivs` tests are
+unaffected. The fork storm, the timeout and the orphan
 are unchanged. The two earlier "most likely" paragraphs above were partly right (the daemon,
 the fork storm — ash does die, and that test is among the 17 that passed on the third commit)
 and partly wrong (the `rm --force` race did not show in this log; the fix stands as a
@@ -247,8 +257,19 @@ uv run ruff format --check  138 files already formatted
 uv run pyright              0 errors, 0 warnings, 0 informations
 ```
 
-The Mac has not run the current head. Commits two to five are what it will see new: the
-subshell fork storm, removal judged by the listing, and `--user <workspace owner>` — the last
+Sixth commit's checks, after the uid source moved to `host_user()` and the non-root escape test
+was added:
+
+```
+uv run pytest               2161 passed, 30 skipped
+uv run ruff check           All checks passed!
+uv run ruff format --check  138 files already formatted
+uv run pyright              0 errors, 0 warnings, 0 informations
+```
+
+The 30th skip is the new `id -u` escape test. The Mac has not run the current head. Commits
+two to six are what it will see new: the
+subshell fork storm, removal judged by the listing, and `--user <host uid>:<gid>` — the last
 being the one to watch under OrbStack's ownership remap.
 
 **Two-runner walkthrough:** the executor touches no log, lock or derived file. The shared thing
@@ -292,10 +313,11 @@ a decode that could raise on a stray byte (`errors="replace"` throughout).
   there because real tools need one; `noexec` so it cannot become a staging area.
 - **`--init`.** A `sh -c` child that forks leaves zombies without a reaper; `tini` as PID 1 is
   one CLI flag and standard.
-- **`--user` is the workspace's owner** (fourth commit; the first three commits ran as root and
-  CI showed why that cannot write the workspace once every capability is gone). The uid is read
-  from the host, not configured, so there is nothing to get wrong. No `HOME` is set inside; a
-  tool that needs one is a later decision. Noted below.
+- **`--user` is the host process's own uid and gid** (sixth commit; the fourth used the
+  workspace owner's, the first three ran as root and Linux showed why that cannot write the
+  workspace once every capability is gone). Read from the process, not configured, so there is
+  nothing to get wrong, and `host_user()` is one function so `run` stays testable against the
+  plan. No `HOME` is set inside; a tool that needs one is a later decision. Noted below.
 - **The timeout covers the image pull.** A first run against a missing image may be killed by a
   short timeout, and `removed` will then be `False` with "No such container". The alternative —
   a separate pull step — is more surface for one task. The escape tests pull once up front.

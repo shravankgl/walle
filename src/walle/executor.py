@@ -25,11 +25,11 @@ things it does:
 
   The root filesystem is read-only and ``/tmp`` is a private tmpfs nothing can execute from,
   so the workspace is the only place a write can land and the only place one is looked for.
-  The process runs as the workspace's owner on the host (``--user``), because with every
-  capability dropped even root has no ``CAP_DAC_OVERRIDE`` and cannot write a folder it does
-  not own — the first real-container run (CI) proved that — and because files the step
-  leaves behind should belong to the person, not to root. OrbStack remaps bind-mount
-  ownership to the container's user under runc, so the same flag holds on the Mac.
+  The process runs as the host user (``--user <uid>:<gid>``, from ``os.getuid()`` and
+  ``os.getgid()``), not as root. Two reasons. With every capability dropped, root has no
+  ``CAP_DAC_OVERRIDE`` and cannot write a bind mount the host user owns — the first run in a
+  real Linux container (CI) failed exactly there, where OrbStack's file sharing had hidden it
+  on the Mac. And files the step leaves behind should belong to the person, not to root.
   ``--memory-swap`` equal to ``--memory`` is how the CLI spells "no swap". Nothing from the
   host environment is passed in: ``docker run`` gives a container an empty environment
   unless told otherwise, and it is not told.
@@ -245,6 +245,12 @@ def check_workspace(path: Path) -> Path:
     return resolved
 
 
+def host_user() -> str:
+    """``uid:gid`` of this process, as ``--user`` takes it: who the container runs as. One
+    place, so a test can pin the plan against it and a runner can say who ran."""
+    return f"{os.getuid()}:{os.getgid()}"
+
+
 def _check_token(token: str) -> str:
     if not _TOKEN.fullmatch(token):
         raise ValueError(f"token {token!r} must be 1 to 64 lowercase letters and digits")
@@ -254,13 +260,11 @@ def _check_token(token: str) -> str:
 def plan(job: Job, *, token: str) -> tuple[str, ...]:
     """The ``docker run`` argv for ``job``, after the client: the boundary as a list of strings.
 
-    Starts no process, but does ``stat`` the workspace for its owner. ``token`` names and
-    labels the container; ``run`` makes one when the caller has none. Raises ``ValueError``
-    for a workspace or token that fails its check.
+    Starts no process. ``token`` names and labels the container; ``run`` makes one when the
+    caller has none. Raises ``ValueError`` for a workspace or token that fails its check.
     """
     workspace = check_workspace(job.workspace)
     token = _check_token(token)
-    owner = workspace.stat()
     return (
         "run",
         "--rm",
@@ -274,7 +278,7 @@ def plan(job: Job, *, token: str) -> tuple[str, ...]:
         "--workdir",
         MOUNT_POINT,
         "--user",
-        f"{owner.st_uid}:{owner.st_gid}",
+        host_user(),
         "--read-only",
         "--tmpfs",
         TMPFS,
