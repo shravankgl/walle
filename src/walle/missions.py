@@ -3,9 +3,10 @@
 A ``mission`` event is the plan: nodes, links, manifests. Nothing about it is ever edited.
 What happened since is ``step`` events — a node started, completed or failed; the mission
 paused or resumed; a node injected; a node handed to someone else — and the DAG as it stands
-now is a fold over those, in ref order, in the same way ``walle.resolver`` folds assertions.
-Hard constraint 3 applies in full: this module opens no file, reads no clock and calls no
-model, and the same records in any order give the same ``Missions``.
+now is a fold over those, in ``walle.merge``'s order (each stream in its own seq order,
+streams interleaved by time: issue #120), in the same way ``walle.resolver`` folds
+assertions. Hard constraint 3 applies in full: this module opens no file, reads no clock and
+calls no model, and the same records in any order give the same ``Missions``.
 
 The rules
 ---------
@@ -13,7 +14,7 @@ The rules
    tombstone on the pause; undoing a reassign is a tombstone on the reassign. A superseded
    mission is not folded at all, and its steps are reported as unapplied.
 2. **Last live delta wins.** A node's status is the status of the last live ``status`` step
-   that names it, in ref order, or ``pending`` if none does. The fold does not police
+   that names it, in merge order, or ``pending`` if none does. The fold does not police
    transitions: it records what the kernel and the person said, and D91's recovery reads
    ``running`` nodes as the steps whose outcome is unknown.
 3. **Ready is every predecessor completed (D67).** A node is ready when its status is
@@ -79,10 +80,10 @@ from walle.events import (
     StepVerb,
     content_hash,
     find_cycle,
-    parse_ref,
 )
 from walle.floors import Kind, hit
 from walle.manifest import Touch, undeclared
+from walle.merge import fold_order
 from walle.resolver import live_events
 
 if TYPE_CHECKING:  # annotations only: the fold takes records, it never reads them itself
@@ -133,7 +134,7 @@ class NodeState:
     """``(cost_usd, tokens)`` summed over this node's live status deltas (D22)."""
 
     spent_from: tuple[str, ...] = ()
-    """Refs of the live status steps that reported spend, in ref order: what an abort step
+    """Refs of the live status steps that reported spend, in merge order: what an abort step
     cites, and what a later exporter reads the per-step figures from."""
 
     injected_by: str | None = None
@@ -210,14 +211,14 @@ class MissionState:
     ref: str
     mission: Mission
     nodes: tuple[NodeState, ...]
-    """Mission order, then injected nodes in ref order of their inject steps."""
+    """Mission order, then injected nodes in merge order of their inject steps."""
 
     links: tuple[tuple[str, str], ...]
     """``(source, target)`` pairs: the mission's, then each applied inject's, in order."""
 
     paused: bool
     applied: tuple[str, ...]
-    """Refs of the live steps that were applied, in ref order."""
+    """Refs of the live steps that were applied, in merge order."""
 
     def node(self, node_id: str) -> NodeState:
         for state in self.nodes:
@@ -275,7 +276,7 @@ class MissionState:
 
 @dataclass(frozen=True)
 class Missions:
-    """The fold's answer: every live mission in ref order, and what could not be applied."""
+    """The fold's answer: every live mission in merge order, and what could not be applied."""
 
     missions: tuple[MissionState, ...]
     unapplied: tuple[Unapplied, ...]
@@ -501,10 +502,10 @@ def fold_missions(records: Iterable[Record]) -> Missions:
     """Fold records from any number of streams into the DAG each live mission stands at.
 
     ``records`` is what ``walle.reader`` returns. The same record passed twice counts once,
-    and the order they arrive in does not matter: steps are applied in ref order.
+    and the order they arrive in does not matter: steps are applied in merge order.
     """
     events, live = live_events(records)
-    ordered = sorted(events, key=parse_ref)
+    ordered = fold_order(events)
 
     building: dict[str, _Building] = {}
     applied: dict[str, list[str]] = {}

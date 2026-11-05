@@ -242,12 +242,12 @@ def _trace(state: MissionState, steps: Mapping[str, Step]) -> Trace | None:
             continue  # never started: nothing to time
         key = node.injected_by or f"{state.ref}#{position}"
         cost, tokens = node.spent
-        start = min(times, key=_utc)  # streams interleave: ref order is not time order
+        start = min(times, key=_utc)  # the earliest report, whatever a device's clock did
         spans.append(
             Span(
                 id=_uuid7("span", key, start),
                 start=start,
-                # the last live status step in ref order is the one that set the status
+                # the last live status step in merge order is the one that set the status
                 end=times[-1] if node.status in _TERMINAL else None,
                 tokens=tokens,
                 cost_usd=cost,

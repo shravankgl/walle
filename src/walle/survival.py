@@ -62,7 +62,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from walle.automations import Entry, Unapplied, fold_automations
-from walle.events import ACTOR_KERNEL, Outcome, OutcomeResult, make_ref, now_instant, parse_ref
+from walle.events import ACTOR_KERNEL, Outcome, OutcomeResult, make_ref, now_instant
+from walle.merge import fold_order
 from walle.paths import log_dir
 from walle.reader import Record, read_file
 from walle.resolver import live_events
@@ -178,7 +179,7 @@ def survival(records: Iterable[Record], *, as_of: datetime) -> Survival:
 
     ok_runs: dict[str, list[datetime]] = {}
     unapplied: list[Unapplied] = []
-    for ref in sorted(events, key=parse_ref):
+    for ref in fold_order(events):
         event = events[ref]
         if not isinstance(event, Outcome) or not live[ref]:
             continue
