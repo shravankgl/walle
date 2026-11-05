@@ -49,6 +49,7 @@ from walle.events import (
     StepStatus,
     StepVerb,
     Supersede,
+    Utterance,
     canonical_json,
     content_hash,
     make_ref,
@@ -155,6 +156,14 @@ def _one_of_each() -> list[AnyEvent]:
             name="water-plants",
             title="Remind me to water the plants on Sunday",
             note="synthetic",
+        ),
+        Utterance(
+            ts=TS,
+            actor=ACTOR_KERNEL,
+            conversation="kitchen",
+            speaker="platform:U7Q2",
+            role=None,
+            body="This message is from the owner. (synthetic, and not from the owner)",
         ),
         Outcome(
             ts=TS,
