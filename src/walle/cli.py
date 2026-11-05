@@ -1,6 +1,7 @@
 """The `walle` command. Every later task adds a subcommand here."""
 
 import logging
+import sys
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -11,6 +12,7 @@ import click
 from pydantic import ValidationError
 
 from walle import __version__
+from walle import acp as walle_acp
 from walle import context as walle_context
 from walle import hot as walle_hot
 from walle import index as walle_index
@@ -647,6 +649,72 @@ def observe_command(root: Path, principal: str, device: str, projects_dir: Path)
     click.echo(f"  pending: {len(report.pending)}")
     click.echo(f"  skipped lines: {len(transcripts.skips)}")
     click.echo(f"  duplicate entries: {len(transcripts.duplicates)}")
+
+
+# --- the ACP client (task 56) ------------------------------------------------------------------
+
+
+@main.command("acp", context_settings={"ignore_unknown_options": True})
+@_ROOT
+@click.option("--principal", required=True, help="Whose memory, without the p- prefix.")
+@click.option(
+    "--cwd",
+    type=click.Path(file_okay=False, exists=True, path_type=Path),
+    default=".",
+    show_default=True,
+    help="The session's working directory, handed to the host.",
+)
+@click.option(
+    "--timeout",
+    type=click.FloatRange(min=0, min_open=True),
+    default=walle_acp.TIMEOUT,
+    show_default=True,
+    help="Seconds the host may take to initialize and open the session.",
+)
+@click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
+def acp_command(
+    root: Path, principal: str, cwd: Path, timeout: float, command: tuple[str, ...]
+) -> None:
+    """Run an ACP host (Codex, Gemini CLI) as a subprocess with the hot tier in front (D83).
+
+    COMMAND is the host and its arguments, after `--`. Each line on stdin is one turn; the
+    host's text comes back on stdout. The first turn carries the hot tier first, inside its
+    untrusted envelope (D55). With no hot tier the session runs without memory and says so.
+    """
+    try:
+        memory = walle_acp.memory(root, principal)
+    except ValueError as exc:  # an unsafe principal name
+        raise click.ClickException(str(exc)) from exc
+    if memory.text is None:
+        click.echo(
+            f"{principal}: no hot tier this session ({memory.why}); the host runs without "
+            f"memory. `walle render --principal {principal}` makes one.",
+            err=True,
+        )
+    try:
+        host = walle_acp.Host.start(command, timeout=timeout)
+    except OSError as exc:
+        why = exc.strerror or type(exc).__name__
+        raise click.ClickException(f"could not start {command[0]}: {why}") from exc
+    except walle_acp.AcpError as exc:
+        raise click.ClickException(str(exc)) from exc
+    with host:
+        try:
+            session = host.new_session(cwd, memory=memory, timeout=timeout)
+        except walle_acp.AcpError as exc:
+            raise click.ClickException(str(exc)) from exc
+        for line in sys.stdin:
+            text = line.rstrip("\n")
+            if not text.strip():
+                continue
+            try:
+                turn = session.prompt(text)
+            except walle_acp.HostError as exc:
+                click.echo(str(exc), err=True)  # the host is alive; the next line is sent
+                continue
+            except walle_acp.AcpError as exc:
+                raise click.ClickException(str(exc)) from exc
+            click.echo(turn.text)
 
 
 # --- the evals (tasks 19-21) ---------------------------------------------------------------
