@@ -37,8 +37,9 @@ The rules
    calls the writes on its own, and the CLI has no command for them.
 
 Anything the fold cannot apply is reported in ``unapplied`` with a reason, never dropped.
-Events are applied in ref order (stream, then seq), like ``walle.missions`` and
-``walle.inbox``, so the same records in any order give the same register.
+Events are applied in ``walle.merge``'s order — each stream in its own seq order, streams
+interleaved by time — like every other fold, so the same records in any order give the same
+register, and a retire from the laptop of an add on the phone finds it (issue #120).
 
 Two writers, step by step (the walkthrough this file is required to carry)
 -------------------------------------------------------------------------------
@@ -64,11 +65,11 @@ exists. The lock is held for one decision, never across waiting on a person.
 
 What this does not cover: two devices that do not share a filesystem. Each takes its own
 lock, and both may add a seventh before their logs meet. Rule 2 still gives one register on
-every machine once they meet — the first add in ref order is applied, and the other is
-reported as past the cap. For the same reason, a retire or pin whose add sorts *after* it in
-ref order (written on a stream that sorts first, about an add from one that sorts later) is
-reported as naming an automation the register does not hold yet. With one device there is
-one stream, and ref order is the order things happened.
+every machine once they meet — the earlier add by its stamp is applied (``walle.merge``; at
+the same instant, the stream that sorts first), and the other is reported as past the cap.
+A retire or pin stamped *before* the add it names — a device whose clock is behind — is
+reported as naming an automation the register does not hold yet; the order does not guess.
+With one device there is one stream, and seq order is the order things happened.
 """
 
 from __future__ import annotations
@@ -92,6 +93,7 @@ from walle.events import (
     now_instant,
     parse_ref,
 )
+from walle.merge import fold_order
 from walle.paths import automations_lock_path, log_dir
 from walle.reader import Record, read_file
 from walle.resolver import live_events
@@ -187,7 +189,7 @@ class Unapplied:
 
 @dataclass(frozen=True)
 class Register:
-    """The fold's answer: every automation in ref order of its add, and what was not applied."""
+    """The fold's answer: every automation in merge order of its add, and what was not applied."""
 
     entries: tuple[Entry, ...]
     unapplied: tuple[Unapplied, ...] = ()
@@ -202,7 +204,7 @@ class Register:
 
     @property
     def pinned(self) -> tuple[Entry, ...]:
-        """The active automations that are pinned, in ref order."""
+        """The active automations that are pinned, in merge order."""
         return tuple(e for e in self.active if e.pinned)
 
     @property
@@ -309,14 +311,14 @@ def fold_automations(records: Iterable[Record]) -> Register:
     """Fold records from any number of streams into the register as it stands.
 
     ``records`` is what ``walle.reader`` returns. The same record passed twice counts once,
-    and the order they arrive in does not matter: events are applied in ref order. A live
+    and the order they arrive in does not matter: events are applied in merge order. A live
     supersede of an automation event is reported, and the event it names still counts (rule
     5); ``live_events`` is still what decides whether that supersede is itself live.
     """
     events, live = live_events(records)
     register = Register(entries=())
     unapplied: list[Unapplied] = []
-    for ref in sorted(events, key=parse_ref):
+    for ref in fold_order(events):
         event = events[ref]
         if isinstance(event, Supersede):
             target = events.get(event.target)
@@ -343,7 +345,7 @@ def fold_automations(records: Iterable[Record]) -> Register:
 
 
 def active(root: Path, principal: str) -> tuple[Entry, ...]:
-    """Every active automation, in ref order of its add, from the log as it is now. Works
+    """Every active automation, in merge order of its add, from the log as it is now. Works
     while the register is off: reading is not acting. A principal with no log raises
     ``FileNotFoundError``."""
     log = log_dir(Path(root), principal)
@@ -370,8 +372,12 @@ def add(
     With ``workflow``, the ref of a kept workflow (``walle.builder.workflow``), the add's
     ``caused_by`` names it: that is what binds the automation to the workflow it runs, and
     what ``walle.builder.run_step`` requires before a step of that workflow runs (#121). The
-    ref is checked for shape only; whether it is a live, kept workflow is the Builder's
-    question, asked at every run. With ``retire``, the active automation of that name is
+    ref must be an event this principal's log already holds — checked under the lock, from
+    the same read the register is folded from, and refused with ``RefusedError`` before
+    anything is written, because an append-only log cannot take a dangling cause back
+    (D111; the writer refuses it again as the last line). Whether it is a live, kept
+    workflow is the Builder's question, asked at every run. With ``retire``, the active
+    automation of that name is
     retired first, in the same hold of ``automations.lock``, and the add's ``caused_by``
     names that retire as well (rule 2). Raises
     ``AutomationsOffError`` while off; ``RefusedError`` for a machine actor, a name already
@@ -394,7 +400,13 @@ def add(
     )
     _require_person(actor)
     with _exclusive(root, principal):
-        register = fold_automations(_read(root, principal))
+        records = _read(root, principal)
+        if workflow is not None and all(r.ref != workflow for r in records):
+            raise RefusedError(
+                f"workflow {workflow} is not in the log of principal {principal!r}; an "
+                "automation is bound to an event that exists (D111)"
+            )
+        register = fold_automations(records)
         swap: Automation | None = None
         if retire is not None:
             out = _active_named(register, retire)

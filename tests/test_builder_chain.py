@@ -664,3 +664,291 @@ def test_the_builder_has_exactly_one_door_to_the_executor_and_it_is_behind_admit
     assert [f for f, _ in where["admit"]] == ["run_step"]
     assert [f for f, _ in where["run"]] == ["run_step"]
     assert where["admit"][0][1] < where["run"][0][1]
+
+
+# --- review round 2 (PR #126 at a5c2de8): a dangling cause, the mission's real state, links ----
+
+
+def _index_green(root: Path) -> None:
+    """The index updates and rebuilds from the log as it is: no dangling ref (D111)."""
+    from walle import index
+
+    index.update(root, P)
+    index.rebuild(root, P)
+
+
+@pytest.mark.parametrize("bad", ["d-mbp:999", "d-phone:1"])
+def test_an_add_naming_a_workflow_the_log_does_not_hold_is_refused_and_rebuild_stays_green(
+    root: Path, bad: str
+) -> None:
+    """Review high: ``add(workflow=)`` wrote whatever ref it was given into ``caused_by``. The
+    log is append-only, so one typo broke ``index.update`` and the rebuild forever. Now it
+    is refused before anything is written, and the index stays green."""
+    kept = _two_steps(root, enrol=False)
+    assert bad != kept
+    before = _lines(root)
+    with pytest.raises(automations.RefusedError, match="not in the log"):
+        _enrol(root, bad)
+    assert _lines(root) == before
+    _index_green(root)
+    assert automations.active(root, P) == ()
+
+
+def test_an_add_cannot_name_itself_as_its_workflow(root: Path) -> None:
+    """On an empty stream the add becomes ``d-mbp:1``; ``workflow="d-mbp:1"`` would be a ref
+    to itself. Refused: the ref is not in the log when the add is decided."""
+    with pytest.raises(automations.RefusedError, match="not in the log"):
+        automations.add(
+            root, P, D, name="loop", title="t", workflow="d-mbp:1", environ=AUTOMATIONS_ON
+        )
+    assert not (root / "principals").exists() or _lines(root) == 0
+
+
+def test_no_writer_can_append_a_cause_the_log_does_not_hold(root: Path) -> None:
+    """The check is the writer's, not each caller's (review high, "centralise at the append"):
+    any event whose ``caused_by`` names a ref no stream of this principal holds is refused
+    by ``StreamWriter.append`` and by ``LockedStream.append``, with nothing written and
+    the index green afterwards. A cause on another stream of the same principal, and one on
+    this stream, are both accepted."""
+    from walle.writer import DanglingCauseError
+
+    writer = StreamWriter(root, P, D)
+    writer.append(Proposal(ts=now_instant(), actor="user", body="one", summary="one"))
+    other = StreamWriter(root, P, "phone")
+    other.append(Proposal(ts=now_instant(), actor="user", body="two", summary="two"))
+    before = _lines(root)
+    for cause in ("d-mbp:2", "d-mbp:7", "d-phone:2", "d-nowhere:1"):
+        event = Assertion(ts=now_instant(), actor="user", caused_by=[cause], body="b", summary="b")
+        with pytest.raises(DanglingCauseError, match=cause):
+            writer.append(event)
+        with writer.locked() as stream, pytest.raises(DanglingCauseError, match=cause):
+            stream.append(event)
+    assert _lines(root) == before
+    _index_green(root)
+    writer.append(
+        Assertion(ts=now_instant(), actor="user", caused_by=["d-phone:1"], body="b", summary="b")
+    )
+    with other.locked() as stream:
+        stream.append(
+            Assertion(
+                ts=now_instant(),
+                actor="user",
+                caused_by=["d-mbp:1", "d-mbp:2"],
+                body="c",
+                summary="c",
+            )
+        )
+    assert _lines(root) == before + 2
+    _index_green(root)
+
+
+def test_every_writer_that_sets_a_cause_goes_through_the_one_check() -> None:
+    """Source level: the only module that spells a stream's path for writing is ``writer.py``
+    (``paths.stream_path`` is read by the reader and by a profile's read-only property, and by
+    nothing else), and its two appends both call ``_check_causes`` before a byte is written.
+    So the check in the writer is the check for every cause that reaches the log."""
+    src = Path(__file__).parent.parent / "src" / "walle"
+    users = {
+        module.name
+        for module in src.glob("*.py")
+        if module.name != "paths.py" and "stream_path(" in module.read_text()
+    }
+    assert users == {"reader.py", "writer.py", "profiles.py"}
+    profile = (src / "profiles.py").read_text().replace("def stream_path(", "")
+    assert profile.count("stream_path(") == 1  # the read-only property's one call
+    tree = ast.parse((src / "writer.py").read_text())
+    appends = [
+        fn
+        for cls in ast.walk(tree)
+        if isinstance(cls, ast.ClassDef) and cls.name in {"StreamWriter", "LockedStream"}
+        for fn in cls.body
+        if isinstance(fn, ast.FunctionDef) and fn.name == "append"
+    ]
+    assert len(appends) == 2
+    for fn in appends:
+        calls = [
+            n.func.attr
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        ]
+        assert "_check_causes" in calls or "append" in calls, fn.name  # the other delegates
+
+
+def _fail_tidy_by_hand(root: Path, kept: str) -> str:
+    """Step 1 completed through ``run_step``; step 2 written as failed by hand (the fold does
+    not police transitions). Returns the mission ref."""
+    result, _ = _run(root, Path(root).parent, kept, "write-plan")
+    assert isinstance(result, executor.Outcome)
+    (mission,) = _events(root, Mission)
+    StreamWriter(root, P, D).append(
+        Step(
+            ts=now_instant(),
+            actor=ACTOR_BUILDER,
+            mission=mission.ref,
+            verb=StepVerb.STATUS,
+            node="tidy",
+            status=StepStatus.FAILED,
+            note="by hand",
+        )
+    )
+    return mission.ref
+
+
+def test_a_failed_later_step_reports_as_failed_never_as_a_fresh_not_ready(
+    root: Path, tmp_path: Path
+) -> None:
+    """Review medium 1: ``_mission_state`` kept only ``open`` missions, so a mission whose
+    step 2 had failed was dropped and step 2 was refused "not ready" off a fresh fold, a lie
+    about a step that already ran. The real state is folded: "already failed"."""
+    kept = _two_steps(root)
+    _fail_tidy_by_hand(root, kept)
+    before = _lines(root)
+    result, calls = _run(root, tmp_path, kept, "tidy")
+    assert result == Refusal("already failed") and calls == [] and _lines(root) == before
+
+
+def test_a_paused_mission_refuses_even_after_a_failure(root: Path, tmp_path: Path) -> None:
+    kept = _two_steps(root)
+    mission = _fail_tidy_by_hand(root, kept)
+    StreamWriter(root, P, D).append(
+        Step(ts=now_instant(), actor="user", mission=mission, verb=StepVerb.PAUSE)
+    )
+    before = _lines(root)
+    for node in ("write-plan", "tidy"):
+        result, calls = _run(root, tmp_path, kept, node)
+        assert result == Refusal("mission is paused") and calls == []
+    assert _lines(root) == before and len(_events(root, Mission)) == 1
+
+
+def test_an_aborted_mission_refuses_with_the_breach_and_opens_no_fresh_one(
+    root: Path, tmp_path: Path
+) -> None:
+    """A budget breach aborts the mission (D22, rule 6): ``abort_step`` marks the node failed,
+    which used to look like a finished mission to the Builder, which opened a new one with a
+    fresh budget. Now ``admit`` answers, with the breach."""
+    kept = _two_steps(root, enrol=False)
+    flow = workflow(_records(root), kept)
+    plan = flow.mission(now_instant())
+    budgeted = plan.nodes[0].model_copy(update={"token_budget": 10})
+    plan = plan.model_copy(update={"nodes": [budgeted, *plan.nodes[1:]]})
+    writer = StreamWriter(root, P, D)
+    mission = writer.append(plan)
+    assert mission.seq is not None
+    mref = f"{writer.stream}:{mission.seq}"
+    writer.append(
+        Step(
+            ts=now_instant(),
+            actor=ACTOR_BUILDER,
+            mission=mref,
+            verb=StepVerb.STATUS,
+            node="write-plan",
+            status=StepStatus.RUNNING,
+            tokens=50,
+        )
+    )
+    state = missions.fold_missions(_records(root)).mission(mref)
+    assert state.breach is not None
+    writer.append(missions.abort_step(state, state.breach, ts=now_instant()))
+    _enrol(root, kept)
+    before = _lines(root)
+    for node in ("write-plan", "tidy"):
+        result, calls = _run(root, tmp_path, kept, node)
+        assert isinstance(result, Refusal) and result.reason.startswith("aborted:"), result
+        assert calls == []
+    assert _lines(root) == before and len(_events(root, Mission)) == 1
+
+
+def test_a_running_node_holds_the_mission_even_beside_a_failed_one(
+    root: Path, tmp_path: Path
+) -> None:
+    """D91: a node still running is an outcome unknown. With another node failed the mission
+    read as finished and a fresh one opened beside the running step. Now it is refused."""
+    kept = _two_steps(root)
+    flow = workflow(_records(root), kept)
+    writer = StreamWriter(root, P, D)
+    mission = writer.append(flow.mission(now_instant()))
+    assert mission.seq is not None
+    mref = f"{writer.stream}:{mission.seq}"
+    for node, status in (("write-plan", StepStatus.RUNNING), ("tidy", StepStatus.FAILED)):
+        writer.append(
+            Step(
+                ts=now_instant(),
+                actor=ACTOR_BUILDER,
+                mission=mref,
+                verb=StepVerb.STATUS,
+                node=node,
+                status=status,
+            )
+        )
+    before = _lines(root)
+    result, calls = _run(root, tmp_path, kept, "write-plan")
+    assert isinstance(result, Refusal) and "already running" in result.reason and calls == []
+    result, calls = _run(root, tmp_path, kept, "tidy")
+    assert result == Refusal("already failed") and calls == []
+    assert _lines(root) == before and len(_events(root, Mission)) == 1
+
+
+def test_a_fresh_mission_opens_only_at_the_first_step_of_a_settled_one(
+    root: Path, tmp_path: Path
+) -> None:
+    """Once every step completed, step 2 asked again is "already completed" on that mission;
+    only step 1 opens the next run."""
+    kept = _two_steps(root)
+    for node in ("write-plan", "tidy"):
+        result, _ = _run(root, tmp_path, kept, node)
+        assert isinstance(result, executor.Outcome)
+    before = _lines(root)
+    result, calls = _run(root, tmp_path, kept, "tidy")
+    assert result == Refusal("already completed") and calls == [] and _lines(root) == before
+    result, calls = _run(root, tmp_path, kept, "write-plan")
+    assert isinstance(result, executor.Outcome) and len(_events(root, Mission)) == 2
+
+
+@pytest.mark.parametrize("target", ["kernel", "principals/p-maya/hot", "SHARED"])
+def test_a_link_inside_the_workspace_to_a_floor_name_is_refused_before_anything_runs(
+    root: Path, tmp_path: Path, target: str
+) -> None:
+    """Review medium 2: ``floors.hit`` is lexical. ``plans -> kernel`` inside the workspace
+    made ``plans/meals.md`` a write under ``kernel/``; ``run_step`` never asked
+    ``floors.floored``, which follows links (``missions`` rule 8). Now it does, against the
+    workspace, before anything is appended or started."""
+    kept = _two_steps(root)
+    ws = _workspace(tmp_path)
+    (ws / "plans").symlink_to(target)
+    before = _lines(root)
+    result, calls = _run(root, tmp_path, kept, "write-plan")
+    assert isinstance(result, Refusal) and "floored" in result.reason and "D72" in result.reason
+    assert calls == [] and _lines(root) == before
+
+
+def test_a_link_out_of_the_workspace_into_the_walle_root_is_refused_too(
+    root: Path, tmp_path: Path
+) -> None:
+    """The same check against the walle root with the path as the container would land it:
+    ``plans -> <root>/principals/p-maya/hot`` is a write into the hot tier (D72, D109)."""
+    kept = _two_steps(root)
+    ws = _workspace(tmp_path)
+    hot = root / "principals" / "p-maya" / "hot"
+    hot.mkdir(parents=True, exist_ok=True)
+    (ws / "plans").symlink_to(hot)
+    before = _lines(root)
+    result, calls = _run(root, tmp_path, kept, "write-plan")
+    assert isinstance(result, Refusal) and "floored" in result.reason
+    assert calls == [] and _lines(root) == before
+
+
+def test_a_link_that_cannot_be_resolved_fails_closed(root: Path, tmp_path: Path) -> None:
+    kept = _two_steps(root)
+    ws = _workspace(tmp_path)
+    (ws / "plans").symlink_to("plans")  # a loop
+    result, calls = _run(root, tmp_path, kept, "write-plan")
+    assert isinstance(result, Refusal) and "floored" in result.reason and calls == []
+
+
+def test_a_plain_workspace_still_runs_after_the_link_check(root: Path, tmp_path: Path) -> None:
+    kept = _two_steps(root)
+    ws = _workspace(tmp_path)
+    (ws / "plans").mkdir()
+    (ws / "notes").symlink_to("plans")  # a link that reaches no floor is not the floor's
+    result, calls = _run(root, tmp_path, kept, "write-plan")
+    assert isinstance(result, executor.Outcome) and len(calls) == 1

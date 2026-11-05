@@ -581,3 +581,106 @@ def test_the_register_over_the_golden_log_is_the_one_it_shipped_with(tmp_path: P
         "d-mbp:8",
         "d-mbp:9",
     ]
+
+
+# --- issue #120 (audit 5.1): two devices fold in time order, not stream order ----------------
+
+
+def _at(hhmm: str, day: int = 5) -> str:
+    return f"2026-11-{day:02d}T{hhmm}:00.000000+00:00"
+
+
+def test_a_swap_from_the_laptop_of_an_automation_added_on_the_phone_holds(tmp_path: Path) -> None:
+    """The audit's reproduction. ``gym-class`` was added first, on the phone. Six more and a
+    swap come from the laptop. Folded in stream order every ``d-mbp`` event came before
+    ``d-phone:1``: the retire found nothing, ``a-7`` took the seventh slot and ``gym-class``,
+    the oldest automation, was then refused as an eighth and vanished. In time order the
+    swap holds, on this machine and on any other that folds the same two streams."""
+    gym = automations.add(tmp_path, P, "phone", name="gym-class", title="Gym", environ=ON)
+    for i in range(1, 7):
+        automations.add(tmp_path, P, "mbp", name=f"a-{i}", title=f"A {i}", environ=ON)
+
+    swapped = automations.add(
+        tmp_path, P, "mbp", name="a-7", title="A 7", retire="gym-class", environ=ON
+    )
+
+    register = _register(tmp_path)
+    assert register.unapplied == ()
+    assert [e.name for e in register.active] == [f"a-{i}" for i in range(1, 8)]
+    retired = register.entry(gym.ref)
+    assert retired is not None and retired.status == "retired"
+    assert retired.retired_ref == "d-mbp:7"
+    assert register.entry(swapped.ref) == swapped
+    assert [e.name for e in automations.active(tmp_path, P)] == [e.name for e in register.active]
+
+
+def test_what_a_write_returns_is_what_the_next_read_folds(tmp_path: Path) -> None:
+    """``pin`` and ``retire`` fold, check, append and return the entry as changed. The next
+    read must agree, whichever device each event came from."""
+    automations.add(tmp_path, P, "phone", name="gym-class", title="Gym", environ=ON)
+    pinned = automations.pin(tmp_path, P, "mbp", "gym-class", environ=ON)
+    assert pinned.pinned and pinned.pin_ref == "d-mbp:1"
+    assert _register(tmp_path).entry(pinned.ref) == pinned
+    assert _register(tmp_path).unapplied == ()
+
+    automations.unpin(tmp_path, P, "tab", "gym-class", environ=ON)
+    retired = automations.retire(tmp_path, P, "mbp", "gym-class", environ=ON)
+    assert retired.status == "retired" and retired.retired_ref == "d-mbp:2"
+    assert _register(tmp_path).entry(retired.ref) == retired
+    assert _register(tmp_path).unapplied == ()
+    assert automations.active(tmp_path, P) == ()
+
+
+def test_events_on_two_devices_apply_in_time_order(tmp_path: Path) -> None:
+    """Hand-written stamps, so the order is the fold's and not the test clock's: the phone's
+    add at 10:01 comes before the laptop's retire of it at 10:10, although every ``d-mbp``
+    ref sorts before every ``d-phone`` ref."""
+    _write(tmp_path, "mbp", _raw_add("car-service", ts=_at("10:00")))  # d-mbp:1
+    _write(tmp_path, "phone", _raw_add("gym-class", ts=_at("10:01")))  # d-phone:1
+    _write(tmp_path, "mbp", _raw(AutomationVerb.RETIRE, target="d-phone:1", ts=_at("10:10")))
+    _write(tmp_path, "phone", _raw(AutomationVerb.PIN, target="d-mbp:1", ts=_at("10:20")))
+
+    register = _register(tmp_path)
+    assert register.unapplied == ()
+    assert [(e.ref, e.status, e.pinned) for e in register.entries] == [
+        ("d-mbp:1", "active", True),
+        ("d-phone:1", "retired", False),
+    ]
+
+
+def test_a_clock_that_steps_back_on_one_device_never_reorders_that_device(tmp_path: Path) -> None:
+    """The phone adds ``a-1`` at 10:10, its clock steps back, it adds ``a-2`` at 09:50 and
+    retires ``a-1`` at 09:55. A plain sort by stamp would apply the retire before the add it
+    names and report it. The merge keeps the phone's seq order, so everything applies; the
+    laptop's 10:00 add is interleaved before the phone's run, and the answer is the same
+    however many times, and in whatever order, the log is folded."""
+    _write(tmp_path, "phone", _raw_add("a-1", ts=_at("10:10")))  # d-phone:1
+    _write(tmp_path, "phone", _raw_add("a-2", ts=_at("09:50")))  # d-phone:2
+    _write(tmp_path, "phone", _raw(AutomationVerb.RETIRE, target="d-phone:1", ts=_at("09:55")))
+    _write(tmp_path, "mbp", _raw_add("b-1", ts=_at("10:00")))  # d-mbp:1
+
+    records = _records(tmp_path)
+    register = automations.fold_automations(records)
+    assert register.unapplied == ()
+    assert [(e.ref, e.status) for e in register.entries] == [
+        ("d-mbp:1", "active"),
+        ("d-phone:1", "retired"),
+        ("d-phone:2", "active"),
+    ]
+    assert automations.fold_automations(records) == register
+    assert automations.fold_automations(reversed(records)) == register
+    assert automations.fold_automations([*records, *records]) == register
+
+
+def test_the_same_instant_on_two_devices_falls_back_to_stream_order(tmp_path: Path) -> None:
+    """A tie is ordered ``(stream, seq)`` (D57), so it is still one answer: with two
+    sevenths stamped alike, the laptop's is applied and the phone's is reported."""
+    for name in NAMES[:6]:
+        _write(tmp_path, "mbp", _raw_add(name, ts=_at("09:00")))
+    on_phone = _write(tmp_path, "phone", _raw_add("gym-class", ts=_at("10:00")))
+    on_mbp = _write(tmp_path, "mbp", _raw_add("car-service", ts=_at("10:00")))
+
+    register = _register(tmp_path)
+    assert register.find("car-service") is not None
+    assert register.find("car-service").ref == on_mbp  # type: ignore[union-attr]
+    assert [u.ref for u in register.unapplied] == [on_phone]

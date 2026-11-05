@@ -140,7 +140,6 @@ def _meal_plan() -> Mission:
         ("principals/p-ira/notes/", "principals/p-ira/notes/sunday.md"),
         ("principals/p-ira/notes", "principals/p-ira/notes/a/../b.md"),
         ("principals/p-ira/notes", "./principals/p-ira/notes//sunday.md"),
-        ("/tmp/walle", "/tmp/walle/out.txt"),
     ],
 )
 def test_a_declared_path_covers_itself_and_what_is_under_it(declared: str, touched: str) -> None:
@@ -157,6 +156,10 @@ def test_a_declared_path_covers_itself_and_what_is_under_it(declared: str, touch
         ("principals/p-ira/notes", "../principals/p-ira/notes"),
         ("principals/p-ira/notes", "/principals/p-ira/notes"),
         ("/principals/p-ira/notes", "principals/p-ira/notes"),
+        ("/tmp/walle", "/tmp/walle/out.txt"),  # issue #118 1.1: absolute is unanswerable
+        ("/", "/principals/p-ira/hot/rules.md"),
+        ("/", "principals/p-ira/hot/rules.md"),
+        ("principals/p-ira/notes", "principals/p-ira/notes/a\x00b"),
         ("principals/p-ira/notes", ""),
         ("principals/p-ira/notes", "."),
         ("principals/p-ira/notes", "Principals/p-ira/notes"),
@@ -631,7 +634,14 @@ def _runtime_imports(path: Path) -> set[str]:
 def test_the_manifest_module_reaches_no_model_no_network_no_file_and_no_clock() -> None:
     assert forbidden_in_closure(PACKAGE, ("manifest",)) == {}
     imports = _runtime_imports(MANIFEST_SOURCE)
-    allowed = {"__future__", "dataclasses", "posixpath", "typing", "walle.events"}
+    allowed = {
+        "__future__",
+        "dataclasses",
+        "posixpath",
+        "typing",
+        "walle.events",
+        "walle.floors",  # issue #118: the one spelling of a path by name, shared with the floor
+    }
     assert imports <= allowed, imports - allowed
     assert not (imports & MODEL_OR_NETWORK)
     assert "os" not in imports and "datetime" not in imports and "time" not in imports

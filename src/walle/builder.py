@@ -113,19 +113,26 @@ there is no cycle. The lock is held for one decision, never across the container
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
-import posixpath
-import sys
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
 from pydantic import ValidationError
 
-from walle import automations, envelope, executor, floors, hazards, index, missions
+from walle import (
+    automations,
+    envelope,
+    executor,
+    floors,
+    hazards,
+    index,
+    manifest,
+    missions,
+    paths,
+)
 from walle.events import (
     ACTOR_BUILDER,
     ACTOR_USER,
@@ -141,19 +148,18 @@ from walle.events import (
     now_instant,
     parse_ref,
 )
-from walle.manifest import Touch
-from walle.paths import log_dir, missions_lock_path
+from walle.floors import segments
 from walle.reader import Record
 from walle.resolver import Staged, live_events
 from walle.writer import StreamWriter
 
-if sys.platform == "win32":  # pragma: no cover - POSIX only in Phase 0
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - POSIX only in Phase 0
     raise ImportError(
         "walle's Builder needs POSIX file locking (fcntl); Windows is not supported in "
         "Phase 0. Run it under WSL."
-    )
-
-import fcntl
+    ) from None
 
 __all__ = [
     "ACTOR_BUILDER",
@@ -581,7 +587,9 @@ def _read_step(item: object) -> WorkflowStep | str:
         if len(value) > PATH_COUNT:
             return f"{key} names more than {PATH_COUNT} paths"
         for path in value:
-            if (why := _inside(path, write=key == "writes")) is not None:
+            if (why := _inside(path)) is not None:
+                return f"{key}: {why}"
+            if key == "writes" and (why := _floored_by_name(path)) is not None:
                 return f"{key}: {why}"
         paths[key] = tuple(value)
     try:
@@ -591,26 +599,38 @@ def _read_step(item: object) -> WorkflowStep | str:
     return WorkflowStep(step_id, title, tuple(command), paths["reads"], paths["writes"])
 
 
-def _inside(path: str, *, write: bool = False) -> str | None:
-    """``None`` when ``path`` names something inside the workspace — and, for a write, off the
-    floor (D72) — or why not. The path is the model's word and is never quoted."""
+def _inside(path: str) -> str | None:
+    """``None`` when ``path`` names something inside the workspace, or why not. Whether it is
+    a path by name at all — relative, not climbing out, no NUL — is the floor's one answer
+    (``walle.floors.segments``, issue #118); the length cap, the shell's ``~`` and a backslash
+    are refused here because a command, not a filesystem, would read them."""
     if not path or path.strip() != path:
         return "a path is empty or padded"
     if len(path) > PATH_CHARS:
         return f"a path is longer than {PATH_CHARS} characters"
-    if posixpath.isabs(path) or path.startswith("~") or "\\" in path or "\x00" in path:
+    if path.startswith("~") or "\\" in path:
         return "a path is not relative to the workspace"
-    norm = posixpath.normpath(path)
-    if norm == "." or norm == ".." or norm.startswith("../"):
-        return "a path names the workspace itself or climbs out of it"
-    if write and (floor := floors.hit(norm)) is not None:
-        how = floor.how if floor.how == "is" else f"is {floor.how}"
-        return (
-            f"a write is floored: the path {how} a floor path (the kernel, shared "
-            "capabilities, or a principal's grants, keys or hot tier), which nothing the agent "
-            "does may write, in any mode (D72)"
-        )
+    parts = segments(path)
+    if parts is None:
+        return "a path is not relative to the workspace, or climbs out of it"
+    if not parts:
+        return "a path names the workspace itself"
     return None
+
+
+def _floored_by_name(path: str) -> str | None:
+    """Why a declared write is on the floor (D72), or ``None``. ``walle.floors.hit`` is the
+    one answer, asked here so a step the mission gate would refuse is never staged, and asked
+    again by ``missions.admit`` before it runs (#121). ``_inside`` has already said the path
+    is a path by name. The path is the model's word and is never quoted."""
+    if (floor := floors.hit(path)) is None:
+        return None
+    how = floor.how if floor.how == "is" else f"is {floor.how}"
+    return (
+        f"a write is floored: the path {how} a floor path (the kernel, shared capabilities, "
+        "or a principal's grants, keys or hot tier), which nothing the agent does may write, "
+        "in any mode (D72)"
+    )
 
 
 def _node_of(step_id: object, title: str, reads: Sequence[str], writes: Sequence[str]) -> Node:
@@ -702,16 +722,6 @@ def _overlaps(workspace: Path, root: Path) -> bool:
     return ws == rt or rt in ws.parents or ws in rt.parents
 
 
-@contextlib.contextmanager
-def _exclusive(lock: Path) -> Iterator[None]:
-    """Hold ``missions.lock`` exclusively: one decision to start a step per principal at a
-    time (the walkthrough in the module docstring)."""
-    with open(lock, "ab") as f:  # "a": opening never truncates, and the file stays empty
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        yield
-        # The lock goes with close.
-
-
 def _automation(records: Sequence[Record], ref: str) -> str | None:
     """Why no active automation runs the workflow at ``ref`` (D6, hard constraint 9), or
     ``None`` when one does: an active register entry whose add names ``ref`` in ``caused_by``."""
@@ -731,29 +741,49 @@ def _automation(records: Sequence[Record], ref: str) -> str | None:
     )
 
 
+_BUDGETS = {"token_budget", "cost_budget_usd"}
+
+
 def _same_plan(logged: Mission, plan: Mission) -> bool:
-    """Whether a mission in the log is this workflow's plan: the same nodes and links, as
-    declared. ``ts`` differs by nature and is not compared."""
-    return logged.nodes == plan.nodes and logged.links == plan.links and logged.title == plan.title
+    """Whether a mission in the log is this workflow's plan: the same title, links and nodes
+    — id, title and manifest — as declared. ``ts`` differs by nature. A budget on a node
+    (D22) is not compared: the Builder writes none, and one a person added narrows what the
+    step may spend without widening what it may touch, so a budgeted copy of the plan is
+    still the plan, and its breach is ``admit``'s to refuse."""
+    strip = [n.model_dump(exclude=_BUDGETS) for n in logged.nodes]
+    return (
+        strip == [n.model_dump(exclude=_BUDGETS) for n in plan.nodes]
+        and logged.links == plan.links
+        and logged.title == plan.title
+    )
+
+
+def _settled(state: missions.MissionState) -> bool:
+    """Whether a mission is over and done with, so that the next run of the workflow is a new
+    mission: every node finished (done, or failed with no node still running), not paused
+    and not aborted. A paused or aborted mission is held, not over; a running node is an
+    outcome unknown (D91); each is ``admit``'s to refuse, with its own reason."""
+    return state.outcome != "open" and not state.paused and not state.aborted and not state.running
 
 
 def _mission_state(
-    records: Sequence[Record], flow: Workflow, plan: Mission
+    records: Sequence[Record], flow: Workflow, node: str, plan: Mission
 ) -> tuple[str | None, missions.MissionState] | Refusal:
-    """The mission this run belongs to: the latest live, open mission the Builder appended for
-    ``flow`` (its ref and state), or a fresh fold of ``plan`` with no ref when none is open,
-    for the caller to append once the step is admitted. A refusal when an open mission names
-    the workflow but is not its plan: the runner trusts neither then."""
+    """The mission this run belongs to: the latest live mission the Builder appended for
+    ``flow`` (its ref and state), as the log has it — paused, aborted, failed or running
+    included, so ``admit`` answers about the real state. A fresh fold of ``plan``, with no
+    ref, only when there is no such mission, or when the latest is settled and ``node`` is
+    the workflow's first step: a new run starts at the start. A refusal when the latest
+    mission names the workflow but is not its plan: the runner trusts neither then."""
     folded = missions.fold_missions(records)
-    open_ones = [
+    ours = [
         m
         for m in folded.missions
-        if m.mission.actor == ACTOR_BUILDER
-        and m.mission.caused_by == [flow.ref]
-        and m.outcome == "open"
+        if m.mission.actor == ACTOR_BUILDER and m.mission.caused_by == [flow.ref]
     ]
-    if open_ones:
-        state = open_ones[-1]
+    first = flow.steps[0].id
+    if ours and not (_settled(ours[-1]) and node == first):
+        state = ours[-1]
         if not _same_plan(state.mission, plan):
             return Refusal(
                 f"mission {state.ref} names workflow {flow.ref} but does not match it; it is not "
@@ -762,6 +792,24 @@ def _mission_state(
         return state.ref, state
     fresh = missions.fold_missions([Record(_PENDING, 1, plan, 1)]).mission(_PENDING)
     return None, fresh
+
+
+def _linked_floor(root: Path, workspace: Path, writes: Sequence[str]) -> str | None:
+    """Why a declared write reaches a floor path through the filesystem, or ``None``.
+    ``floors.hit`` answered by name already (in ``_inside`` and in ``admit``); this is the
+    runner's half of ``missions`` rule 8, with a root in hand: ``floors.floored`` follows every
+    link on the way and looks where the write lands — against the workspace, where a link
+    ``plans -> kernel`` makes ``plans/meals.md`` a write under ``kernel/``, and against the
+    walle root with the path as the container would land it, where a link out of the
+    workspace reaches a principal's hot tier. A path that cannot be resolved is refused (D86)."""
+    for path in writes:
+        op = floors.Op(floors.Kind.WRITE, path)
+        if (found := floors.floored(workspace, op)) is not None:
+            return f"in the workspace, {found.reason}"
+        landed = floors.Op(floors.Kind.WRITE, str(workspace / path))
+        if (found := floors.floored(root, landed)) is not None:
+            return f"in the walle root, {found.reason}"
+    return None
 
 
 _PENDING = "d-pending:1"
@@ -817,11 +865,12 @@ def run_step(
     Builder workflow built from a live approval (read from the log as it is now); the
     workflow has no such step; no active automation names the workflow; the open mission in
     the log for it is not its plan; ``missions.admit`` refuses (a floored write, missions
-    off, paused, a breach, the step finished or not ready, the manifest); the step is already
-    running; or the container executor is off. Otherwise appends the mission (when none is
-    open) and ``running`` for the step on ``device``'s stream, hands the step to
-    ``executor.run``, and appends ``completed`` or ``failed`` with how it ended. There is no
-    other way for a step to run.
+    off, paused, a breach, the step finished or not ready, the manifest); a declared write
+    reaches a floor path through a link, in the workspace or in the walle root
+    (``floors.floored``); the step is already running; or the container executor is off.
+    Otherwise appends the mission (when none is open) and ``running`` for the step on
+    ``device``'s stream, hands the step to ``executor.run``, and appends ``completed`` or
+    ``failed`` with how it ended. There is no other way for a step to run.
 
     Raises, rather than refusing: ``ValueError`` for a malformed ref or an unsafe principal or
     device name, and for a workspace or token the executor's own checks refuse (missing, the
@@ -840,12 +889,16 @@ def run_step(
             f"workspace {str(workspace)!r} overlaps the walle root; a container there could "
             "reach the log"
         )
-    log = log_dir(root, principal)
+    log = paths.log_dir(root, principal)
     if not log.is_dir():
         # Checked before missions.lock is created: a misspelt principal must not get a folder.
         raise FileNotFoundError(f"{log}: no log for principal {principal!r}, nothing to run")
 
-    with _exclusive(missions_lock_path(root, principal)):
+    # Hold ``missions.lock`` exclusively for one decision to start a step (the walkthrough
+    # in the module docstring). "a": opening never truncates, and the file stays empty; the
+    # lock goes with close, which is before the container runs.
+    with open(paths.missions_lock_path(root, principal), "ab") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         records = index.update(root, principal).records
         try:
             flow = workflow(records, ref)
@@ -857,13 +910,15 @@ def run_step(
         if (why := _automation(records, ref)) is not None:
             return Refusal(why)
         plan = flow.mission(now_instant())
-        found = _mission_state(records, flow, plan)
+        found = _mission_state(records, flow, node, plan)
         if isinstance(found, Refusal):
             return found
         mission_ref, state = found
-        touch = Touch(reads=step.reads, writes=step.writes)
+        touch = manifest.Touch(reads=step.reads, writes=step.writes)
         if (refused := missions.admit(state, node, touch, environ)) is not None:
             return Refusal(refused.reason)
+        if (why := _linked_floor(root, workspace, step.writes)) is not None:
+            return Refusal(why)
         if state.node(node).status is StepStatus.RUNNING:
             # ``admit`` lets a running node through because it is also the check at each tool
             # call; starting a step is not a tool call, and its outcome is still unknown (D91).

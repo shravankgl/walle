@@ -92,7 +92,6 @@ from __future__ import annotations
 
 import json
 import os
-import posixpath
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -333,16 +332,6 @@ def scanned(action: Action, context: Context) -> tuple[str, ...]:
     )
 
 
-def _unanswerable(path: str) -> bool:
-    """Whether ``floors.hit`` has no answer by name for ``path``: absolute, or climbing out
-    through ``..``. ``hit`` returns ``None`` for those as for a clear path; here no answer is
-    a refusal (D86)."""
-    if posixpath.isabs(path):
-        return True
-    norm = posixpath.normpath(path) if path else "."
-    return norm == ".." or norm.startswith("../")
-
-
 def review(
     action: Action,
     context: Context,
@@ -383,14 +372,8 @@ def review(
         return Review(action, standing, decision, verdict, reason, model, paused)
 
     for path in action.touch.writes:
-        if _unanswerable(path):
-            return done(
-                "blocked",
-                None,
-                f"write {path!r} is blocked: absolute or climbing out, so the floor cannot be "
-                "answered by name and it is refused (D72, D86)",
-                model=None,
-            )
+        # ``hit`` answers ``unanswerable`` for an absolute or climbing path itself (issue
+        # #118): the same function and the same sentence as ``walle.missions.admit``.
         if (floor := hit(path)) is not None:
             return done(
                 "blocked",

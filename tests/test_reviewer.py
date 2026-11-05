@@ -677,9 +677,11 @@ def test_round_one_the_instructions_themselves_never_trip_the_scan() -> None:
     ],
 )
 def test_round_one_a_write_path_the_floor_cannot_answer_about_is_blocked(path: str) -> None:
-    """Finding 3a: ``floors.hit`` returns ``None`` for a path it cannot answer about by name
-    as well as for a clear one. Here, no answer is a refusal (D86)."""
-    assert reviewer.hit(path) is None  # the floor alone would have let it through
+    """Finding 3a, then issue #118: ``floors.hit`` used to return ``None`` for a path it
+    cannot answer about by name as well as for a clear one, and this module alone read that
+    as a refusal (D86). Now ``hit`` says ``unanswerable`` itself, so every gate does."""
+    found = reviewer.hit(path)
+    assert found is not None and found.how == "unanswerable"
     model = Scripted(_reply("allow"))
     action = Action(tool="file.write", arguments='{"text": "list"}', touch=Touch(writes=(path,)))
     for standing in Standing:

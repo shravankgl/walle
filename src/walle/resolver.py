@@ -74,8 +74,8 @@ from walle.events import (
     Proposal,
     Supersede,
     WorldTime,
-    parse_ref,
 )
+from walle.merge import ref_order
 
 if TYPE_CHECKING:  # annotations only: the fold takes records, it never reads them itself
     from collections.abc import Iterable
@@ -265,10 +265,6 @@ def _earliest(times: list[str]) -> str:
 # --- the fold ----------------------------------------------------------------------------
 
 
-def _ref_key(ref: str) -> tuple[str, int]:
-    return parse_ref(ref)
-
-
 def _by_ref(records: Iterable[Record]) -> dict[str, AnyEvent]:
     events: dict[str, AnyEvent] = {}
     for record in records:
@@ -290,13 +286,14 @@ def _liveness(events: dict[str, AnyEvent]) -> tuple[dict[str, bool], dict[str, l
     recursion limit. A cycle has no consistent answer and raises.
     """
     targeted_by: dict[str, list[str]] = {}
-    for ref in sorted(events, key=_ref_key):
+    ordered = ref_order(events)
+    for ref in ordered:
         event = events[ref]
         if isinstance(event, Supersede):
             targeted_by.setdefault(event.target, []).append(ref)
 
     live: dict[str, bool] = {}
-    for start in sorted(events, key=_ref_key):
+    for start in ordered:
         stack, on_path = [start], {start}
         while stack:
             ref = stack[-1]
@@ -323,10 +320,15 @@ def resolve(records: Iterable[Record]) -> Resolution:
 
     ``records`` is what ``walle.reader`` returns — one ``StreamContents``, or several chained.
     The same record passed twice counts once. The order they arrive in does not matter.
+
+    Nothing here is applied in sequence — a supersede and a contradiction name their refs —
+    so the fold needs no merge order, and its tuples are listed in ``walle.merge.ref_order``,
+    D57's ``(stream, seq)``: the one order a set of refs keeps when some of them are later
+    forgotten, which ``walle.consolidation`` relies on.
     """
     events = _by_ref(records)
     live, targeted_by = _liveness(events)
-    ordered = sorted(events, key=_ref_key)
+    ordered = ref_order(events)
     unapplied: list[Unapplied] = []
 
     for ref in ordered:
@@ -349,9 +351,7 @@ def resolve(records: Iterable[Record]) -> Resolution:
                 Unapplied(ref, f"names {', '.join(missing)}, which the fold was not given")
             )
             continue
-        sides = sorted(
-            {r for r in event.caused_by if isinstance(events[r], Assertion)}, key=_ref_key
-        )
+        sides = ref_order(r for r in event.caused_by if isinstance(events[r], Assertion))
         if len(sides) != 2:
             noun = "assertion" if len(sides) == 1 else "assertions"
             unapplied.append(Unapplied(ref, f"names {len(sides)} {noun}, not 2"))
@@ -384,7 +384,7 @@ def resolve(records: Iterable[Record]) -> Resolution:
             retired.append(Retired(ref, event, by, _earliest(stated) if stated else None))
             continue
         window = _window(event)
-        closed_by = tuple(sorted(closers.get(ref, ()), key=_ref_key))
+        closed_by = ref_order(closers.get(ref, ()))
         if closed_by:
             starts = [_start_of(events[c]) for c in closed_by]
             window = Window(event.valid_from, _earliest(starts))
@@ -413,7 +413,7 @@ def staged(records: Iterable[Record]) -> tuple[Staged, ...]:
     }
     return tuple(
         Staged(ref, event)
-        for ref in sorted(events, key=_ref_key)
+        for ref in ref_order(events)
         if isinstance(event := events[ref], Proposal) and live[ref] and ref not in decided
     )
 

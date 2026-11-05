@@ -215,3 +215,164 @@ then `test_step_two_cannot_run_before_step_one` and `test_a_step_already_running
 
 **Cost:** not visible to the author from inside the run; read it from the Hyperagent thread
 `cmw40wiot01iu07adsvodv4nr` (author) and the reviewer's run.
+
+---
+
+## Round 2 — review of a5c2de8 (Gemini 4 Argon): 1 high, 2 medium, 1 low
+
+Before pushing, the branch was checked for commits not mine: it held `f007016` (mine) and
+`a5c2de8` (GitHub's merge of main, requested by me via `update-branch`). Nothing else.
+
+**Failing tests first.** Fourteen new tests at the end of `tests/test_builder_chain.py`, all
+run against the branch head before the fix: 13 failed, one (`_plain_workspace_still_runs`)
+passed as the control it is.
+
+### 1 [high] `automations.add(workflow=)` could poison the log
+
+**Found.** `add` put whatever ref it was handed into `caused_by`. `index._dangling` refuses a
+log with a cause no stream holds, and the log is append-only, so a typo (`d-mbp:999`), a ref
+from another principal, or the add's own ref on an empty stream broke `index.update` and the
+rebuild for good. Reproduced; the index raised `DanglingRefError` after one call.
+
+**Fixed, twice.**
+- `automations.add` checks, under `automations.lock` and from the same read the register is
+  folded from, that `workflow` is a ref in this principal's log, and raises `RefusedError`
+  before anything is written. The event's own ref is never in the log at decision time, so a
+  self-reference is refused the same way.
+- **Centralised at the append** (`src/walle/writer.py`): `LockedStream.append` — the one
+  place a stream grows; `StreamWriter.append` delegates to it — now runs `_check_causes`
+  before a byte is written. Every ref in `caused_by` is looked for: on this stream through
+  the locked handle, on any other stream of the principal by reading its file. Missing refs
+  raise `DanglingCauseError` (a `ValueError`) naming them. A cause on this stream with the
+  seq about to be assigned is the event naming itself and is missing like any other.
+
+  *Why the other streams are read without their lock:* taking `LOCK_SH` on `d-phone` while
+  holding `LOCK_EX` on `d-mbp` deadlocks against a writer doing the same the other way. The
+  lockless read is sound because the reader's rules (D80) already make it so: a line is a
+  record only once its newline is on disk; the only line a concurrent writer can be mid-way
+  through is the last, which parses as torn and is skipped. Append-only means what was there
+  before the read stays; what was not there yet makes a cause missing, which refuses — fail
+  closed. This is written into the writer's module docstring.
+
+**Survey of every other writer that sets `caused_by`** (asked for by the owner):
+
+| writer | cause comes from | dangling possible before this round? |
+|---|---|---|
+| `staging.keep/edit` (`_assertion`) | `item.ref`, read from the log under `staging.lock` | no |
+| `builder.stage` | `draft.source`, which `approved(records, …)` found in the log | no — but only if the caller built the draft from the same principal's records; now the writer refuses otherwise |
+| `builder.run_step` (mission, steps) | `flow.ref` from the log; the mission ref just written on this stream | no |
+| `curator` (merge/fusion) | `pair.sides`, `fusion.sources` from the fold | no |
+| `proposer` | `candidate.observation` from the records it read | no |
+| `context._write` (edit) | `old_ref` from the ledger; `new_ref` just written on this stream | no |
+| `missions.abort_step` | `spent_from` from the fold | no |
+| `automations.add` with `retire=` | the retire just written on this stream | no |
+| `automations.add` with `workflow=` | **a bare string from the caller** | **yes — the finding** |
+
+So the hole was the one the reviewer found; everything else derives its cause from a record
+it has in hand. The writer's check is still worth having: it turns "every caller got it
+right" into "no caller can get it wrong", which is what an append-only log needs.
+`Supersede.target`, `Step.mission` and `Automation.target` are not `caused_by` and are not
+checked by `index._dangling`; a dangling one there is reported by its fold, not a broken
+index, so they are left as they are (noted below).
+
+**Tests edited because the task required it:** three pre-existing tests planted a dangling
+or cyclic cause *through `StreamWriter`* to exercise the index's and `why`'s defence
+(`test_index.py::test_a_dangling_caused_by_fails_the_build`,
+`test_walle_rebuild_fails_loudly_on_a_dangling_ref`,
+`test_why.py::test_a_cycle_in_caused_by_still_ends`). The writer now refuses exactly that,
+so they plant the line by hand (`_append_raw` / `write_bytes`), as a hand-edited log would
+hold it; the first also asserts the writer refuses. The defences they test are unchanged.
+`_append_raw` gained a `mkdir` for the test that starts from an empty root.
+
+New tests: the two refused adds with the index asserted green afterwards (`update` and
+`rebuild`); the self-reference; `test_no_writer_can_append_a_cause_the_log_does_not_hold`
+(both appends, four kinds of missing ref, nothing written, index green, then a cross-stream
+cause and a same-stream cause accepted); and a source-level test that `paths.stream_path` is
+spelled only by the reader, the writer and a profile's read-only property, and that both
+appends in the writer go through `_check_causes`.
+
+### 2 [medium] `_mission_state` dropped every mission that was not `open`
+
+**Found.** `outcome == "open"` was the filter, so a paused mission after a failure, an
+aborted one (D22's `abort_step` marks the node failed), and one with a node still running
+beside a failed one were all ignored and a fresh mission opened; and step 2 of a mission
+whose step 2 had failed was refused "not ready: waiting on write-plan" off a fresh fold — a
+lie about a step that had already run.
+
+**Fixed.** `_mission_state` takes the latest Builder mission for the workflow whatever its
+state, and folds a fresh plan only when there is none, or when the latest is *settled*
+(`_settled`: every node finished, not paused, not aborted, no node running) **and** the node
+asked for is the workflow's first step — a new run starts at the start. Everything else is
+`admit`'s to answer: "mission is paused", "aborted: …", "already failed", "already running".
+`_same_plan` now ignores the two budget fields on a node: the Builder writes none, and a
+budget a person added narrows spend without widening the manifest, so a budgeted copy of the
+plan is still the plan and its breach is refused as a breach rather than as "not the plan".
+Tests: one per case the reviewer listed, plus `_fresh_mission_opens_only_at_the_first_step`.
+
+### 3 [medium] `run_step` never asked `floors.floored`
+
+**Found.** `floors.hit` is lexical. `plans -> kernel` inside the workspace made
+`plans/meals.md` a write under `kernel/`, and the step ran.
+
+**Fixed.** `_linked_floor`, called after `admit` and before anything is appended: for each
+declared write, `floors.floored(workspace, Op(WRITE, path))` — the shared answer from #123,
+following every link and looking where the write lands — and then
+`floors.floored(root, Op(WRITE, workspace/path))`, so a link *out* of the workspace into the
+walle root's floors is caught too. An unresolvable path (a link loop) is refused (D86). The
+refusal carries `floors`' own sentence, prefixed with which root it was found against. Tests:
+links to `kernel`, `principals/p-maya/hot` and `SHARED` inside the workspace; a link out to
+the real hot tier; a loop; and a control where a harmless link still runs.
+
+Reads are not checked against the floor: the floor is under writes (D72), as before.
+
+### 4 [low] merge main (#123, #125)
+
+Merged `57e3a98`. One conflict, in `_inside`: #123 replaced the hand-rolled relative/`..`
+check with `floors.segments`; this branch had added the floor check after it. Resolved by
+keeping #123's `segments` and asking `floors.hit` on `"/".join(parts)` for a write. #125's
+fold order change needed nothing here; the suite is green on it.
+
+### How the round was pushed
+
+The `walle-github` skill writes single-parent commits only, so the merge with main was
+pushed as one flat commit on `a5c2de8` carrying the merged tree (my round-2 files and the
+#123/#125 files alike), followed by `update-branch`, which records main as an ancestor. That
+only works if GitHub's merge is clean, so it was simulated locally first: the first two
+tries conflicted (`_inside`, then the import block, where #123 and this branch edited
+adjacent lines). Resolved by keeping `_inside` byte-identical to #123's and moving the floor
+check into its caller as `_floored_by_name`, and by taking the new imports through the
+existing `from walle import …` line. The simulated merge then produced exactly the reference
+tree the four checks ran on.
+
+### Checks, round 2
+
+```
+$ uv run pytest
+4188 passed, 35 skipped in 133.50s (0:02:13)
+$ uv run ruff check
+All checks passed!
+$ uv run ruff format --check
+204 files already formatted
+$ uv run pyright
+0 errors, 0 warnings, 0 informations
+```
+
+### Stranger pass, round 2
+
+- `_check_causes` runs before the first-append `fsync` of the directory, so a refusal on a
+  brand-new stream leaves no file content and no durable entry to explain.
+- `read()` on the locked handle seeks to the end and back; `append` seeks to the end again
+  before writing, so the position is not trusted across the check.
+- `Node` is frozen; the aborted-mission test builds its budgeted plan with `model_copy`.
+  That is what surfaced the `_same_plan` budget question above.
+- `_linked_floor` is placed after `admit` so a lexical floor hit is still reported in
+  `admit`'s words (one refusal, one voice), and before any append.
+
+### Noticed, not done (round 2)
+
+- `Supersede.target`, `Step.mission`, `Automation.target` are refs the writer does not check;
+  their folds report a dangling one rather than fail. Checking them at the append would be
+  the same six lines in `_check_causes`, but it changes what a tombstone of a not-yet-synced
+  event means across devices, which is a decision, not a fix.
+- The writer's own-stream check parses the whole stream on every append that has a cause.
+  Fine for Phase 0 logs; a tail cache under the lock is the obvious next step if it shows.

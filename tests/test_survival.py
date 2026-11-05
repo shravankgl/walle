@@ -27,7 +27,7 @@ import pytest
 from pydantic import ValidationError
 
 from test_constraints import forbidden_in_closure
-from walle import survival
+from walle import automations, survival
 from walle.events import (
     ACTOR_KERNEL,
     ACTOR_USER,
@@ -443,3 +443,51 @@ def test_survival_over_the_golden_log_is_the_one_it_shipped_with(tmp_path: Path)
     assert [e.ref for e in from_log.not_yet] == ["d-mbp:4"]
     assert [u.ref for u in from_log.unapplied] == ["d-mbp:11"]
     assert from_log.rate == pytest.approx(1 / 3)
+
+
+# --- issue #120 (audit 5.1): the register and the report agree across devices ----------------
+
+
+def test_a_swap_from_the_laptop_keeps_the_phones_automation_and_its_runs(tmp_path: Path) -> None:
+    """The audit's reproduction, through the real write paths. ``gym-class`` was added and
+    ran on the phone; six more and a swap that retires it come from the laptop. Folded in
+    stream order the swap missed, ``gym-class`` vanished from the register and its run was
+    reported as naming nothing. In time order the retire lands, the automation is in the
+    cohort as retired, and nothing is unapplied."""
+    both = {**ON, automations.AUTOMATIONS_SWITCH: automations.SWITCH_ON}
+    gym = automations.add(tmp_path, P, "phone", name="gym-class", title="Gym", environ=both)
+    ran = survival.record(tmp_path, P, "phone", "gym-class", "ok", environ=both)
+    for i in range(1, 7):
+        automations.add(tmp_path, P, "mbp", name=f"a-{i}", title=f"A {i}", environ=both)
+    automations.add(tmp_path, P, "mbp", name="a-7", title="A 7", retire="gym-class", environ=both)
+
+    register = automations.fold_automations(_records(tmp_path))
+    assert register.unapplied == ()
+    assert [e.name for e in register.entries] == ["gym-class", *(f"a-{i}" for i in range(1, 8))]
+    assert register.entry(gym.ref) is not None and register.entry(gym.ref).status == "retired"  # type: ignore[union-attr]
+
+    report = survival.report(tmp_path, P, as_of=datetime(2027, 1, 1, tzinfo=UTC))
+    assert report.unapplied == ()
+    assert ran == "d-phone:2"
+    verdict = _verdict(report, gym.ref)
+    assert verdict.survived is False and "retired" in verdict.reason
+    assert [e.ref for e in report.not_yet] == []
+    assert len(report.cohort) == 8
+
+
+def test_outcomes_on_two_devices_are_counted_in_time_order(tmp_path: Path) -> None:
+    """Hand-written stamps: the add on the phone, the retire on the laptop, runs on both.
+    Every run before the retire counts; the report is the same from any order of records."""
+    added = _add(tmp_path, "gym-class", day=0, device="phone")
+    _ran(tmp_path, added, day=5, device="mbp")
+    _ran(tmp_path, added, day=12, device="phone")
+    _retire(tmp_path, added, day=40)
+
+    report = _report(tmp_path, 45)
+    assert report.unapplied == ()
+    verdict = _verdict(report, added)
+    assert verdict.survived is False and verdict.last_ok == _ts(12)
+    records = _records(tmp_path)
+    as_of = T0 + timedelta(days=45)
+    assert survival.survival(reversed(records), as_of=as_of) == report
+    assert survival.survival([*records, *records], as_of=as_of) == report
