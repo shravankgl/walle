@@ -17,6 +17,7 @@ things it does:
 
       run --rm --init --name walle-<token> --label walle.executor=<token>
           --mount type=bind,source=<workspace>,target=/workspace --workdir /workspace
+          --user <uid>:<gid>
           --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m
           --network none --cap-drop ALL --security-opt no-new-privileges
           --memory <m> --memory-swap <m> --cpus <c> --pids-limit <p>
@@ -24,6 +25,11 @@ things it does:
 
   The root filesystem is read-only and ``/tmp`` is a private tmpfs nothing can execute from,
   so the workspace is the only place a write can land and the only place one is looked for.
+  The process runs as the workspace's owner on the host (``--user``), because with every
+  capability dropped even root has no ``CAP_DAC_OVERRIDE`` and cannot write a folder it does
+  not own — the first real-container run (CI) proved that — and because files the step
+  leaves behind should belong to the person, not to root. OrbStack remaps bind-mount
+  ownership to the container's user under runc, so the same flag holds on the Mac.
   ``--memory-swap`` equal to ``--memory`` is how the CLI spells "no swap". Nothing from the
   host environment is passed in: ``docker run`` gives a container an empty environment
   unless told otherwise, and it is not told.
@@ -47,9 +53,10 @@ workspace must be an existing absolute directory that is neither ``/`` nor the h
 resolved so a symlink cannot point the mount elsewhere.
 
 What this module does not do: it does not decide *what* runs (that is the mission's manifest
-and ``walle.missions.admit``), it does not choose a user inside the container, and it does not
-pull images ahead of time. The escape attempts that prove the boundary are
-``tests/test_executor_escape.py`` and need a daemon; the unit tests drive a fake client.
+and ``walle.missions.admit``), it sets no environment inside the container (not even
+``HOME``), and it does not pull images ahead of time. The escape attempts that prove the
+boundary are ``tests/test_executor_escape.py`` and need a daemon; the unit tests drive a fake
+client.
 """
 
 from __future__ import annotations
@@ -247,11 +254,13 @@ def _check_token(token: str) -> str:
 def plan(job: Job, *, token: str) -> tuple[str, ...]:
     """The ``docker run`` argv for ``job``, after the client: the boundary as a list of strings.
 
-    Starts no process. ``token`` names and labels the container; ``run`` makes one when the
-    caller has none. Raises ``ValueError`` for a workspace or token that fails its check.
+    Starts no process, but does ``stat`` the workspace for its owner. ``token`` names and
+    labels the container; ``run`` makes one when the caller has none. Raises ``ValueError``
+    for a workspace or token that fails its check.
     """
     workspace = check_workspace(job.workspace)
     token = _check_token(token)
+    owner = workspace.stat()
     return (
         "run",
         "--rm",
@@ -264,6 +273,8 @@ def plan(job: Job, *, token: str) -> tuple[str, ...]:
         f"type=bind,source={workspace},target={MOUNT_POINT}",
         "--workdir",
         MOUNT_POINT,
+        "--user",
+        f"{owner.st_uid}:{owner.st_gid}",
         "--read-only",
         "--tmpfs",
         TMPFS,

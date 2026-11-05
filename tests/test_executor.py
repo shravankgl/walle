@@ -1,9 +1,10 @@
 """Issue #72's container executor, without a container (D68, D99, D117).
 
   the plan is the boundary   the ``docker run`` the executor builds mounts the workspace and
-                             nothing else, drops every capability, forbids new privileges, caps
-                             memory, CPU and PIDs, closes the network, and labels the container
-                             so a crashed parent's child can be found
+                             nothing else, runs as the workspace's owner, drops every
+                             capability, forbids new privileges, caps memory, CPU and PIDs,
+                             closes the network, and labels the container so a crashed
+                             parent's child can be found
   the client is driven       with a fake ``docker`` standing in for the real one: the argv the
                              fake records is the plan exactly, the outcome carries exit code and
                              output, a hang is killed and the container removed by name, and the
@@ -111,6 +112,16 @@ def test_only_the_workspace_is_mounted(tmp_path: Path) -> None:
     assert mounts == [f"type=bind,source={ws.resolve()},target={MOUNT_POINT}"]
     assert "-v" not in argv and "--volume" not in argv and "--volumes-from" not in argv
     assert _flag(argv, "--workdir") == [MOUNT_POINT]
+
+
+def test_the_process_runs_as_the_workspace_owner_not_as_root(tmp_path: Path) -> None:
+    """With every capability dropped, root has no ``CAP_DAC_OVERRIDE`` and cannot write a
+    folder it does not own; the owner can, and what the step leaves behind is the owner's."""
+    ws = _workspace(tmp_path)
+    owner = ws.stat()
+    argv = plan(Job(ws, ("true",)), token=TOKEN)
+    assert _flag(argv, "--user") == [f"{owner.st_uid}:{owner.st_gid}"]
+    assert "--privileged" not in argv
 
 
 def test_the_root_filesystem_is_read_only_with_a_private_tmp(tmp_path: Path) -> None:

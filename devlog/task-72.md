@@ -5,12 +5,13 @@ task (R8). Nothing in this build calls it: there is still no runner, and the swi
 is the executor a runner will hand a step to once `admit` (task 68) has let it through, and the
 exact shape of the container it gets.
 
-**The escape attempts have not run.** This VM has no `docker` client and no daemon, so every
-test in `tests/test_executor_escape.py` skipped here, with that reason. They need the owner's
-Mac (OrbStack) before this merges — see *Verify* for the one command. Nothing below claims the
-boundary holds in a real container; it claims the plan says what D68 asks for, and that the
-tests which would prove it exist, skip honestly, and refuse to skip when told the daemon must be
-there.
+**The escape attempts have not run on the Mac.** This VM has no `docker` client and no daemon,
+so every test in `tests/test_executor_escape.py` skipped here, with that reason. They did run on
+GitHub's Linux runner, which turned out to have a daemon (see *Fourth commit*): on the third
+commit 17 of 19 passed there and 2 failed for one reason, now fixed. That is a Linux kernel
+under Docker Engine, not the owner's machine under OrbStack; the issue asks for the Mac run
+before this merges — see *Verify* for the one command. Nothing below claims the boundary holds
+on the Mac.
 
 **Shipped:**
 - `src/walle/executor.py`, new, about 370 lines, half of them docstring. Imports `os`, `re`,
@@ -172,9 +173,51 @@ uv run ruff format --check  138 files already formatted
 uv run pyright              0 errors, 0 warnings, 0 informations
 ```
 
-If CI is red again after this commit, the log is the next thing to read, and it needs someone
-who can — the owner, or a reviewer agent whose scope includes Actions logs. The escape tests
-have still not been run by me, anywhere.
+**Fourth commit, with the CI log in hand.** Red again on the third commit, so I stopped
+guessing and read the job log through the skill's token (`GET
+/repos/…/actions/jobs/<id>/logs`, a read of this PR's own CI; the GitHub integration's scope
+has no Actions tool). The facts: **`2 failed, 2248 passed, 4 skipped`** — the runner has a
+daemon, the escape tests ran, 17 of 19 passed in a real Linux container, and the two failures
+share one cause:
+
+```
+FAILED test_a_write_inside_the_workspace_reaches_the_host
+       AssertionError: sh: can't create made.txt: Permission denied
+FAILED test_a_write_outside_the_workspace_is_refused[/root/escaped]
+       PermissionError: [Errno 13] Permission denied: '/root/escaped'
+```
+
+- **Root with every capability dropped has no `CAP_DAC_OVERRIDE`**, so it cannot write a
+  bind-mounted folder owned by uid 1001 and mode 755. The boundary was *stronger* than the
+  harness assumed — the one positive test failed, not an escape. The fix is `--user
+  <uid>:<gid>`, the workspace's owner as the host `stat`s it: on Linux that is the one identity
+  that can write the one folder it is given, and it also closes the "noticed, not done" item
+  about root-owned files in the person's workspace. On the Mac, OrbStack remaps bind-mount
+  ownership to the container's user under runc (orbstack/orbstack#2530: "the host→container
+  ownership remap that makes bind mounts writable under runc"), so the same flag holds there;
+  Docker Desktop behaves alike. `test_the_process_runs_as_the_workspace_owner_not_as_root` pins
+  it, and the positive escape test now also asserts the file it made belongs to the owner.
+- **`/root/escaped`** was the host-side check raising, not the container: `Path.exists()` under
+  a `/root` the runner user cannot enter raises `PermissionError` on that kernel. Replaced by
+  `/var/escaped`; the container's own refusal of `/root` adds nothing a non-root process cannot
+  already not do.
+
+What this does to the other escape tests, thought through for a non-root process: `CapPrm`
+and `CapEff` are zero for any non-root process, so `CapBnd` zero is now the assertion that
+carries weight (the docstring says so); `chown` on the writable `/tmp` file fails with
+"Operation not permitted" rather than by read-only root, which is the test's point; cgroup
+files are world-readable; `/proc/self/*` is its own. The fork storm, the timeout and the orphan
+are unchanged. The two earlier "most likely" paragraphs above were partly right (the daemon,
+the fork storm — ash does die, and that test is among the 17 that passed on the third commit)
+and partly wrong (the `rm --force` race did not show in this log; the fix stands as a
+correctness fix, but it was not the red).
+
+```
+uv run pytest               2161 passed, 29 skipped in 87.07s
+uv run ruff check           All checks passed!
+uv run ruff format --check  138 files already formatted
+uv run pyright              0 errors, 0 warnings, 0 informations
+```
 
 **Two-runner walkthrough:** the executor touches no log, lock or derived file. The shared thing
 is the daemon. Writers A and B each `run` a job: each makes its own 16-hex token, so the two
@@ -216,10 +259,10 @@ a decode that could raise on a stray byte (`errors="replace"` throughout).
   there because real tools need one; `noexec` so it cannot become a staging area.
 - **`--init`.** A `sh -c` child that forks leaves zombies without a reaper; `tini` as PID 1 is
   one CLI flag and standard.
-- **No `--user`.** The process runs as the image's default user (root, in Alpine) with an empty
-  capability set and a read-only root. Choosing a uid is a decision about file ownership in the
-  owner's workspace (on Linux, files written as root in a bind mount are root's), which varies
-  by host and is not in the issue. Noted below.
+- **`--user` is the workspace's owner** (fourth commit; the first three commits ran as root and
+  CI showed why that cannot write the workspace once every capability is gone). The uid is read
+  from the host, not configured, so there is nothing to get wrong. No `HOME` is set inside; a
+  tool that needs one is a later decision. Noted below.
 - **The timeout covers the image pull.** A first run against a missing image may be killed by a
   short timeout, and `removed` will then be `False` with "No such container". The alternative —
   a separate pull step — is more surface for one task. The escape tests pull once up front.
@@ -245,15 +288,19 @@ which is the skip-or-fail rule, and `test_the_escape_tests_fail_rather_than_skip
 required`, which proves it from outside.
 
 **Noticed, not done:**
-- **CI has a daemon, most likely.** GitHub's `ubuntu-latest` runners ship Docker, so the escape
-  tests run there rather than skip, contrary to the issue's expectation (see the second commit).
-  If they pass there, that is extra evidence from a Linux kernel; the owner's Mac run is still
-  the one the issue asks for. If the owner would rather CI never start a container, a marker
-  and a `-m "not escape"` in `ci.yml` is a one-line change — but `ci.yml` is not this task's.
-- **The author agent cannot read CI logs.** Its GitHub scope has no Actions log tool, and the
-  REST log endpoint needs a token. A red `check` is then a guess from the diff. Worth a
-  `check-logs` subcommand in the `walle-github` skill, or the Actions toolset in the scope.
-- **`--user`** (above): the file ownership story for a Linux host is open.
+- **CI has a daemon** — a fact now, from the log. The escape tests run on every PR on a Linux
+  kernel, contrary to the issue's expectation. That is good evidence and a slower `check` (the
+  step took 88–113 s against about 75 s of unit tests). If the owner would rather CI never start
+  a container, a marker and `-m "not escape"` in `ci.yml` is a one-line change — `ci.yml` is
+  not this task's.
+- **The author agent could not read CI logs through its integration.** The GitHub MCP scope has
+  no Actions tool; the REST log endpoint needs the token, which only the skill carries. Three
+  commits were pushed on inference before I used the skill's token for a plain `GET` of the
+  job log. A `check-logs` subcommand in `walle-github` would make that the first move, not the
+  fourth.
+- **No `HOME` inside the container.** The process runs as a uid the image has no passwd entry
+  for; busybox does not mind, Python and git might want `HOME`. One `--env HOME=/tmp` when a
+  runner needs it — but then the "no `--env`" test changes, and that is a decision.
 - **A `-v`/`--volume` for the srt profile's reads** (D99) is not here; this executor mounts one
   folder. A Builder step that needs a read-only view of a second path needs a second mount
   kind, declared from the manifest's `reads`.

@@ -12,8 +12,9 @@ test, not a quiet pass. Without it, the skip reason says how to set it.
 
 What is attempted, and what must hold, each in its own test:
 
-  write outside the workspace      the root filesystem is read-only; ``/`` and ``/etc`` refuse
-                                   a new file, and nothing lands on the host
+  write outside the workspace      the root filesystem is read-only; ``/``, ``/etc``, ``/usr``
+                                   and ``/var`` refuse a new file, and nothing lands on the host
+                                   (``/root`` is not tried: the host cannot look there either)
   read beside the workspace        a sibling folder of the workspace, holding a synthetic
                                    secret, is not in the container at any path
   keep a capability                the effective capability set is empty; ``mount`` and
@@ -126,17 +127,20 @@ def _containers(label: str) -> list[str]:
 # --- the workspace itself works ---------------------------------------------------------------
 
 
-def test_a_write_inside_the_workspace_reaches_the_host(workspace: Path) -> None:
+def test_a_write_inside_the_workspace_reaches_the_host_and_belongs_to_its_owner(
+    workspace: Path,
+) -> None:
     outcome = _sh(workspace, "cat inside.txt && echo made-inside > made.txt")
     assert outcome.exit_code == 0, outcome.stderr
     assert outcome.stdout == "synthetic workspace file\n"
     assert (workspace / "made.txt").read_text() == "made-inside\n"
+    assert (workspace / "made.txt").stat().st_uid == workspace.stat().st_uid
 
 
 # --- write outside the workspace ----------------------------------------------------------------
 
 
-@pytest.mark.parametrize("target", ["/escaped", "/etc/escaped", "/usr/escaped", "/root/escaped"])
+@pytest.mark.parametrize("target", ["/escaped", "/etc/escaped", "/usr/escaped", "/var/escaped"])
 def test_a_write_outside_the_workspace_is_refused(workspace: Path, target: str) -> None:
     outcome = _sh(workspace, f"echo x > {target}")
     assert outcome.exit_code != 0
@@ -184,6 +188,8 @@ def test_only_one_mount_is_a_bind_from_the_host(workspace: Path) -> None:
 
 
 def test_the_effective_capability_set_is_empty(workspace: Path) -> None:
+    """``CapBnd`` is the one that matters for a non-root process: nothing ``setuid`` or
+    file-capability could ever hand back."""
     outcome = _sh(workspace, "grep -E '^Cap(Eff|Prm|Bnd):' /proc/self/status")
     assert outcome.exit_code == 0, outcome.stderr
     values = {line.split()[0]: line.split()[1] for line in outcome.stdout.splitlines()}
