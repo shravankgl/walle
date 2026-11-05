@@ -157,9 +157,9 @@ def _snippet_command(root: Path) -> str:
     entry = _snippet()["hooks"]["SessionStart"][0]["hooks"][0]  # type: ignore[index]
     command: str = entry["command"]
     return (
-        command.replace("/path/to/walle/.venv/bin/walle-hook", shlex.quote(str(SCRIPT)))
-        .replace("/path/to/walle-data", shlex.quote(str(root)))
-        .replace("--principal maya", f"--principal {P}")
+        command.replace("/Users/you/.local/bin/walle-hook", shlex.quote(str(SCRIPT)))
+        .replace("/Users/you/walle-data", shlex.quote(str(root)))
+        .replace("--principal me", f"--principal {P}")
     )
 
 
@@ -439,7 +439,7 @@ def test_the_install_snippet_is_documentation_with_an_outer_timeout() -> None:
     assert "matcher" not in entry, "no matcher: startup, resume, clear and compact all get it"
     (command,) = entry["hooks"]
     assert command["type"] == "command"
-    assert command["command"].split()[0].endswith("/.venv/bin/walle-hook")
+    assert command["command"].split()[0].endswith("/.local/bin/walle-hook")
     assert command["timeout"] > hook.BUDGET, "the host's timeout is the guard behind ours"
 
 

@@ -267,17 +267,28 @@ def test_every_credential_says_it_is_fake() -> None:
                 assert any(re.fullmatch(s, marker) for s in SECRET_SHAPES), (item.id, marker)
     for token in re.findall(r"FAKE-[\w-]*", all_text()):
         assert re.fullmatch(FAKE_SECRET, token), token
-    passphrases = [i for i in all_items() if i.template == "passphrase"]
+    passphrases = [i for i in all_items() if i.template in ("passphrase", "joined-passphrase")]
     zeros = [i for i in all_items() if i.template == "card-security-code"]
     assert passphrases and zeros, "the word-shaped and the short digit-shaped secret are both here"
+    assert {i.template for i in passphrases} == {"passphrase", "joined-passphrase"}
     for item in passphrases:
         assert all(not any(c.isdigit() for c in m) for m in item.markers), item.id
 
 
 def test_a_secret_that_does_not_say_it_is_fake_is_rejected() -> None:
     good = sample()
-    turns = [{"role": "user", "text": "pin hunter2 4821 correct horse battery staple"}]
-    for marker in ("hunter2", "4821", "correct horse battery staple"):
+    turns = [
+        {
+            "role": "user",
+            "text": "pin hunter2 4821 correct horse battery staple correct-horse-battery-staple",
+        }
+    ]
+    for marker in (
+        "hunter2",
+        "4821",
+        "correct horse battery staple",
+        "correct-horse-battery-staple",
+    ):
         with pytest.raises(ValidationError, match="not shaped"):
             Item.model_validate(
                 good

@@ -2,8 +2,10 @@
 
 > A forward deployment engineer for anyone.
 
-**Status:** Phase 0 implementation, not yet usable. Agents are building it and code lands before
-human review (R6) — see [PLAN.md](PLAN.md) §9 and [devlog/](devlog/). Package name: `walle` (D105).
+**Status:** Phase 0 implementation. It installs and runs (below), but it is early, built largely
+by agents, and code lands before human review (R6) — see [PLAN.md](PLAN.md) §9 and
+[devlog/](devlog/). The [status table](#what-works-and-what-is-untested) says what has been tested
+and how. Package name: `walle` (D105).
 
 Built solo, evenings and weekends. Each phase ships an article alongside the code — see
 [PLAN.md](PLAN.md) §4.
@@ -69,11 +71,100 @@ and carry it to a different model vendor.
 6. **Trust is earned per domain.** Observe → propose → act-with-confirm → autonomous-bounded.
    Trusted with your calendar is not trusted with your money.
 
+## Install
+
+You need [`uv`](https://docs.astral.sh/uv/getting-started/installation/) (on a Mac,
+`curl -LsSf https://astral.sh/uv/install.sh | sh`). Then one command installs `walle`,
+`walle-hook` and `walle-mcp`:
+
+```sh
+uv tool install --python 3.12 https://github.com/shravankgl/walle/archive/refs/heads/main.zip
+```
+
+and one line gives Claude Code its memory:
+
+```sh
+claude mcp add walle -- walle-mcp --root ~/walle-data --principal me --device mac
+```
+
+- `--python 3.12` matters. Without it, uv builds the tool on the first Python it finds, which on
+  a fresh Mac is the system's 3.9, and the install fails; with it, uv downloads 3.12 itself.
+- The source is a GitHub archive of `main`, not a `git+` URL, because a fresh Mac has no `git`
+  until the developer tools are installed. walle is **not on PyPI**, so `uvx walle` does not
+  work yet, and a package called `walle` on PyPI is not this project.
+- `~/walle-data` is created on first use. `me` is whose memory it is and `mac` names this
+  machine's stream; pick your own.
+- If uv says its bin folder is not on your `PATH`, run `uv tool update-shell` and open a new
+  terminal before the `claude mcp add` line.
+- `walle --help` lists the rest. The usual first loop: Claude calls `remember`, which only
+  stages; you run `walle review --root ~/walle-data --principal me --device mac` to keep or
+  drop; `walle render --root ~/walle-data --principal me` writes the hot tier; and the
+  [SessionStart hook](#install-the-sessionstart-hook) puts it in every new session.
+- To remove it: `uv tool uninstall walle` and `claude mcp remove walle`. Your memory stays in
+  `~/walle-data` as plain JSONL until you delete it.
+
+## Measured
+
+D69 and D102: every number here was measured, by the command beside it, and anything that was
+not measured says so. The numbers were taken on 2026-11-05 in the build agent's sandbox, a
+2-core Linux x86_64 container on an xfs disk, Python 3.12.16. **Not on a Mac**: `fsync`, which
+dominates persist, costs very differently on a laptop SSD, so re-run `walle bench` on your own
+machine before quoting these.
+
+| What | Measured | Command |
+|---|---|---|
+| Tool schema, all three MCP tools (D102) | 1,102 characters, about **368 tokens** (characters / 3); cap 400, enforced by a test | `walle-mcp --root /tmp/walle-bench-100 --principal bench --device bench --measure` |
+| Hot tier, 1 fact | 2,065 characters, about **517 tokens** (characters / 4) | `walle remember`, `walle review`, `walle render`, then `walle-hook … --measure` (as in [the hook section](#install-the-sessionstart-hook)) |
+| Hot tier, 80 live facts | 8,911 characters, about **2,228 tokens**, index mode | `walle bench --events 100 --root /tmp/walle-bench-100`; the same figure from `walle-hook --root /tmp/walle-bench-100 --principal bench --measure` |
+| Hot tier, 800 live facts | 63,633 characters, about **15,909 tokens**, index mode: **over Claude Code's 10,000-character cap**, so the host shows the model a file path and a preview instead | `walle bench` |
+| Persist: one `fsync`ed append | median **0.18 ms**, p95 0.21 ms, over 1,000 appends | `walle bench` |
+| Replay: read and fold 1,000 events from the log, no index | median **14.59 ms**, p95 16.13 ms, 5 runs | `walle bench` |
+| Recover: delete the index, rebuild from the log, fold | median **64.53 ms**, p95 113.68 ms, 5 runs; state hash equal after rebuild | `walle bench` |
+| Replay / recover at 100 events | median 1.47 ms / 7.50 ms | `walle bench --events 100 --root /tmp/walle-bench-100` |
+| Hook, whole process: start Python, read the hot tier, answer (1-fact profile) | **29 ms** on average over 20 runs (0.581 s in all); the hook's own `--measure`, which starts its clock after Python is up, says 3 ms | `time (for i in $(seq 20); do echo '{"hook_event_name": "SessionStart"}' \| walle-hook --root ~/walle-data --principal me >/dev/null; done)` |
+| Resident tokens on a real person's memory | **not measured**: there is no real profile in this repository, by design | — |
+| Any of the above on a Mac | **not measured** | — |
+| Install, nothing cached, Python 3.12 downloaded by uv | 2.8 s to 3.5 s over three runs in the sandbox; **on a fresh Mac, not measured** | the install command above, timed with `time` |
+
+Token counts are estimates (characters / 4 for the hot tier, / 3, the safe side, for the
+schema): Claude's tokenizer is not available offline. `walle bench` writes only synthetic data
+into a folder that must be absent or empty; nine events in ten are made-up household facts and
+every tenth retracts the one before it.
+
+## What works and what is untested
+
+| Part | Status |
+|---|---|
+| Log, writer, reader, resolver, SQLite index, rebuild | **Working**, tested: concurrent writers, torn tails, golden logs per schema version (D88) |
+| `walle remember` / `review` / `forget` / `why` / `context` / `render` | **Working**, tested with the CLI runner and run by hand on a fresh install |
+| `walle-mcp` (`recall`, `remember`, `why`, the hot-tier resource) | **Working** over stdio, tested in-process and, from a fresh install, by a real stdio client. Not yet exercised inside a real Claude Code session by the agents who built it |
+| SessionStart hook | Tested with fake hook payloads. Not yet verified by the agents inside a real Claude Code session |
+| Transcript observer (`walle observe`) | Tested on synthetic transcripts only |
+| Proposer and curator | Tested with the fake model only |
+| **Model route** (`provider:model` through aisuite, ollama as the local tier) | **Tested against fakes only.** No real provider and no real ollama has been called by the tests |
+| **Google connectors** (Gmail, Google Calendar) | **Tested against fakes only.** Neither has talked to a real Google account |
+| **ACP client** (a second host, [#66](https://github.com/shravankgl/walle/pull/66)) | **Tested against fakes only**, and not on `main` at the time of writing |
+| `srt` sandbox profile | Written to the `srt` documentation; **not verified under `srt`** (see below) |
+| Boundary eval with a real model; LongMemEval and LoCoMo | **Not run** (see [Evals](#evals)). `walle eval` also needs a checkout, for `tests/corpora` |
+| Install on a fresh Mac | **Not verified on a Mac.** In a Linux sandbox: the command above installed from GitHub with an empty home folder and neither `git` nor any Python on `PATH`; and `tests/test_packaging.py` installs this checkout's wheel the same way with only a system Python 3.9 on `PATH`, then starts the server with the `claude mcp add` line's command and stages a memory through a real stdio client. Claude Code itself was not run |
+
+## Support
+
+Built by one person, on evenings and weekends (PLAN §2, "guard the hours").
+
+- **Issues** are welcome and read when there is time. There is no response time.
+- **Pull requests are declined.** The work is planned in [PLAN.md](PLAN.md) and built from
+  issues; an unplanned PR is closed, however good. Open an issue instead.
+- **Security problems:** please do not post details in a public issue. Open an issue that
+  says only that you have a security report, and a private channel will be arranged.
+- No compatibility promise before a tagged release. The log format is the exception: logs
+  written by any shipped schema version keep loading (D88).
+
 ## Install the SessionStart hook
 
-Not usable yet (see the status above), but this is how the hot tier reaches Claude Code
-(D54). walle never edits your settings: you paste this into `~/.claude/settings.json`
-yourself, replacing the two paths and the name. Keep any `hooks` you already have.
+This is how the hot tier reaches Claude Code at the start of every session (D54). walle never
+edits your settings: you paste this into `~/.claude/settings.json` yourself, with your own home
+folder in place of `/Users/you` and your own name for `me`. Keep any `hooks` you already have.
 
 ```json
 {
@@ -83,7 +174,7 @@ yourself, replacing the two paths and the name. Keep any `hooks` you already hav
         "hooks": [
           {
             "type": "command",
-            "command": "/path/to/walle/.venv/bin/walle-hook --root /path/to/walle-data --principal maya",
+            "command": "/Users/you/.local/bin/walle-hook --root /Users/you/walle-data --principal me",
             "timeout": 10
           }
         ]
@@ -93,32 +184,35 @@ yourself, replacing the two paths and the name. Keep any `hooks` you already hav
 }
 ```
 
-- `/path/to/walle` is your checkout, after `uv sync`. `/path/to/walle-data` is the folder
-  that holds `principals/`, and `maya` is whose memory this session gets.
+- `/Users/you/.local/bin` is where the install above puts `walle-hook`; `uv tool dir --bin`
+  prints the folder if yours differs. The full path is deliberate: a hook that cannot be found
+  fails silently. `/Users/you/walle-data` is the folder that holds `principals/`, and `me` is
+  whose memory this session gets.
 - With no `matcher`, it runs on startup, resume, `/clear` and compaction alike.
 - The hook only reads the hot tier that `walle render` wrote. If anything is wrong, or it takes
   more than 2 seconds, it prints nothing and the session starts without memory (D115).
   `timeout` is Claude Code's own limit, a guard behind that one; without it the host waits
   600 seconds.
 - To see what it injects and roughly how many tokens that is, run it by hand:
-  `echo '{"hook_event_name": "SessionStart"}' | /path/to/walle/.venv/bin/walle-hook --root
-  /path/to/walle-data --principal maya --measure`. The JSON goes to stdout, the count to
+  `echo '{"hook_event_name": "SessionStart"}' | walle-hook --root ~/walle-data --principal me
+  --measure`. The JSON goes to stdout, the count to
   stderr.
 
 ## The MCP server
 
-Not usable yet either. `walle-mcp` serves three tools over stdio (D48): `recall` (search
+`walle-mcp` serves three tools over stdio (D48): `recall` (search
 current facts, or fetch one by ref), `remember` (only *stages* a proposal; you keep or drop it
 in `walle review`) and `why` (where a fact came from). Every piece of memory comes back in an
 untrusted envelope with a random per-result id, labelled `_meta.ifc` from its provenance
-(D55, D84, D97). For Claude Code:
+(D55, D84, D97). The `claude mcp add` line in [Install](#install) is all Claude Code needs.
+The same thing as JSON, for a project's `.mcp.json` or another host:
 
 ```json
 {
   "mcpServers": {
     "walle": {
-      "command": "/path/to/walle/.venv/bin/walle-mcp",
-      "args": ["--root", "/path/to/walle-data", "--principal", "maya", "--device", "mbp"]
+      "command": "walle-mcp",
+      "args": ["--root", "/Users/you/walle-data", "--principal", "me", "--device", "mac"]
     }
   }
 }
@@ -127,7 +221,7 @@ untrusted envelope with a random per-result id, labelled `_meta.ifc` from its pr
 - **Schema cost (D102): 1,102 characters, about 368 tokens** for all three tools, measured on
   the `tools/list` answer a client receives at 3 characters per token (an estimate on the safe
   side; Claude's tokenizer is not available offline). The cap is 400 and is a test. Check it
-  with `walle-mcp --root /path/to/walle-data --principal maya --device mbp --measure`.
+  with `walle-mcp --root ~/walle-data --principal me --device mac --measure`.
 - The envelope cannot stop the host from acting on what it reads. A memory layer runs inside
   the host and cannot taint its session or refuse its tool calls (D55).
 
@@ -137,13 +231,13 @@ D99: the server should run under [`srt`](https://github.com/anthropic-experiment
 (seatbelt on macOS, bubblewrap on Linux). walle prints the profile for you:
 
 ```sh
-walle-mcp --root /path/to/walle-data --principal maya --device mbp --srt-profile > walle.srt.json
-srt --settings walle.srt.json walle-mcp --root /path/to/walle-data --principal maya --device mbp
+walle-mcp --root ~/walle-data --principal me --device mac --srt-profile > walle.srt.json
+srt --settings walle.srt.json walle-mcp --root ~/walle-data --principal me --device mac
 ```
 
-- **Reads:** Maya's folder and the Python that runs the server. The home folder and every
+- **Reads:** this principal's folder and the Python that runs the server. The home folder and every
   other principal's folder are denied by the profile.
-- **Writes:** Maya's `log/` folder only. So `remember` still stages, and `recall` and `why`
+- **Writes:** this principal's `log/` folder only. So `remember` still stages, and `recall` and `why`
   cannot refresh the index: they answer from the index as last built and say so. Refresh it
   with `walle` outside the sandbox.
 - **Network:** none.
@@ -153,6 +247,25 @@ srt --settings walle.srt.json walle-mcp --root /path/to/walle-data --principal m
   skip where `srt` is absent, and have not yet been run on a machine with it. Until they
   have, treat the profile as written to the `srt` documentation, not as proven. On Linux
   `srt` also needs `bwrap` and `socat`.
+
+## The ACP client
+
+`walle acp` runs an [Agent Client Protocol](https://agentclientprotocol.com) host, such as
+Codex or Gemini CLI, as a subprocess and puts the hot tier in front of the first turn, inside
+its untrusted envelope (D55, D83). Built to protocol version 1 (`schema-v1.29.1`); a host that
+names another version is refused. Each line on stdin is one turn; the host's text comes back on
+stdout.
+
+```sh
+walle acp --root /path/to/walle-data --principal maya --cwd ~/project -- codex acp
+```
+
+- The client advertises no capabilities: no file access, no terminal. A permission request from
+  the host is declined. walle is memory, not the hand on the tool.
+- With no hot tier, or a render in progress, the session runs without memory and says so on
+  stderr (D115).
+- **Tested against a fake host only** (`tests/fake_acp.py`). Neither Codex nor Gemini CLI has
+  been run against it yet; the first real run is the first thing to check.
 
 ## Documents
 

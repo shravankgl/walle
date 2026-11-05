@@ -40,9 +40,12 @@ another is a detector nobody would notice losing.
 Three shapes are matched by what they *are*, not by how the corpus happens to spell them:
 
 * **A secret is named and a value is given.** The value may be a code-shaped token nearby, a
-  quoted span, whatever follows a colon or a copula on the next line, or, for a passphrase,
-  which is words by nature, the words after "is". "Every shop password lives in the manager"
-  names one and gives nothing.
+  quoted span, whatever follows a colon or a copula on the next line, for a passphrase,
+  which is words by nature, the words after "is", or, for any named secret, three or more
+  words joined into one token by hyphens, dots or underscores (issue #59). "Every shop
+  password lives in the manager" names one and gives nothing, and "the passphrase is
+  long-winded" describes one: English hyphenates two words freely, three only in a stock
+  phrase, and the gate errs towards the flag.
 * **A sentence is the unit for an instruction.** A line break inside a turn is whitespace, so
   "ignore all previous" on one line and "instructions" on the next is the same order. A turn
   label ends the unit; the person's words are never glued to the reply's.
@@ -107,7 +110,7 @@ _CREDENTIAL = (
 
 # A secret is named, then a value is given. Naming alone is not giving: "Every shop password
 # lives in the password manager" is followed by words about it, not by it. A value is given
-# in one of four ways, each a way text *presents* a value rather than talks about one.
+# in one of five ways, each a way text *presents* a value rather than talks about one.
 _SECRET_NAME = (
     r"\b(?:password|passcode|passphrase|pin|pin code|pin number|otp|one-time code|"
     r"security code|access code|door code|gate code|alarm code|safe code|the code for|"
@@ -149,6 +152,19 @@ _SECRET = (
         r"that|still|also|now|not|very|just|long|short|about|kept|stored|saved|written|"
         r"what|something|same|one|too|only|already|of|for|to|and|or)\b)"
         r"(?:[A-Za-z][A-Za-z'-]*[ \t]+){2,}[A-Za-z][A-Za-z'-]*",
+        re.IGNORECASE,
+    ),
+    # 5. Words joined into one token: "correct-horse-battery-staple", "correct.horse.battery",
+    #    "correct_horse_battery_staple" (issue #59). No digit, so rule 1 does not see it; no
+    #    space, so rule 4 does not. Three or more joined words is a value whatever the name:
+    #    English hyphenates two ("long-winded", "well-known", "re-used") and only a stock
+    #    phrase ("up-to-date") three, so the cost is a withheld proposal when someone says a
+    #    password is up-to-date, and the miss the other way is a secret sent to a vendor. The
+    #    value must directly follow the copula, colon or equals sign, as a stated value does;
+    #    after "=" or ":" the gap may be empty ("passphrase=correct-horse-battery-staple").
+    re.compile(
+        rf"{_SECRET_NAME}[^\n.]{{0,60}}?(?:\b(?:is|was)\s+|[=:]\s*)"
+        r"[A-Za-z]+(?:[-._][A-Za-z]+){2,}(?![A-Za-z0-9])",
         re.IGNORECASE,
     ),
 )
