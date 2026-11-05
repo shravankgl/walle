@@ -20,6 +20,7 @@ from walle import hot as walle_hot
 from walle import index as walle_index
 from walle import models as walle_models
 from walle import observer as walle_observer
+from walle import profiles as walle_profiles
 from walle import proposer as walle_proposer
 from walle import staging as walle_staging
 from walle import stats as walle_stats
@@ -887,3 +888,109 @@ def stats_command(root: Path, principal: str) -> None:
         click.echo(f"acceptance: {counts.accepted} of {counts.decided} decided ({rate}%).")
     else:
         click.echo("acceptance: nothing decided yet.")
+
+
+# --- household profiles (issue #102) -----------------------------------------------------------
+
+
+_PROFILE_ERRORS = (
+    walle_profiles.EmptyContextError,
+    walle_profiles.CrossPrincipalError,
+    walle_profiles.RoleError,
+    walle_profiles.SharedDataError,
+    FileExistsError,
+    FileNotFoundError,
+    OSError,
+    ValueError,
+)
+
+_AS = click.option(
+    "--as",
+    "actor",
+    required=True,
+    help="Who is acting, without the p- prefix. Every profile command acts for one principal.",
+)
+_ROLE = click.option(
+    "--role",
+    type=click.Choice([r.value for r in walle_profiles.Role]),
+    default=walle_profiles.Role.OPERATOR.value,
+    show_default=True,
+    help="The role the speaker holds (D27). Adding and deleting a profile need admin.",
+)
+
+
+@main.group("profiles")
+def profiles_group() -> None:
+    """A household's profiles: one folder per principal, capabilities shared, data never.
+
+    Off unless WALLE_PROFILES=on. Nothing here reads another principal's folder: an admin
+    may add or delete a profile, never read one, and only a folder's owner publishes from it.
+    """
+
+
+def _profile_context(root: Path, actor: str, role: str) -> walle_profiles.Context:
+    return walle_profiles.bind(root, actor, role=walle_profiles.Role(role))
+
+
+@profiles_group.command("add")
+@_ROOT
+@_AS
+@_ROLE
+@click.option("--principal", required=True, help="The new profile's name, without the p- prefix.")
+def profiles_add_command(root: Path, actor: str, role: str, principal: str) -> None:
+    """Make an empty profile folder for a new principal. Needs --role admin."""
+    if not walle_profiles.enabled():
+        raise click.ClickException(walle_profiles.OFF_MESSAGE)
+    try:
+        added = walle_profiles.add_profile(_profile_context(root, actor, role), principal)
+    except _PROFILE_ERRORS as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"{added.principal}: profile made at {added.folder}")
+
+
+@profiles_group.command("delete")
+@_ROOT
+@_AS
+@_ROLE
+@click.option("--principal", required=True, help="The profile to delete, without the p- prefix.")
+def profiles_delete_command(root: Path, actor: str, role: str, principal: str) -> None:
+    """Delete a principal's whole folder (D32 rule 5). Needs --role admin. Opens no file."""
+    if not walle_profiles.enabled():
+        raise click.ClickException(walle_profiles.OFF_MESSAGE)
+    try:
+        gone = walle_profiles.delete_profile(_profile_context(root, actor, role), principal)
+    except _PROFILE_ERRORS as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        f"{gone.principal}: profile deleted ({_plural(gone.files, 'file')}, "
+        f"{_plural(gone.links, 'link')}, {_plural(gone.folders, 'folder')})"
+    )
+
+
+@profiles_group.command("publish")
+@_ROOT
+@click.option("--principal", required=True, help="Whose capability, without the p- prefix.")
+@click.option(
+    "--kind",
+    type=click.Choice(list(walle_profiles.CAPABILITY_KINDS)),
+    required=True,
+    help="What kind of capability it is. shared/ holds nothing else (D33).",
+)
+@click.argument("source")
+def profiles_publish_command(root: Path, principal: str, kind: str, source: str) -> None:
+    """Copy SOURCE, a file inside your own profile folder, into shared/KIND/.
+
+    Only a folder's owner publishes from it: SOURCE is read inside --principal's folder and
+    nowhere else. Nothing already in shared/ is replaced.
+    """
+    if not walle_profiles.enabled():
+        raise click.ClickException(walle_profiles.OFF_MESSAGE)
+    try:
+        done = walle_profiles.publish(
+            walle_profiles.bind(root, principal),
+            source,
+            kind,  # type: ignore[arg-type]  # click.Choice narrows it to CAPABILITY_KINDS
+        )
+    except _PROFILE_ERRORS as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"{done.principal}: published {done.source.name} to {done.path}")
