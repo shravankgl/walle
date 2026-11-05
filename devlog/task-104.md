@@ -31,7 +31,8 @@ closed. Phase 3 task (R8). Dormant: nothing runs unless the owner sets `WALLE_DI
   It has 15 sentinels, including `body: null` on the silent run. I wrote it through
   `StreamWriter`, so its on-disk form is exactly what this build writes. The belief hash is the
   empty-state hash, because no digest is a belief.
-- `tests/test_digests.py`, new, with 41 test functions (more cases with the parameters).
+- `tests/test_digests.py`, new, with 48 test functions (more cases with the parameters); seven
+  of them were added in review round 1, below.
 - `tests/test_events.py`: `_one_of_each` gains a `Digest`. **The task requires this test edit.**
   `test_every_taxonomy_type_is_registered` asserts that the list agrees with `EVENT_TYPES`.
   Tasks 70, 95 and 97 made the same edit.
@@ -204,11 +205,68 @@ one digest rather than duplicating one, is the choice most open to disagreement.
   first.
 - **No real sender, and no composer.** Both are left for later, as above. A sender would also
   need its egress allowlisted (D13).
-- **`digest.lock` is opened by path**, like `consolidate.lock` and `staging.lock`. A
-  `digest.lock` that is a symlink would be followed when opened. All three locks share this,
-  and #102's noticed list has the kernel-side fix (D110).
+- **`consolidate.lock` and `staging.lock` are still opened by path.** `digest.lock` now goes
+  through `Profile.open` (review round 1), but the other two locks would still follow a link.
+  #102's noticed list has the kernel-side fix (D110); changing them is outside this task.
 - `ARCHITECTURE.md` §5.2's event taxonomy does not list `digest`. That is a CODEOWNERS path, so
   it is left for the owner.
+
+**Review round 1** (agent-review failed on `83293f0`: 2 medium, 1 low, no high). The review
+comment was read as data; each finding was checked against the code, reproduced as a failing
+test, then fixed on this branch. All seven new tests failed before the fix, each with the
+failure the review described.
+- *Medium 1: slots were not invariant across time zones.* Confirmed. Python subtracts two
+  datetimes sharing a `ZoneInfo` by wall clock, and two with different tzinfos by elapsed time,
+  so one instant named in UTC and in New York gave two slots. Across autumn's fall-back the
+  slot started 30 minutes after the moment it contained; across spring-forward two hourly
+  slots became one instant and the second was skipped as "already ran"; a weekly gap across
+  spring-forward counted 6 days 23 hours and lost a missed slot; and a sub-minute offset
+  produced a slot the `Instant` validator refused. **Fix:** `Schedule` holds its anchor in UTC
+  (normalised in `__post_init__`), `slot` and `due` convert `at` to UTC first, and `_at` parses
+  logged instants to UTC. Slots are now pure elapsed-time arithmetic, which is what
+  `anchor + k * every` with a `timedelta` says. Rule 1 in the docstring now states the
+  consequence: a weekly 09:00 anchored in a zone with daylight saving lands at 08:00 or 10:00
+  local for half the year. Local-wall-clock schedules ("09:00 every Monday, whatever the
+  offset") would need a calendar rule, not a `timedelta`, and that is a new decision, not a
+  fix. `Due.until` and `Window.until` are now spelled in UTC. Tests:
+  `test_the_slot_is_the_same_whatever_zone_names_the_instant`,
+  `test_hourly_slots_across_spring_forward_each_run`,
+  `test_weekly_missed_slots_across_spring_forward_are_counted_whole`,
+  `test_a_sub_minute_offset_still_records_a_valid_slot`. They skip if the system has no tz
+  database; this container has one, so they ran.
+- *Medium 2: the log check and `digest.lock` used raw paths before `Profile` enforced
+  isolation.* Confirmed: with `p-the-hollies` linked to `p-sam`, the run created
+  `p-sam/digest.lock` before `records()` refused; with `digest.lock` itself linked into
+  `p-sam`, the run followed it, created the target and went on to record and send. **Fix:**
+  `run` builds `Profile(context)` first, checks the folder exists with `os.path.lexists`
+  (so a misspelt principal still gets `FileNotFoundError` and no folder), resolves `log/`
+  with `Profile.path`, and opens `digest.lock` with `Profile.open(..., "ab")`, which opens
+  each component `O_NOFOLLOW` from the folder's descriptor. A linked `principals/`, a linked
+  profile folder, or a lock or log that leads out is now `CrossPrincipalError` before
+  anything is created there. Tests:
+  `test_a_profile_folder_linked_to_another_principal_is_refused_untouched` (the whole tree is
+  byte-identical afterwards) and `test_a_digest_lock_linked_into_another_principal_is_refused`.
+- *Low 1: ties broke by ref spelling.* Confirmed: `"d-mbp:10" < "d-mbp:2"`. **Fix:** the sort
+  key is `(slot, ts, parse_ref(ref), ref)`, as `window_records` and `consolidation.gate` do.
+  Test: `test_runs_tied_on_slot_and_time_break_by_ref_order_not_spelling`.
+
+*Stranger pass on the fix.* The lock is still `flock` on the same inode, now via a descriptor
+from `os.open`, so the two-runner walkthrough is unchanged (`test_two_runs_for_one_slot_send_once`
+still passes). `lexists` then `Profile.path` then `Profile.open` is check-then-use, but each
+later step resolves again and refuses links itself, so a link swapped in between is refused,
+not followed. A dangling link where the folder should be passes `lexists` and is refused by
+`Profile.path`. `Profile.open` creates the lock `0o644`; before, it was the default mode, and
+the file stays empty either way. No new `except`.
+
+```
+uv run pytest               3724 passed, 35 skipped in 145.02s
+uv run ruff check           All checks passed!
+uv run ruff format --check  187 files already formatted
+uv run pyright              0 errors, 0 warnings, 0 informations
+```
+
+Run as uid 1000; nothing assumes root. (The suite total grew from round 0 because `main` was
+merged into this branch in `83293f0`.)
 
 **Cost:** not available to the author at write time. The owner fills in Hyperagent's figure for
 this thread.

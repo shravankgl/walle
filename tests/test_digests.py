@@ -22,9 +22,10 @@ import json
 import shutil
 import stat
 import threading
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pytest
 from pydantic import ValidationError
@@ -433,6 +434,124 @@ def test_a_principal_with_no_log_gets_no_folder(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         _run(tmp_path, T0)
     assert not principal_dir(tmp_path, P).exists()
+
+
+# --- a slot is an instant, whatever zone names it (review of #113, medium 1) ---------------
+
+
+def _zone(name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError:  # pragma: no cover - a system with no tz database
+        pytest.skip(f"no time zone data for {name} on this system")
+
+
+def test_the_slot_is_the_same_whatever_zone_names_the_instant() -> None:
+    """Across autumn's fall-back, one instant named in UTC and in New York is one slot, and
+    the slot never starts after the instant it contains."""
+    ny = _zone("America/New_York")
+    weekly = digests.Schedule(
+        recipient=RECIPIENT, every=WEEK, anchor=datetime(2026, 10, 26, 9, 0, tzinfo=ny)
+    )
+    at_utc = datetime(2026, 11, 2, 13, 30, tzinfo=UTC)  # 08:30 EST
+    at_ny = at_utc.astimezone(ny)
+    assert at_utc == at_ny
+    in_utc, in_ny = weekly.slot(at_utc), weekly.slot(at_ny)
+    assert in_utc is not None and in_ny is not None
+    assert in_utc == in_ny <= at_utc
+    assert digests.due([], weekly, at=at_utc) == digests.due([], weekly, at=at_ny)
+
+
+def test_hourly_slots_across_spring_forward_each_run(tmp_path: Path) -> None:
+    """Spring-forward must not make two slots one instant, so the second is not skipped as
+    already run."""
+    _profile(tmp_path)
+    ny = _zone("America/New_York")
+    hourly = digests.Schedule(
+        recipient=RECIPIENT,
+        every=timedelta(hours=1),
+        anchor=datetime(2026, 3, 8, 0, 0, tzinfo=ny),  # 05:00 UTC; clocks jump at 07:00 UTC
+    )
+    sender = FakeSender()
+    for hour in (7, 8):
+        at = datetime(2026, 3, 8, hour, 1, tzinfo=UTC)
+        assert _run(tmp_path, at, send=sender, schedule=hourly).sent
+    assert len(sender.sent) == 2
+    assert len({d.slot for d in _digests(tmp_path)}) == 2
+
+
+def test_weekly_missed_slots_across_spring_forward_are_counted_whole() -> None:
+    ny = _zone("America/New_York")
+    weekly = digests.Schedule(
+        recipient=RECIPIENT, every=WEEK, anchor=datetime(2026, 3, 1, 9, 0, tzinfo=ny)
+    )
+    ran = Record(
+        ref=f"d-{D}:1",
+        seq=1,
+        event=Digest(
+            ts="2026-03-01T14:00:01.000000+00:00",
+            actor=ACTOR_KERNEL,
+            slot="2026-03-01T14:00:00.000000+00:00",
+            body=None,
+        ),
+        line=1,
+    )
+    verdict = digests.due([ran], weekly, at=datetime(2026, 3, 15, 15, 0, tzinfo=ny))
+    assert verdict.due and verdict.missed == 1
+
+
+def test_a_sub_minute_offset_still_records_a_valid_slot(tmp_path: Path) -> None:
+    _profile(tmp_path)
+    odd = timezone(timedelta(seconds=30))
+    schedule = digests.Schedule(recipient=RECIPIENT, every=WEEK, anchor=T0.astimezone(odd))
+    result = _run(tmp_path, (T0 + DAY).astimezone(odd), schedule=schedule)
+    assert result.sent
+    (digest,) = _digests(tmp_path)
+    assert digest.slot == _ts(T0)
+
+
+# --- the run touches only its own folder (review of #113, medium 2) -------------------------
+
+
+def test_a_profile_folder_linked_to_another_principal_is_refused_untouched(
+    tmp_path: Path,
+) -> None:
+    _profile(tmp_path, "sam")
+    sam = principal_dir(tmp_path, "sam")
+    before = _tree(tmp_path)
+    principal_dir(tmp_path, P).symlink_to(sam, target_is_directory=True)
+    with pytest.raises(profiles.CrossPrincipalError):
+        _run(tmp_path, T0)
+    assert not (sam / digests.DIGEST_LOCK_FILENAME).exists()
+    assert _tree(tmp_path) == before
+
+
+def test_a_digest_lock_linked_into_another_principal_is_refused(tmp_path: Path) -> None:
+    _profile(tmp_path)
+    _profile(tmp_path, "sam")
+    target = principal_dir(tmp_path, "sam") / digests.DIGEST_LOCK_FILENAME
+    (principal_dir(tmp_path, P) / digests.DIGEST_LOCK_FILENAME).symlink_to(target)
+    sender = FakeSender()
+    with pytest.raises(profiles.CrossPrincipalError):
+        _run(tmp_path, T0, send=sender)
+    assert not target.exists()
+    assert _digests(tmp_path) == [] and sender.sent == []
+
+
+# --- ties between runs break by ref order (review of #113, low 1) ---------------------------
+
+
+def test_runs_tied_on_slot_and_time_break_by_ref_order_not_spelling(tmp_path: Path) -> None:
+    _profile(tmp_path)
+    writer = StreamWriter(tmp_path, P, D)
+    tied = Digest(ts=_ts(T0 + timedelta(seconds=1)), actor=ACTOR_KERNEL, slot=_ts(T0), body=None)
+    _note(tmp_path, T0 - DAY)
+    writer.append(tied)  # d-mbp:2
+    for _ in range(7):
+        _note(tmp_path, T0 - DAY)
+    writer.append(tied)  # d-mbp:10
+    verdict = digests.due(_records(tmp_path), _schedule(), at=T0 + DAY)
+    assert not verdict.due and f"(d-{D}:10)" in verdict.reason
 
 
 # --- errors that must not lie --------------------------------------------------------------

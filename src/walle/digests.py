@@ -11,6 +11,10 @@ The rules
 1. **A schedule is configuration.** ``Schedule(recipient, every, anchor)`` is built by whoever
    configures the install, outside the log. Slot ``k`` starts at ``anchor + k * every``. Each
    principal has their own schedule, and ``run`` is the same function for all of them (D31).
+   Slots are instants: the anchor is held in UTC and ``every`` is elapsed time, so the slot
+   containing a moment does not depend on which zone names it, and daylight saving neither
+   merges two slots nor starts one after the moment it contains. A weekly 09:00 anchored in
+   a zone with daylight saving therefore lands at 08:00 or 10:00 local for half the year.
 2. **Configuration decides where; the run decides whether** (D63). The composer is handed a
    ``Window`` that carries no recipient and must return text, nothing else. The ``digest``
    event has no recipient field. The sender is called with ``schedule.recipient`` and nothing
@@ -34,9 +38,12 @@ The rules
    than letting the caller believe nothing happened. Missing one digest is the honest
    failure; sending one twice is the one D79 exists to prevent.
 7. **Built from its own folder only** (D32 rule 3, D33, D113). A run takes a bound
-   ``profiles.Context`` and reads ``Profile(context).records()``, which refuses any stream
-   that resolves into another principal's folder. A household's digest is the household
-   profile's, never a person's.
+   ``profiles.Context`` and touches its folder only through ``Profile(context)``: ``log/`` is
+   resolved, ``digest.lock`` is opened with ``Profile.open`` (each component ``O_NOFOLLOW``)
+   and the records come from ``Profile(context).records()``. A linked ``principals/``, a
+   profile folder that is a link, or a ``digest.lock`` or stream that resolves into another
+   principal's folder is refused with ``CrossPrincipalError`` before any file is created or
+   read there. A household's digest is the household profile's, never a person's.
 8. **Off by default.** ``run`` writes and sends nothing unless the owner has set
    ``WALLE_DIGESTS=on`` in the environment, outside the log (the owner's dormant condition on
    #104, D117). It is checked before anything is read. Reading is not acting: ``due`` works
@@ -50,7 +57,8 @@ Two runners, step by step (the walkthrough this file is required to carry)
 Runs A and B for the household, both started at 09:00:01 on Monday, in the weekly slot that
 starts 09:00. Last week's digest ran. Observer W appends notes meanwhile.
 
-1. A checks the switch, the context and that the log exists, then takes ``digest.lock``
+1. A checks the switch, the context and that ``log/`` resolves inside its own folder and
+   exists, then takes ``digest.lock``
    (exclusive). B does the same and blocks here, having read nothing.
 2. A reads the clock (after the lock, so a run that waited is never stamped before the one it
    waited for), brings the index up to date (``index.lock``, then each stream file shared for a
@@ -95,7 +103,7 @@ from pathlib import Path
 from typing import Protocol
 
 from walle.events import ACTOR_KERNEL, Digest, make_ref, parse_ref
-from walle.paths import log_dir, principal_dir
+from walle.paths import LOG_DIRNAME, principal_dir
 from walle.profiles import Context, EmptyContextError, Profile
 from walle.reader import Record
 
@@ -177,10 +185,14 @@ class Schedule:
         if self.every <= timedelta(0):
             raise ValueError(f"every must be positive, got {self.every}")
         _require_aware(self.anchor, "anchor")
+        # Held in UTC (rule 1): arithmetic on a zone with daylight saving is wall-clock
+        # arithmetic in Python, and a sub-minute offset has no spelling in the log.
+        object.__setattr__(self, "anchor", self.anchor.astimezone(UTC))
 
     def slot(self, at: datetime) -> datetime | None:
-        """The start of the slot containing ``at``, or ``None`` before slot 0."""
+        """The start of the slot containing ``at``, in UTC, or ``None`` before slot 0."""
         _require_aware(at, "at")
+        at = at.astimezone(UTC)
         if at < self.anchor:
             return None
         return self.anchor + ((at - self.anchor) // self.every) * self.every
@@ -207,6 +219,7 @@ def due(records: Iterable[Record], schedule: Schedule, *, at: datetime) -> Due:
     """Whether the slot containing ``at`` is due (rules 4 and 5). Pure: the same records, in
     any order and with duplicates, and the same ``at`` give the same answer."""
     _require_aware(at, "at")
+    at = at.astimezone(UTC)
     until = _spell(at)
     current = schedule.slot(at)
     if current is None:
@@ -214,13 +227,13 @@ def due(records: Iterable[Record], schedule: Schedule, *, at: datetime) -> Due:
 
     runs = sorted(
         {
-            (_at(r.event.slot), _at(r.event.ts), r.ref)
+            (_at(r.event.slot), _at(r.event.ts), parse_ref(r.ref), r.ref)
             for r in records
             if isinstance(r.event, Digest)
         }
     )
     if runs:
-        last_slot, last_ts, last_ref = runs[-1]
+        last_slot, last_ts, _, last_ref = runs[-1]
         if last_slot == current:
             return Due(
                 False,
@@ -335,7 +348,9 @@ def run(
 
     Raises, having read and written nothing: ``DigestsOffError`` while off,
     ``EmptyContextError`` for a missing context or one with no device bound,
-    ``FileNotFoundError`` for a principal with no log, ``ValueError`` for a naive ``now``.
+    ``FileNotFoundError`` for a principal with no log, ``ValueError`` for a naive ``now``,
+    ``CrossPrincipalError`` when ``principals/``, the profile folder, ``log/`` or
+    ``digest.lock`` leads out of the principal's own folder.
     Raises having written nothing: ``TypeError`` when the composer returns anything but
     text, and whatever the composer itself raises. Raises after recording the run:
     ``DeliveryError`` when the sender fails.
@@ -354,14 +369,21 @@ def run(
     if now is not None:
         _require_aware(now, "now")
     principal = context.principal
-    log = log_dir(context.root, principal)
+    profile = Profile(context)
+    if not os.path.lexists(profile.folder):
+        # Checked before anything is resolved or created: a misspelt principal must not get
+        # a folder, and is told so plainly.
+        raise FileNotFoundError(
+            f"{profile.folder}: no profile for principal {principal!r}, nothing to digest"
+        )
+    log = profile.path(LOG_DIRNAME)  # CrossPrincipalError for any link out of the folder
     if not log.is_dir():
-        # Checked before the lock file is created: a misspelt principal must not get a folder.
+        # Checked before the lock file is created.
         raise FileNotFoundError(f"{log}: no log for principal {principal!r}, nothing to digest")
 
-    with _exclusive(digest_lock_path(context.root, principal)):
+    with _exclusive(profile, DIGEST_LOCK_FILENAME):
         at = datetime.now(UTC) if now is None else now
-        records = Profile(context).records()
+        records = profile.records()
         verdict = due(records, schedule, at=at)
         if not verdict.due:
             return Run(principal, False, verdict.reason, slot=verdict.slot)
@@ -412,7 +434,8 @@ def _require_aware(moment: object, name: str) -> None:
 
 
 def _at(ts: str) -> datetime:
-    return datetime.fromisoformat(ts)
+    """A logged instant, in UTC, so comparisons and differences are elapsed time."""
+    return datetime.fromisoformat(ts).astimezone(UTC)
 
 
 def _spell(moment: datetime) -> str:
@@ -421,9 +444,10 @@ def _spell(moment: datetime) -> str:
 
 
 @contextlib.contextmanager
-def _exclusive(lock: Path) -> Iterator[None]:
-    """Hold ``digest.lock`` exclusively: one run's check and claim at a time."""
-    with open(lock, "ab") as f:  # "a": opening never truncates, and the file stays empty
+def _exclusive(profile: Profile, name: str) -> Iterator[None]:
+    """Hold ``digest.lock`` exclusively: one run's check and claim at a time. Opened through
+    the profile, so a lock file that is a link out of the folder is refused, not followed."""
+    with profile.open(name, "ab") as f:  # "a": never truncates, and the file stays empty
         fcntl.flock(f.fileno(), fcntl.LOCK_EX)
         yield
         # The lock goes with close.
