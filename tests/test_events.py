@@ -33,6 +33,7 @@ from walle.events import (
     Automation,
     AutomationVerb,
     Contradiction,
+    Digest,
     Event,
     FutureSchemaError,
     Level,
@@ -161,6 +162,13 @@ def _one_of_each() -> list[AnyEvent]:
             target="d-mbp:1",
             result=OutcomeResult.OK,
             note="synthetic",
+        ),
+        Digest(
+            ts=TS,
+            actor=ACTOR_KERNEL,
+            slot="2026-10-05T09:00:00+00:00",
+            body="This week: synthetic.",
+            model="fake-composer",
         ),
     ]
 
