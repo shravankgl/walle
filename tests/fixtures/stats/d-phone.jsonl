@@ -1,0 +1,6 @@
+{"actor":"user","body":"Maya waters the basil on Sunday mornings.","caused_by":["d-mbp:1"],"confidence":0.3,"evidence_count":1,"level":"explicit","seq":1,"summary":"Maya waters the basil on Sunday mornings.","ts":"2026-11-03T19:00:00+00:00","type":"assertion","v":1}
+{"actor":"user","body":"The recycling goes out on Thursday night.","caused_by":[],"level":"explicit","seq":2,"summary":"The recycling goes out on Thursday night.","ts":"2026-11-03T19:00:00+00:00","type":"proposal","v":1}
+{"actor":"user","caused_by":[],"reason":"dropped in review","seq":3,"target":"d-phone:2","ts":"2026-11-03T19:00:00+00:00","type":"supersede","v":1}
+{"actor":"user","caused_by":[],"reason":"dropped by mistake","seq":4,"target":"d-phone:3","ts":"2026-11-03T19:00:00+00:00","type":"supersede","v":1}
+{"actor":"user","caused_by":[],"reason":"dropped in review","seq":5,"target":"d-mbp:12","ts":"2026-11-03T19:00:00+00:00","type":"supersede","v":1}
+{"actor":"observer","body":"user: what day is recycling?","caused_by":[],"observed_at":"2026-11-03T19:00:00+00:00","seq":6,"source":"transcript","ts":"2026-11-03T19:00:00+00:00","type":"observation","v":1}
