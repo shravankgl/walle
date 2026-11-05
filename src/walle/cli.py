@@ -1,6 +1,7 @@
 """The `walle` command. Every later task adds a subcommand here."""
 
 import logging
+import sys
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -11,6 +12,7 @@ import click
 from pydantic import ValidationError
 
 from walle import __version__
+from walle import acp as walle_acp
 from walle import context as walle_context
 from walle import curator as walle_curator
 from walle import hot as walle_hot
@@ -19,6 +21,7 @@ from walle import models as walle_models
 from walle import observer as walle_observer
 from walle import proposer as walle_proposer
 from walle import staging as walle_staging
+from walle import stats as walle_stats
 from walle import why as walle_why
 from walle.bench import bench_command
 from walle.evals import report as walle_evals
@@ -735,6 +738,109 @@ def observe_command(root: Path, principal: str, device: str, projects_dir: Path)
     click.echo(f"  duplicate entries: {len(transcripts.duplicates)}")
 
 
+# --- the ACP client (task 56) ------------------------------------------------------------------
+
+
+@main.command("acp", context_settings={"ignore_unknown_options": True})
+@_ROOT
+@click.option("--principal", required=True, help="Whose memory, without the p- prefix.")
+@click.option(
+    "--cwd",
+    type=click.Path(file_okay=False, exists=True, path_type=Path),
+    default=".",
+    show_default=True,
+    help="The session's working directory, handed to the host.",
+)
+@click.option(
+    "--timeout",
+    type=click.FloatRange(min=0, min_open=True),
+    default=walle_acp.TIMEOUT,
+    show_default=True,
+    help="Seconds the host may take to initialize and open the session.",
+)
+@click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
+def acp_command(
+    root: Path, principal: str, cwd: Path, timeout: float, command: tuple[str, ...]
+) -> None:
+    """Run an ACP host (Codex, Gemini CLI) as a subprocess with the hot tier in front (D83).
+
+    COMMAND is the host and its arguments, after `--`. Each line on stdin is one turn; the
+    host's text comes back on stdout. The first turn carries the hot tier first, inside its
+    untrusted envelope (D55). With no hot tier the session runs without memory and says so.
+    """
+    try:
+        memory = walle_acp.memory(root, principal)
+    except ValueError as exc:  # an unsafe principal name
+        raise click.ClickException(str(exc)) from exc
+    if memory.text is None:
+        click.echo(
+            f"{principal}: no hot tier this session ({memory.why}); the host runs without "
+            f"memory. `walle render --principal {principal}` makes one.",
+            err=True,
+        )
+    try:
+        host = walle_acp.Host.start(command, timeout=timeout)
+    except OSError as exc:
+        why = exc.strerror or type(exc).__name__
+        raise click.ClickException(f"could not start {command[0]}: {why}") from exc
+    except walle_acp.AcpError as exc:
+        raise click.ClickException(str(exc)) from exc
+    with host:
+        try:
+            session = host.new_session(cwd, memory=memory, timeout=timeout)
+        except walle_acp.AcpError as exc:
+            raise click.ClickException(str(exc)) from exc
+        for line in sys.stdin:
+            text = line.rstrip("\n")
+            if not text.strip():
+                continue
+            try:
+                turn = session.prompt(text)
+            except walle_acp.HostError as exc:
+                click.echo(str(exc), err=True)  # the host is alive; the next line is sent
+                continue
+            except walle_acp.AcpError as exc:
+                raise click.ClickException(str(exc)) from exc
+            click.echo(turn.text)
+
+
 # --- the evals (tasks 19-21) ---------------------------------------------------------------
 
 main.add_command(walle_evals.eval_command)
+
+
+# --- the acceptance rate (issue #53) -----------------------------------------------------
+
+
+@main.command("stats")
+@_ROOT
+@click.option("--principal", required=True, help="Whose log to count, without the p- prefix.")
+def stats_command(root: Path, principal: str) -> None:
+    """Count the proposals kept, edited and dropped: the Phase 1 gate metric (D49).
+
+    Counted from the log alone; the index only makes it quick, and rebuilding it gives the
+    same numbers. Prints counts only, never what a proposal says.
+    """
+    try:
+        report = walle_stats.stats(root, principal)
+    except _LOG_ERRORS as exc:
+        # Without content: a line the reader refuses is quoted in pydantic's message.
+        raise click.ClickException(_without_content(exc)) from exc
+
+    counts = report.counts
+    if report.skipped_lines:
+        click.echo(
+            f"{principal}: skipped {_plural(report.skipped_lines, 'unreadable line')} in the "
+            "log; anything on them is not counted below. `walle rebuild` names them.",
+            err=True,
+        )
+    click.echo(f"{principal}: {_plural(counts.proposals, 'proposal')} in the log.")
+    click.echo(f"  kept: {counts.kept}")
+    click.echo(f"  edited: {counts.edited}")
+    click.echo(f"  dropped: {counts.dropped}")
+    click.echo(f"  still staged: {counts.staged}")
+    if counts.decided:
+        rate = walle_stats.percent(counts.accepted, counts.decided)
+        click.echo(f"acceptance: {counts.accepted} of {counts.decided} decided ({rate}%).")
+    else:
+        click.echo("acceptance: nothing decided yet.")
