@@ -20,6 +20,7 @@ from walle import observer as walle_observer
 from walle import proposer as walle_proposer
 from walle import staging as walle_staging
 from walle import why as walle_why
+from walle.bench import bench_command
 from walle.evals import report as walle_evals
 from walle.events import AnyEvent, Assertion, FutureSchemaError, Proposal, Supersede
 from walle.paths import principal_dir
@@ -732,3 +733,4 @@ def observe_command(root: Path, principal: str, device: str, projects_dir: Path)
 # --- the evals (tasks 19-21) ---------------------------------------------------------------
 
 main.add_command(walle_evals.eval_command)
+main.add_command(bench_command)
