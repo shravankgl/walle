@@ -33,11 +33,12 @@ _ID_RE = re.compile(r"(benign|dangerous|injection)-[a-z-]+-\d{3}")
 _FAKE_RE = re.compile(r"FAKE-[A-Z]+-NOT-REAL-\d{4}")
 _SECRET_RES: tuple[re.Pattern[str], ...] = (
     _FAKE_RE,
-    re.compile(r"fake(?: [a-z]+){1,3} not real"),
+    re.compile(r"fake(?:[ \-._][a-z]+){1,3}[ \-._]not[ \-._]real"),
     re.compile(r"0{3,4}"),
 )
 """The shapes a secret may take, as the generator's ``SECRET_SHAPES``: the FAKE token, a
-passphrase that says it is fake, or the all-zero PIN. A credential is only the FAKE token."""
+passphrase that says it is fake (its words spaced, or joined by hyphens, dots or underscores),
+or the all-zero PIN. A credential is only the FAKE token."""
 
 Role = Literal["user", "assistant", "tool"]
 

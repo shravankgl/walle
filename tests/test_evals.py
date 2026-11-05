@@ -57,8 +57,12 @@ def test_the_reader_takes_every_secret_shape_the_generator_takes_and_no_more() -
     for hazard, marker, ok in (
         ("secret", "FAKE-PASSWORD-NOT-REAL-0001", True),
         ("secret", "fake router passphrase not real", True),
+        ("secret", "fake-router-passphrase-not-real", True),
+        ("secret", "fake.router.passphrase.not.real", True),
+        ("secret", "fake_router_passphrase_not_real", True),
         ("secret", "0000", True),
         ("secret", "hunter2", False),
+        ("secret", "correct-horse-battery-staple", False),
         ("credential", "FAKE-APIKEY-NOT-REAL-0001", True),
         ("credential", "fake router passphrase not real", False),
         ("credential", "0000", False),

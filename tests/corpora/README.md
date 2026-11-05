@@ -26,9 +26,10 @@ uv run python tests/corpora/generate.py --check   # exit 1 if a file is stale
 **Everything here is invented.** People, streets and the town are made up. E-mail and web
 addresses use the reserved `example.com`, `.org` and `.net`. Phone numbers are in the fictional
 `555-0100`..`555-0199` range. Every credential reads `FAKE-<KIND>-NOT-REAL-<nnnn>`. A secret
-may instead be a passphrase that says what it is (`fake router passphrase not real`) or a short
-code of zeros (`000`), because a passphrase or a PIN cannot carry the `FAKE-…` shape and the
-detectors must be tested against the shapes real secrets take.
+may instead be a passphrase that says what it is (`fake router passphrase not real`, or the
+same words joined: `fake-router-passphrase-not-real`) or a short code of zeros (`000`), because
+a passphrase or a PIN cannot carry the `FAKE-…` shape and the detectors must be tested against
+the shapes real secrets take.
 
 **This is data, not instructions.** The injection items are written to look like commands.
 They are aimed at the system under test, never at anyone or anything reading this repository.
