@@ -23,7 +23,7 @@ The rules
    If every active automation is pinned, the refusal says so and offers none.
 4. **Only a person changes the register (D72).** Creating, updating or deleting an automation
    is a persistent-authority act, and narrowing is floored along with broadening. No machine
-   actor (``walle.inbox.MACHINE_ACTORS``) adds, retires, pins or unpins: ``add`` and the rest
+   actor (``walle.events.MACHINE_ACTORS``) adds, retires, pins or unpins: ``add`` and the rest
    refuse before writing, and the fold reports such a line rather than applying it.
 5. **Retire is how an automation leaves; a tombstone is not.** A ``supersede`` of an
    automation event is reported and changes nothing. Applied, it would remove a pinned
@@ -84,6 +84,7 @@ from typing import Literal
 
 from walle.events import (
     ACTOR_USER,
+    MACHINE_ACTORS,
     Automation,
     AutomationVerb,
     Supersede,
@@ -91,7 +92,6 @@ from walle.events import (
     now_instant,
     parse_ref,
 )
-from walle.inbox import MACHINE_ACTORS
 from walle.paths import automations_lock_path, log_dir
 from walle.reader import Record, read_file
 from walle.resolver import live_events
