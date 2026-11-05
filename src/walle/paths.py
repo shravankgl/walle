@@ -47,6 +47,7 @@ HOT_DIRNAME = "hot"
 STAGING_LOCK_FILENAME = "staging.lock"
 INBOX_LOCK_FILENAME = "inbox.lock"
 AUTOMATIONS_LOCK_FILENAME = "automations.lock"
+MISSIONS_LOCK_FILENAME = "missions.lock"
 
 
 def check_name(name: str, *, kind: str) -> str:
@@ -135,3 +136,14 @@ def automations_lock_path(root: Path, principal: str) -> Path:
     must still see each other, or both would take the last slot under the cap.
     """
     return principal_dir(root, principal) / AUTOMATIONS_LOCK_FILENAME
+
+
+def missions_lock_path(root: Path, principal: str) -> Path:
+    """``<root>/principals/p-<principal>/missions.lock`` — held while a runner decides whether
+    one step of a mission may start, and appends the events that say it has (D67, #121).
+
+    Per principal, like ``automations.lock``: two runners on two devices' streams of the same
+    profile must see each other's missions and running steps, or both would start the same
+    step, or each its own mission for the same workflow.
+    """
+    return principal_dir(root, principal) / MISSIONS_LOCK_FILENAME

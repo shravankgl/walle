@@ -32,7 +32,7 @@ from typing import Any
 import pytest
 
 from test_constraints import MODEL_OR_NETWORK, imports_of
-from walle import builder, envelope, executor, hazards, index, staging
+from walle import automations, builder, envelope, executor, hazards, index, missions, staging
 from walle.builder import (
     ACTOR_BUILDER,
     ARG_CHARS,
@@ -68,7 +68,11 @@ FAKE_DOCKER = Path(__file__).parent / "fake_docker.py"
 
 P, D = "maya", "mbp"
 ON = {BUILDER_SWITCH: SWITCH_ON}
-ALL_ON = {BUILDER_SWITCH: SWITCH_ON, executor.EXECUTOR_SWITCH: executor.SWITCH_ON}
+ALL_ON = {
+    BUILDER_SWITCH: SWITCH_ON,
+    missions.MISSIONS_SWITCH: missions.SWITCH_ON,
+    executor.EXECUTOR_SWITCH: executor.SWITCH_ON,
+}
 TOKEN = "0123abcd4567"
 
 APPROVAL = "Every Sunday evening, write the week's meal plan into plans/meals.md so it is ready."
@@ -137,6 +141,21 @@ def _staged_ref(root: Path, reply: str | None = None) -> str:
     return stage(root, P, D, _draft(root, reply), environ=ON).ref
 
 
+def _enrolled(root: Path, kept: str) -> str:
+    """The kept workflow at ``kept``, added to the register of active automations by a person,
+    which a step needs before it runs (#121, D6). Returns ``kept`` for chaining."""
+    automations.add(
+        root,
+        P,
+        D,
+        name="meal-plan",
+        title="Sunday meal plan",
+        workflow=kept,
+        environ={automations.AUTOMATIONS_SWITCH: automations.SWITCH_ON},
+    )
+    return kept
+
+
 def _workspace(tmp_path: Path) -> Path:
     ws = tmp_path / "ws"
     ws.mkdir(exist_ok=True)
@@ -197,7 +216,7 @@ def test_builder_output_never_runs_on_the_host_by_default(
     assert model.calls == 0
     docker, record = _fake(tmp_path)
     ref = _kept(root)
-    result = run_step(root, P, ref, "write-plan", _workspace(tmp_path), docker=docker)
+    result = run_step(root, P, D, ref, "write-plan", _workspace(tmp_path), docker=docker)
     assert isinstance(result, Refusal)
     assert _calls(record) == [] and no_host_process == []
 
@@ -210,9 +229,10 @@ def test_with_the_builder_on_and_the_executor_at_its_default_a_kept_workflow_sti
     process starts — the Builder has no other way to run it."""
     monkeypatch.delenv(executor.EXECUTOR_SWITCH, raising=False)
     monkeypatch.setenv(BUILDER_SWITCH, SWITCH_ON)
-    kept = staging.keep(root, P, D, _staged_ref(root))
+    monkeypatch.setenv(missions.MISSIONS_SWITCH, missions.SWITCH_ON)
+    kept = _enrolled(root, staging.keep(root, P, D, _staged_ref(root)))
     docker, record = _fake(tmp_path)
-    result = run_step(root, P, kept, "write-plan", _workspace(tmp_path), docker=docker)
+    result = run_step(root, P, D, kept, "write-plan", _workspace(tmp_path), docker=docker)
     assert result == executor.Refusal("container executor is off")
     assert _calls(record) == [] and no_host_process == []
 
@@ -221,10 +241,12 @@ def test_with_everything_on_a_kept_step_runs_only_as_docker_run(root: Path, tmp_
     """The one thing that starts is the docker client, with the executor's own plan: the
     workspace mounted and nothing else, no network, every capability dropped, and the step's
     command after the image — inside the container, never beside it."""
-    kept = staging.keep(root, P, D, _staged_ref(root))
+    kept = _enrolled(root, staging.keep(root, P, D, _staged_ref(root)))
     docker, record = _fake(tmp_path)
     ws = _workspace(tmp_path)
-    result = run_step(root, P, kept, "write-plan", ws, environ=ALL_ON, docker=docker, token=TOKEN)
+    result = run_step(
+        root, P, D, kept, "write-plan", ws, environ=ALL_ON, docker=docker, token=TOKEN
+    )
     assert isinstance(result, executor.Outcome) and result.exit_code == 0
     (call,) = _calls(record)
     job = executor.Job(ws, tuple(_step()["command"]))
@@ -267,7 +289,10 @@ def test_the_builder_has_no_way_to_start_a_process_of_its_own() -> None:
         and isinstance(n.func.value, ast.Name)
         and n.func.value.id == "executor"
     ]
-    assert sorted(executor_calls) == ["Job", "run"]  # a job is data; ``run`` is the one door
+    # A job is data; ``run`` is the one door. ``enabled`` is asked first so an executor the
+    # owner has not turned on leaves no mission and no step in the log, and ``Refusal`` is
+    # the answer it gives then (#121).
+    assert sorted(executor_calls) == ["Job", "Refusal", "enabled", "run"]
     assert not {"exec", "eval", "compile", "__import__"} & {
         n.func.id
         for n in ast.walk(tree)
@@ -312,12 +337,12 @@ def test_a_staged_workflow_cannot_run_until_a_person_keeps_it(root: Path, tmp_pa
     ref = _staged_ref(root)
     docker, record = _fake(tmp_path)
     ws = _workspace(tmp_path)
-    waiting = run_step(root, P, ref, "write-plan", ws, environ=ALL_ON, docker=docker)
+    waiting = run_step(root, P, D, ref, "write-plan", ws, environ=ALL_ON, docker=docker)
     assert isinstance(waiting, Refusal) and "not an assertion" in waiting.reason
     with pytest.raises(NotApprovedError, match="not an assertion"):
         workflow(_records(root), ref)
-    kept = staging.keep(root, P, D, ref)
-    ran = run_step(root, P, kept, "write-plan", ws, environ=ALL_ON, docker=docker, token=TOKEN)
+    kept = _enrolled(root, staging.keep(root, P, D, ref))
+    ran = run_step(root, P, D, kept, "write-plan", ws, environ=ALL_ON, docker=docker, token=TOKEN)
     assert isinstance(ran, executor.Outcome)
     assert len(_calls(record)) == 1
 
@@ -328,7 +353,7 @@ def test_a_dropped_workflow_never_runs(root: Path, tmp_path: Path) -> None:
     assert staging.pending(root, P) == ()
     docker, record = _fake(tmp_path)
     result = run_step(
-        root, P, ref, "write-plan", _workspace(tmp_path), environ=ALL_ON, docker=docker
+        root, P, D, ref, "write-plan", _workspace(tmp_path), environ=ALL_ON, docker=docker
     )
     assert isinstance(result, Refusal)
     assert _calls(record) == []
@@ -339,7 +364,7 @@ def test_a_kept_workflow_later_superseded_no_longer_runs(root: Path, tmp_path: P
     StreamWriter(root, P, D).append(Supersede(ts=now_instant(), actor="user", target=kept))
     docker, record = _fake(tmp_path)
     result = run_step(
-        root, P, kept, "write-plan", _workspace(tmp_path), environ=ALL_ON, docker=docker
+        root, P, D, kept, "write-plan", _workspace(tmp_path), environ=ALL_ON, docker=docker
     )
     assert isinstance(result, Refusal) and "superseded" in result.reason
     assert _calls(record) == []
@@ -357,7 +382,7 @@ def test_a_workflow_lapses_when_the_approval_it_was_built_from_is_superseded(
         workflow(_records(root), kept)
     docker, record = _fake(tmp_path)
     ws = _workspace(tmp_path)
-    result = run_step(root, P, kept, "write-plan", ws, environ=ALL_ON, docker=docker)
+    result = run_step(root, P, D, kept, "write-plan", ws, environ=ALL_ON, docker=docker)
     assert isinstance(result, Refusal) and "lapsed" in result.reason
     assert _calls(record) == []
 
@@ -370,9 +395,10 @@ def test_a_workflow_the_person_edited_runs_as_the_person_left_it(
     data = json.loads(item.proposal.body.split("\n", 1)[1])
     data["steps"][0]["command"] = ["true"]
     edited = staging.edit(root, P, D, ref, body=WORKFLOW_HEADER + "\n" + json.dumps(data, indent=2))
+    _enrolled(root, edited)
     docker, record = _fake(tmp_path)
     ws = _workspace(tmp_path)
-    run_step(root, P, edited, "write-plan", ws, environ=ALL_ON, docker=docker, token=TOKEN)
+    run_step(root, P, D, edited, "write-plan", ws, environ=ALL_ON, docker=docker, token=TOKEN)
     (call,) = _calls(record)
     assert call[-2:] == [executor.DEFAULT_IMAGE, "true"]
 
@@ -384,7 +410,7 @@ def test_a_workflow_edited_out_of_shape_is_refused_not_guessed_at(
     edited = staging.edit(root, P, D, ref, body="just run the meal plan thing")
     docker, record = _fake(tmp_path)
     result = run_step(
-        root, P, edited, "write-plan", _workspace(tmp_path), environ=ALL_ON, docker=docker
+        root, P, D, edited, "write-plan", _workspace(tmp_path), environ=ALL_ON, docker=docker
     )
     assert isinstance(result, Refusal) and "not a workflow" in result.reason
     assert _calls(record) == []
@@ -399,7 +425,7 @@ def test_a_memory_the_person_kept_is_not_a_workflow(root: Path, tmp_path: Path) 
         workflow(_records(root), ref)
     docker, record = _fake(tmp_path)
     result = run_step(
-        root, P, ref, "write-plan", _workspace(tmp_path), environ=ALL_ON, docker=docker
+        root, P, D, ref, "write-plan", _workspace(tmp_path), environ=ALL_ON, docker=docker
     )
     assert isinstance(result, Refusal)
     assert _calls(record) == []
@@ -409,7 +435,7 @@ def test_an_unknown_step_is_refused(root: Path, tmp_path: Path) -> None:
     kept = staging.keep(root, P, D, _staged_ref(root))
     docker, record = _fake(tmp_path)
     result = run_step(
-        root, P, kept, "no-such-step", _workspace(tmp_path), environ=ALL_ON, docker=docker
+        root, P, D, kept, "no-such-step", _workspace(tmp_path), environ=ALL_ON, docker=docker
     )
     assert isinstance(result, Refusal) and "no-such-step" in result.reason
     assert _calls(record) == []
@@ -426,7 +452,7 @@ def test_a_workspace_that_overlaps_the_walle_root_is_refused(
     inside.mkdir(parents=True)
     ws = {"root": root, "inside": inside, "above": tmp_path}[where]
     docker, record = _fake(tmp_path)
-    result = run_step(root, P, kept, "write-plan", ws, environ=ALL_ON, docker=docker)
+    result = run_step(root, P, D, kept, "write-plan", ws, environ=ALL_ON, docker=docker)
     assert isinstance(result, Refusal) and "walle root" in result.reason
     assert _calls(record) == []
 
@@ -668,7 +694,7 @@ def test_a_deeply_nested_kept_body_is_refused_by_run_step_not_raised(
     deep_ref = staging.edit(root, P, D, _staged_ref(root), body=body, summary="workflow: deep")
     docker, record = _fake(tmp_path)
     result = run_step(
-        root, P, deep_ref, "write-plan", _workspace(tmp_path), environ=ALL_ON, docker=docker
+        root, P, D, deep_ref, "write-plan", _workspace(tmp_path), environ=ALL_ON, docker=docker
     )
     assert isinstance(result, Refusal) and "not a workflow" in result.reason
     assert not record.exists()
@@ -791,12 +817,12 @@ def test_the_fake_builder_drafts_a_workflow_end_to_end(root: Path, tmp_path: Pat
     assert isinstance(result, Draft) and len(fake.prompts) == 1
     assert result.model == "fake"
     item = stage(root, P, D, result, environ=ON)
-    kept = staging.keep(root, P, D, item.ref)
+    kept = _enrolled(root, staging.keep(root, P, D, item.ref))
     flow = workflow(_records(root), kept)
     docker, record = _fake(tmp_path)
     step = flow.steps[0]
     run_step(
-        root, P, kept, step.id, _workspace(tmp_path), environ=ALL_ON, docker=docker, token=TOKEN
+        root, P, D, kept, step.id, _workspace(tmp_path), environ=ALL_ON, docker=docker, token=TOKEN
     )
     (call,) = _calls(record)
     assert call[call.index(executor.DEFAULT_IMAGE) + 1 :] == list(step.command)
@@ -846,7 +872,7 @@ def test_run_step_with_the_builder_off_refuses_even_with_the_executor_on(
     docker, record = _fake(tmp_path)
     only_executor = {executor.EXECUTOR_SWITCH: executor.SWITCH_ON}
     result = run_step(
-        root, P, kept, "write-plan", _workspace(tmp_path), environ=only_executor, docker=docker
+        root, P, D, kept, "write-plan", _workspace(tmp_path), environ=only_executor, docker=docker
     )
     assert isinstance(result, Refusal) and BUILDER_SWITCH in result.reason
     assert _calls(record) == []
