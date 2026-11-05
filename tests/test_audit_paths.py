@@ -34,11 +34,14 @@ from walle.floors import Kind, Op, floored, hit, segments
 from walle.manifest import Touch, covers_path
 from walle.missions import MISSIONS_SWITCH, SWITCH_ON, admit, fold_missions
 from walle.paths import principal_dir
-from walle.profiles import CrossPrincipalError, Profile, bind
+from walle.profiles import CrossPrincipalError, Profile, Role, bind
 from walle.reader import Record
 from walle.reviewer import REVIEWER_SWITCH, Action, Context, FakeReviewer, Standing, review
+from walle.speakers import Order, Speaker
 
 TS = "2026-11-05T10:00:00+00:00"
+ADA = Order("ada", Speaker("ada", Role.OPERATOR))
+"""Ada speaking as the operator: the authority a grant is given by (issue #119)."""
 EVERYTHING_ON = {
     MISSIONS_SWITCH: SWITCH_ON,
     REVIEWER_SWITCH: SWITCH_ON,
@@ -231,7 +234,7 @@ def test_1_4_a_linked_grants_folder_grants_nothing_and_is_written_nothing(
             grants.Scope.ALWAYS,
             call_id="c1",
             root=two_principals,
-            principal="ada",
+            by=ADA,
             ts=TS,
             environ=environ,
         )
@@ -246,7 +249,7 @@ def test_1_4_a_linked_grants_folder_grants_nothing_and_is_written_nothing(
                 grants.Scope.ALWAYS,
                 call_id="c1",
                 root=two_principals,
-                principal="ada",
+                by=ADA,
                 ts=TS,
                 environ=environ,
             )
@@ -281,7 +284,7 @@ def test_1_4_a_linked_principal_folder_is_refused_the_same_way(tmp_path: Path) -
         grants.Scope.ALWAYS,
         call_id="c1",
         root=tmp_path,
-        principal="ada",
+        by=ADA,
         ts=TS,
         environ=EVERYTHING_ON,
     )

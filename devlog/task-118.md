@@ -134,6 +134,31 @@ uv run ruff format --check  196 files already formatted
 uv run pyright              0 errors, 0 warnings, 0 informations
 ```
 
+`main` moved again, to `dfbeb90` (#124 approvals, after #119 speakers), and the PR went
+`dirty`: conflicts in `grants.py` and `rungs.py`. Main gave `grant` a required `by: Authority`
+in place of `principal` and refuses a `Request` before any file is opened; this task routes
+every rule-file open through `Profile`. The two are orthogonal, and both are kept: `grant`
+checks `by` exactly as main does and then binds `_profile(root, by.principal)`, so the grant
+still lands only in the `Order`'s own folder and is still opened through the plain door; the
+docstring names both refusals. `rungs.py` takes main's imports (`inbox`, `check_name`,
+`speakers`) with this task's `read_plain` and `CrossPrincipalError` in place of `grants_dir`,
+which nothing in `rungs` uses any more. The three `grant(...)` calls in this task's own
+`tests/test_audit_paths.py` passed `principal="ada"`; they now pass `by=ADA`, an `Order` for
+ada as operator — the same assertions, main's signature. No test of main's was edited. The agent's
+tool makes only single-parent commits, and committing the resolved files alone still
+conflicts, since both sides changed the same lines from the old base. So, in three steps,
+none forced: one commit sets `grants.py` and `rungs.py` to `main`'s own text (the branch is
+broken for that one commit, and no check can pass on it, so nothing merges); `update-branch`
+then merges `main` in cleanly; a last commit puts the resolution described here on top. The
+squash makes it one commit. With `main` merged, the four checks:
+
+```
+uv run pytest               4088 passed, 35 skipped in 128.19s (0:02:08)
+uv run ruff check           All checks passed!
+uv run ruff format --check  199 files already formatted
+uv run pyright              0 errors, 0 warnings, 0 informations
+```
+
 The issue's own reproduction script, run against the branch: `covers_path("/", …)` is `False`;
 `admit` returns the unanswerable refusal on and off; `review` is `blocked`; the four `floored`
 calls return `Floored(how="above", through=True, resolved=…/principals/p-sam)`; `grants.check`
