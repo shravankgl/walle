@@ -20,6 +20,7 @@ exercised on its own:
                  has been seen; ``rm`` exits 0.
 ``stale-racy``   as ``stale``, but ``rm`` exits 1 with the "already in progress" line.
 ``stale-stuck``  ``ps`` lists the two ids before and after ``rm``, and ``rm`` fails.
+``ps-hang``      ``ps`` never returns (sleeps until killed), as a wedged daemon would leave it.
 
 The record is also the fake's memory: ``ps`` reads it to know whether an ``rm`` came before.
 
@@ -79,6 +80,9 @@ def main(argv: list[str]) -> int:
         sys.stdout.write("ran\n")
         return 0
     if command == "ps":
+        if mode == "ps-hang":
+            while True:
+                time.sleep(3600)
         if mode == "stale-stuck" or (mode in ("stale", "stale-racy") and not removed_before):
             sys.stdout.write("\n".join(STALE_IDS) + "\n")
         elif mode == "hang-stuck":

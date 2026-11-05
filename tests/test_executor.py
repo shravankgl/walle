@@ -228,6 +228,39 @@ def test_an_empty_command_is_refused(tmp_path: Path) -> None:
         _job(tmp_path, command=())
 
 
+@pytest.mark.parametrize("command", ["true", "sh -c true", ""])
+def test_a_bare_string_command_is_refused_not_split_into_characters(
+    tmp_path: Path, command: str
+) -> None:
+    """A ``str`` is a sequence of strings, so ``"rm -rf x"`` passed the old check and would
+    have run as ``r m " " - r f ...``. Review of PR #84 (low); closed here, task 73."""
+    with pytest.raises(TypeError, match="command"):
+        _job(tmp_path, command=command)
+
+
+@pytest.mark.parametrize("command", [["sh", "-c", "true"], ("sh", 1), (b"true",)])
+def test_a_command_that_is_not_a_tuple_of_strings_is_refused(
+    tmp_path: Path, command: object
+) -> None:
+    with pytest.raises((TypeError, ValueError), match="command"):
+        _job(tmp_path, command=command)
+
+
+@pytest.mark.parametrize("field", ["pids", "timeout_s"])
+@pytest.mark.parametrize("value", [True, False])
+def test_a_bool_is_not_a_cap(tmp_path: Path, field: str, value: bool) -> None:
+    """``True`` is the int 1, so ``pids=True`` was a cap of one PID and ``timeout_s=True`` a
+    one-second timeout. Neither is what anyone meant. Review of PR #84 (low)."""
+    with pytest.raises(TypeError, match=field):
+        _job(tmp_path, **{field: value})
+
+
+@pytest.mark.parametrize(("field", "value"), [("pids", "64"), ("pids", 2.0), ("timeout_s", "60")])
+def test_a_cap_of_the_wrong_type_is_refused(tmp_path: Path, field: str, value: object) -> None:
+    with pytest.raises(TypeError, match=field):
+        _job(tmp_path, **{field: value})
+
+
 @pytest.mark.parametrize("memory", ["", "0", "-1m", "1.5g", "512 m", "lots", "1t"])
 def test_a_memory_cap_docker_would_not_read_as_one_is_refused(tmp_path: Path, memory: str) -> None:
     with pytest.raises(ValueError, match="memory"):
@@ -437,6 +470,38 @@ def test_reap_raises_when_there_is_no_daemon(tmp_path: Path) -> None:
     docker, _ = _fake(tmp_path, "no-daemon")
     with pytest.raises(DockerError, match="Cannot connect"):
         reap(docker=docker)
+
+
+def test_reap_turns_a_client_that_does_not_answer_into_a_docker_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wedged daemon leaves ``docker ps`` hanging. ``reap`` used to let
+    ``subprocess.TimeoutExpired`` escape where its siblings raise ``DockerError``. Review of
+    PR #84 (low); closed here, task 73."""
+    monkeypatch.setattr(executor, "CLIENT_TIMEOUT_S", 0.5)
+    docker, record = _fake(tmp_path, "ps-hang")
+    with pytest.raises(DockerError, match="did not answer") as info:
+        reap(docker=docker)
+    assert info.value.argv[0] == "ps" and info.value.exit_code is None
+    assert [c[0] for c in _calls(record)] == ["ps"]
+
+
+def test_reap_turns_a_missing_client_into_a_docker_error(tmp_path: Path) -> None:
+    missing = str(tmp_path / "no-such-docker")
+    with pytest.raises(DockerError, match="not found") as info:
+        reap(docker=(missing,))
+    assert info.value.exit_code is None and missing in info.value.stderr
+
+
+def test_reap_turns_a_client_that_cannot_be_started_into_a_docker_error(tmp_path: Path) -> None:
+    """A file that is there but is not executable: ``which`` would not find it, but the path
+    test does, and the OS refuses to start it. That too is ``DockerError``, never ``OSError``."""
+    unrunnable = tmp_path / "docker"
+    unrunnable.write_text("#!/bin/sh\nexit 0\n")
+    unrunnable.chmod(0o644)
+    with pytest.raises(DockerError, match="could not be started") as info:
+        reap(docker=(str(unrunnable),))
+    assert info.value.exit_code is None
 
 
 def test_reap_runs_whether_or_not_the_executor_is_on(

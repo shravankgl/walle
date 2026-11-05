@@ -153,8 +153,20 @@ class Job:
     timeout_s: float = 60.0
 
     def __post_init__(self) -> None:
+        # A bare ``str`` is itself a sequence of strings, so the element check alone would
+        # pass ``"rm -rf x"`` and run it one character per argument. A ``bool`` is an ``int``,
+        # so ``pids=True`` would be a cap of one and ``timeout_s=True`` one second. Both are
+        # the wrong type, not a wrong value: ``TypeError``, before any value check.
+        if not isinstance(self.command, tuple):
+            raise TypeError(
+                f"command must be a tuple of strings, not a {type(self.command).__name__}"
+            )
         if not self.command or not all(isinstance(part, str) for part in self.command):
             raise ValueError("command must be a non-empty tuple of strings")
+        if isinstance(self.pids, bool) or not isinstance(self.pids, int):
+            raise TypeError(f"pids must be an int, not a {type(self.pids).__name__}")
+        if isinstance(self.timeout_s, bool) or not isinstance(self.timeout_s, int | float):
+            raise TypeError(f"timeout_s must be a number, not a {type(self.timeout_s).__name__}")
         if not _IMAGE.fullmatch(self.image):
             raise ValueError(f"image {self.image!r} is not an image reference")
         if not _MEMORY.fullmatch(self.memory):
@@ -196,11 +208,14 @@ class Outcome:
 
 
 class DockerError(RuntimeError):
-    """The client ran and the daemon said no. ``argv`` is the docker argv (after the client),
-    ``exit_code`` and ``stderr`` the client's."""
+    """The client could not do what was asked. ``argv`` is the docker argv (after the client),
+    ``exit_code`` and ``stderr`` the client's — or, when the client never gave an exit status
+    (not found, could not be started, did not answer in time), ``exit_code`` is ``None`` and
+    ``stderr`` says which."""
 
-    def __init__(self, argv: Sequence[str], exit_code: int, stderr: str) -> None:
-        super().__init__(f"docker {' '.join(argv[:2])} failed ({exit_code}): {stderr.strip()}")
+    def __init__(self, argv: Sequence[str], exit_code: int | None, stderr: str) -> None:
+        status = "no exit status" if exit_code is None else str(exit_code)
+        super().__init__(f"docker {' '.join(argv[:2])} failed ({status}): {stderr.strip()}")
         self.argv = tuple(argv)
         self.exit_code = exit_code
         self.stderr = stderr
@@ -383,6 +398,8 @@ def _gone(client: _Client, selector: str) -> tuple[bool, str]:
             done = client.run(*listing, timeout=CLIENT_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             return False, f"docker ps did not answer in {CLIENT_TIMEOUT_S:g}s\n"
+        except OSError as error:
+            return False, f"docker client could not be started: {error}\n"
         if done.returncode != 0:
             return False, _text(done.stderr) or f"docker ps exited {done.returncode}\n"
         ids = _text(done.stdout).split()
@@ -400,24 +417,44 @@ def reap(token: str | None = None, *, docker: Sequence[str] = ("docker",)) -> tu
     ``removed`` was ``False``. Needs no switch: it consults no environment. Judged by the
     listing after the removal, not by ``rm``'s status (see the module docstring); raises
     ``DockerError`` when the listing fails or still shows something at the end, so a reap that
-    did nothing is never reported as one that did.
+    did nothing is never reported as one that did. A client that is not found, will not start
+    or does not answer in ``CLIENT_TIMEOUT_S`` is a ``DockerError`` too, with ``exit_code``
+    ``None`` — never a ``TimeoutExpired`` or ``OSError`` the caller has to know about.
     """
     client = _Client(tuple(docker))
     selector = f"label={LABEL}" if token is None else f"label={LABEL}={_check_token(token)}"
     listing = ("ps", "--all", "--quiet", "--filter", selector)
-    done = client.run(*listing, timeout=CLIENT_TIMEOUT_S)
+    if shutil.which(client.argv[0]) is None and not Path(client.argv[0]).is_file():
+        raise DockerError(listing, None, f"docker client not found: {client.argv[0]!r}")
+    done = _ask(client, listing)
     if done.returncode != 0:
         raise DockerError(listing, done.returncode, _text(done.stderr))
     ids = tuple(_text(done.stdout).split())
     if not ids:
         return ()
     removal = ("rm", "--force", *ids)
-    done = client.run(*removal, timeout=CLIENT_TIMEOUT_S)
+    done = _ask(client, removal)
     words = _text(done.stderr) if done.returncode != 0 else ""
     gone, listed = _gone(client, selector)
     if not gone:
         raise DockerError(removal, done.returncode, f"{words}{listed}")
     return ids
+
+
+def _ask(client: _Client, argv: tuple[str, ...]) -> subprocess.CompletedProcess[bytes]:
+    """One client call for ``reap``, with the two ways it can fail without an exit status —
+    no answer in ``CLIENT_TIMEOUT_S``, or a client the OS will not start — turned into
+    ``DockerError`` like every other failure ``reap`` reports. ``subprocess.run`` has already
+    killed and waited for a client that timed out."""
+    try:
+        return client.run(*argv, timeout=CLIENT_TIMEOUT_S)
+    except subprocess.TimeoutExpired as expired:
+        words = _text(expired.stderr)
+        raise DockerError(
+            argv, None, f"{words}docker {argv[0]} did not answer in {CLIENT_TIMEOUT_S:g}s"
+        ) from None
+    except OSError as error:
+        raise DockerError(argv, None, f"docker client could not be started: {error}") from None
 
 
 def unavailable(docker: Sequence[str] = ("docker",)) -> str | None:
