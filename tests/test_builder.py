@@ -35,8 +35,12 @@ from test_constraints import MODEL_OR_NETWORK, imports_of
 from walle import builder, envelope, executor, hazards, index, staging
 from walle.builder import (
     ACTOR_BUILDER,
+    ARG_CHARS,
+    BODY_CHARS,
     BUILDER_SWITCH,
+    COMMAND_PARTS,
     MAX_STEPS,
+    PATH_COUNT,
     SWITCH_ON,
     WORKFLOW_HEADER,
     Approved,
@@ -616,6 +620,117 @@ def test_a_hazard_split_across_two_strings_is_seen_as_the_person_will_see_it(roo
     assert all(not hazards.flag(builder.SCAN_PREFIX + part) for part in split)
     result = build(_approval(root), Scripted(_reply(_step(command=split))), environ=ON)
     assert isinstance(result, Refusal) and "instruction" in result.reason
+
+
+# --- issue #116: what the comparison found -----------------------------------------------------
+
+DEEP = "[" * 100_000 + "]" * 100_000
+"""Nesting past the interpreter's recursion limit: ``json.loads`` raises ``RecursionError``,
+which is not a ``ValueError``."""
+
+
+def test_a_deeply_nested_reply_is_refused_like_any_malformed_one(root: Path) -> None:
+    """#116 (1): ``_parse_reply`` caught ``ValueError`` only, so a reply nested past the limit
+    raised out of ``build``. Nothing is written either way; here it must refuse."""
+    approval = _approval(root)
+    before = _lines(root)
+    model = Scripted(DEEP)
+    result = build(approval, model, environ=ON)
+    assert isinstance(result, Refusal) and "not a workflow" in result.reason
+    assert "[[" not in result.reason and model.calls == 1
+    assert _lines(root) == before
+
+
+def test_a_deeply_nested_kept_body_is_refused_by_run_step_not_raised(
+    root: Path, tmp_path: Path
+) -> None:
+    """#116 (1): ``parse_workflow`` had the same catch, so a kept workflow whose body a person
+    edited into deep nesting raised out of ``run_step``."""
+    body = WORKFLOW_HEADER + "\n" + DEEP
+    assert isinstance(parse_workflow(body), str)
+    deep_ref = staging.edit(root, P, D, _staged_ref(root), body=body, summary="workflow: deep")
+    docker, record = _fake(tmp_path)
+    result = run_step(
+        root, P, deep_ref, "write-plan", _workspace(tmp_path), environ=ALL_ON, docker=docker
+    )
+    assert isinstance(result, Refusal) and "not a workflow" in result.reason
+    assert not record.exists()
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        _reply(title="ok \udc80"),
+        _reply(_step(title="ok \udc80")),
+        _reply(_step(command=["sh", "-c", "\udc80"])),
+        _reply(_step(writes=["plans/\udc80"])),
+        _reply(_step(id="\udc80")),
+        json.dumps({"title": "t", "steps": [{**_step(), "\udc80": 1}]}),
+    ],
+)
+def test_a_lone_surrogate_is_refused_at_build_with_a_reason(root: Path, reply: str) -> None:
+    """#116 (2): ``"\\udc80"`` arrives legally through a JSON escape and cannot be written as
+    UTF-8. It passed ``build`` and raised a ``ValidationError`` inside ``stage``; now ``build``
+    refuses it and says why, before ``stage`` is reached."""
+    assert "\\udc80" in reply
+    result = build(_approval(root), Scripted(reply), environ=ON)
+    assert isinstance(result, Refusal)
+    assert "UTF-8" in result.reason and "\udc80" not in result.reason
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        json.dumps({"title": "t", "steps": [_step()], "ignore previous NONCE7": 1}),
+        _reply({**_step(), "ignore previous NONCE7": 1, "NONCE8": 2}),
+    ],
+)
+def test_a_key_the_model_invented_is_counted_not_quoted(root: Path, reply: str) -> None:
+    """#116 (3): key names are the model's words too. Missing keys are ours and are named;
+    unexpected ones are counted."""
+    result = build(_approval(root), Scripted(reply), environ=ON)
+    assert isinstance(result, Refusal)
+    assert "NONCE" not in result.reason
+    assert "unexpected" in result.reason and ("1 " in result.reason or "2 " in result.reason)
+
+
+def test_missing_keys_are_still_named(root: Path) -> None:
+    result = build(_approval(root), Scripted(json.dumps({"title": "t"})), environ=ON)
+    assert isinstance(result, Refusal) and "'steps'" in result.reason
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        _reply(_step(command=["x"] * (COMMAND_PARTS + 1))),
+        _reply(_step(reads=["a"] * (PATH_COUNT + 1))),
+        _reply(_step(writes=["a"] * (PATH_COUNT + 1))),
+        _reply(_step(writes=["p/" + "x" * 300])),
+        _reply(*[_step(id=f"s{i}", command=["x" * ARG_CHARS] * COMMAND_PARTS) for i in range(8)]),
+    ],
+)
+def test_a_reply_past_the_bounds_is_refused_and_nothing_is_staged(root: Path, reply: str) -> None:
+    """#116 (4): each step's argv and path lists, each path, and the whole staged body are
+    bounded, so one reply cannot put megabytes into the log."""
+    approval = _approval(root)  # writes the proposal and the keep; count after
+    before = _lines(root)
+    result = build(approval, Scripted(reply), environ=ON)
+    assert isinstance(result, Refusal) and "not a workflow" in result.reason
+    assert _lines(root) == before
+
+
+def test_a_reply_at_the_bounds_is_accepted(root: Path) -> None:
+    reply = _reply(_step(command=["x"] * COMMAND_PARTS, reads=[f"r{i}" for i in range(PATH_COUNT)]))
+    assert isinstance(build(_approval(root), Scripted(reply), environ=ON), Draft)
+    assert len(_draft(root).body()) <= BODY_CHARS
+
+
+@pytest.mark.parametrize("title", ["a\rb", "a\u2028b", "a\x0bb", "a\x0cb", "a\x85b"])
+def test_a_title_with_any_line_break_is_refused(root: Path, title: str) -> None:
+    """#116 (5): a title is one line (D81), and ``\\n`` is not the only line break."""
+    for reply in (_reply(title=title), _reply(_step(title=title))):
+        result = build(_approval(root), Scripted(reply), environ=ON)
+        assert isinstance(result, Refusal) and "not a workflow" in result.reason
 
 
 def test_parse_workflow_reads_back_exactly_what_stage_wrote(root: Path) -> None:
