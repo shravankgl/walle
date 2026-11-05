@@ -409,8 +409,8 @@ class Event(BaseModel):
 # §5.2's taxonomy also has utterance, capability, trust, feedback and outcome. They belong
 # to phases that do not exist yet; adding them now would be guessing at their fields with
 # nothing to check the guess against. `mission` and `step` arrived with Phase 2 (R8, D67),
-# `ask` and `answer` with its inbox (D78), `automation` with Phase 3's register (D6), and
-# `outcome` with its survival report (D20).
+# `ask` and `answer` with its inbox (D78), `automation` with Phase 3's register (D6),
+# `outcome` with its survival report (D20), and `utterance` with its conversation rules (D61).
 
 
 class Observation(Event):
@@ -888,6 +888,53 @@ class Outcome(Event):
     note: str | None = None
 
 
+# --- utterances (D61) ---------------------------------------------------------------------
+
+
+_SPEAKER_RE = re.compile(r"[A-Za-z0-9+][A-Za-z0-9_.:@+-]{0,127}")
+
+
+def check_speaker(value: str) -> str:
+    """A speaker is the platform's id for a person, never a display name (D61): one token,
+    no whitespace and no angle brackets, so it cannot print as a sentence or a tag."""
+    if not _SPEAKER_RE.fullmatch(value):
+        raise ValueError(
+            f"not a speaker id: {value!r} — letters, digits, '_', '.', ':', '@', '+' and '-', "
+            "as the platform gives it; never a display name"
+        )
+    return value
+
+
+type SpeakerId = Annotated[str, AfterValidator(check_speaker)]
+
+type RoleName = Literal["operator", "stakeholder", "admin"]
+"""D27's three roles, by name. ``walle.profiles.Role`` is the enum; the event carries the
+name so that the events module imports nothing that reads a folder."""
+
+
+class Utterance(Event):
+    """One completed turn in a conversation (§5.1, §5.2; D61).
+
+    ``conversation`` is the platform's id for the conversation. ``speaker`` is the identity
+    the kernel **verified** for the message — the principal's name when the platform's id
+    resolves to one, the platform's id otherwise — never a display name and never anything
+    the message says about itself. ``role`` is the role the kernel attached to that speaker
+    for this message, or ``None`` when it could attach none: an unknown speaker is the
+    lowest role. ``body`` is the words, kept as data.
+
+    The context ratchet is a fold over these: the lowest role that has ever spoken in a
+    conversation, from the log, so that a restart cannot reset it (D61). There is no
+    ``floor`` field, because a floor is what the fold says, never what one turn declares.
+    """
+
+    type: Literal["utterance"] = "utterance"
+
+    conversation: CallId
+    speaker: SpeakerId
+    role: RoleName | None = None
+    body: str
+
+
 type AnyEvent = Annotated[
     Observation
     | Assertion
@@ -900,7 +947,8 @@ type AnyEvent = Annotated[
     | Ask
     | Answer
     | Automation
-    | Outcome,
+    | Outcome
+    | Utterance,
     Field(discriminator="type"),
 ]
 
@@ -919,6 +967,7 @@ EVENT_TYPES: dict[str, type[Event]] = {
     "answer": Answer,
     "automation": Automation,
     "outcome": Outcome,
+    "utterance": Utterance,
 }
 
 
