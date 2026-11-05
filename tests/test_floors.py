@@ -385,6 +385,127 @@ def test_a_rename_whose_source_is_a_link_to_a_floor_path_is_refused(root: Path) 
     assert found is not None and found.protected == f"principals/p-{P}/keys"
 
 
+# --- review round one: the hops in between (PR #85, two medium, one low) ----------------------
+
+
+@pytest.fixture
+def grants_out(root: Path, tmp_path: Path) -> Path:
+    """``grants/`` is a link pointing out of the root, so the final resolution lands outside;
+    only a check of the hop in between can see it."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (principal_dir(root, P) / "grants").symlink_to(outside, target_is_directory=True)
+    return outside
+
+
+def test_a_floor_path_linked_out_is_refused_through_another_hop(
+    root: Path, grants_out: Path
+) -> None:
+    """Review case 1a: ``scratch/g -> ../grants``, and ``grants`` points out of the root. By name
+    the path is ``scratch/g/...``; fully resolved it is outside; the hop in the middle is the
+    floor path."""
+    (principal_dir(root, P) / "scratch" / "g").symlink_to("../grants")
+    found = floored(root, Op(Kind.WRITE, f"principals/p-{P}/scratch/g/calendar.json"))
+    assert found is not None and found.protected == f"principals/p-{P}/grants"
+
+
+def test_a_floor_path_linked_out_is_refused_through_a_climb_out_and_back(
+    root: Path, grants_out: Path
+) -> None:
+    """Review case 1b: ``../walle/principals/p-sam/grants/...`` names the floor path once the
+    relative spelling is made absolute against the root."""
+    climb = f"../{root.name}/principals/p-{P}/grants"
+    for op in (Op(Kind.WRITE, climb + "/calendar.json"), Op(Kind.DELETE, climb)):
+        found = floored(root, op)
+        assert found is not None and found.protected == f"principals/p-{P}/grants", op
+
+
+def test_a_floor_path_linked_out_is_refused_across_a_linked_root(
+    root: Path, grants_out: Path, tmp_path: Path
+) -> None:
+    """Review case 1c: the root is named through a link and the path through the real folder,
+    or the other way round (macOS: ``/var`` and ``/private/var``)."""
+    via = tmp_path / "via"
+    via.symlink_to(root, target_is_directory=True)
+    target = f"principals/p-{P}/grants/calendar.json"
+    assert (f := floored(via, Op(Kind.WRITE, str(root / target)))) and f.protected.endswith(
+        "grants"
+    )
+    assert (f := floored(root, Op(Kind.WRITE, str(via / target)))) and f.protected.endswith(
+        "grants"
+    )
+
+
+def test_a_relative_root_with_an_absolute_path_is_refused(
+    root: Path, grants_out: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review case 1d: a root spelled relative to the working directory and a path spelled
+    absolute name the same floor path."""
+    monkeypatch.chdir(root.parent)
+    found = floored(Path(root.name), Op(Kind.WRITE, str(root / f"principals/p-{P}/grants/c.json")))
+    assert found is not None and found.protected == f"principals/p-{P}/grants"
+
+
+def test_a_relative_link_target_is_resolved_against_the_link_s_own_folder(root: Path) -> None:
+    """Review case 2: ``os.symlink(to, path)`` resolves a relative ``to`` from ``dirname(path)``,
+    so the two links the symlink tests above plant must themselves be refused."""
+    for op in (
+        Op(Kind.LINK, f"principals/p-{P}/notes", "hot"),
+        Op(Kind.LINK, f"principals/p-{P}/scratch/g", "../keys/grocer.key"),
+    ):
+        found = floored(root, op)
+        assert found is not None and found.end == "to", op
+    assert found.protected == f"principals/p-{P}/keys"
+
+
+def test_a_relative_link_target_is_also_checked_against_the_root_for_hard_links(root: Path) -> None:
+    """A hard link's ``to`` is a path like any other, read from the root."""
+    found = floored(root, Op(Kind.LINK, f"principals/p-{P}/scratch/k", f"principals/p-{P}/keys/x"))
+    assert found is not None and found.end == "to" and found.protected == f"principals/p-{P}/keys"
+
+
+def test_a_relative_link_target_is_checked_from_the_folder_s_resolved_form(root: Path) -> None:
+    """The link's folder may itself be a link: ``alias -> scratch``, then ``alias/k -> ../keys``
+    is ``scratch/../keys``, which is ``keys``."""
+    (principal_dir(root, P) / "alias").symlink_to("scratch")
+    found = floored(root, Op(Kind.LINK, f"principals/p-{P}/alias/k", "../keys"))
+    assert found is not None and found.protected == f"principals/p-{P}/keys"
+
+
+def test_a_dot_dot_after_a_link_is_read_as_the_os_reads_it(root: Path) -> None:
+    """Lexically ``scratch/L/../x`` is ``scratch/x``; the OS follows ``L`` first, so with
+    ``L -> ../keys/sub`` the ``..`` steps back to ``keys`` and the write lands in it."""
+    (principal_dir(root, P) / "scratch" / "L").symlink_to("../keys/sub")
+    assert hit(f"principals/p-{P}/scratch/L/../x") is None
+    found = floored(root, Op(Kind.WRITE, f"principals/p-{P}/scratch/L/../x"))
+    assert found is not None and found.protected == f"principals/p-{P}/keys"
+
+
+def test_a_principal_folder_that_is_a_link_does_not_floor_its_log(
+    root: Path, tmp_path: Path
+) -> None:
+    """A hop *above* a floor path is read on the way through, not written: a principal kept
+    on another disk still gets to append to its log. The folder itself stays floored."""
+    disk = tmp_path / "disk" / "p-ana"
+    (disk / "log").mkdir(parents=True)
+    (root / "principals" / "p-ana").symlink_to(disk, target_is_directory=True)
+    assert floored(root, Op(Kind.WRITE, "principals/p-ana/log/d-mbp.jsonl")) is None
+    assert floored(root, Op(Kind.DELETE, "principals/p-ana")) is not None
+    assert floored(root, Op(Kind.WRITE, "principals/p-ana/hot/rules.md")) is not None
+
+
+def test_a_link_target_to_an_ordinary_place_is_not_floored(root: Path) -> None:
+    assert floored(root, Op(Kind.LINK, f"principals/p-{P}/plans/latest.md", "week.md")) is None
+    assert floored(root, Op(Kind.LINK, f"principals/p-{P}/scratch/p", "../plans")) is None
+
+
+def test_the_root_prefix_is_compared_without_regard_to_case_like_the_floor_is(root: Path) -> None:
+    """Review case 3 (low): ``hit`` folds case; the root prefix of an absolute path must too."""
+    spelled = str(root).upper() + f"/principals/p-{P}/hot/rules.md"
+    found = floored(root, Op(Kind.WRITE, spelled))
+    assert found is not None and found.protected == f"principals/p-{P}/hot" and found.how == "under"
+
+
 # --- what passes -----------------------------------------------------------------------------
 
 

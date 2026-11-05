@@ -52,14 +52,27 @@ the manifest, before anything — so a plan that declares a floored write is ref
 way in every mode. It answers nothing about an absolute path or one that climbs out through
 ``..``, because without a root there is no answer.
 
-``floored`` has a root and a filesystem. For each end of the operation it asks ``hit`` twice:
-once about the path **as given** (made relative to the root as given), and once about where it
-**resolves to** — ``os.path.realpath`` through every symlink, including a dangling one, whose
-missing target is where a write would land. Either answer floors it. Both are needed: a link
-under an innocent name only shows under resolution, and a protected folder replaced by a link
-pointing *out* of the root only shows by name — the host loads ``hot/rules.md`` by that name and
-follows the link, so a write to the name is a write to what the host reads. A path that cannot
-be resolved (a link loop, an unreadable link) is refused: fail closed (D86).
+``floored`` has a root and a filesystem. For each end of the operation it asks ``hit`` about
+three things, and any one floors it:
+
+- the path **as given**, made absolute against the root and folded lexically (``abspath``), so
+  ``../walle/principals/p-sam/grants`` is read as the floor path it names and a root spelled
+  relative to the working directory agrees with a path spelled absolute;
+- **every symlink met on the way**, walking the path one component at a time from the real
+  root, as ``walle.sandbox._symlink_hops`` does, each link named as itself with its folder
+  already resolved. A protected folder replaced by a link pointing *out* of the root is seen
+  here whatever name it was reached through, because the host loads ``hot/rules.md`` by that
+  name and follows the link: a write through the name is a write to what the host reads. A
+  hop counts when it *is* or is *under* a floor path, not when it is above one — a hop is
+  read on the way through, and what gets written is where it leads;
+- **where it lands**, the fully resolved path, including the missing target of a dangling link,
+  which is where a write would create something.
+
+A relative target of a ``link`` is, as the OS reads it, relative to the folder the link is
+made in, not to the root, so ``to`` is also walked from ``dirname(path)`` — that folder
+resolved first, since it may itself be a link. It is walked from the root as well, which is
+what a hard link's ``to`` means. A path that cannot be resolved — a link loop, a link or a
+folder that cannot be read, an embedded NUL — is refused: fail closed (D86).
 
 Every kind of write is one ``Op``: ``write`` (create, change, truncate, chmod — anything that
 changes what is at the path), ``delete``, ``rename`` (both ends) and ``link`` (hard or
@@ -69,8 +82,8 @@ reads as what was asked; no kind is let through that another is not.
 The dormant rule, for a check
 -----------------------------
 This module never writes, starts nothing, reads no clock and no environment, and has no
-command. Its only filesystem calls are the ones that resolve a name (``realpath`` and
-``lstat``). There is no switch, because a floor that can be turned off is not a floor; what
+command. Its only filesystem calls are the ones that resolve a name (``lstat`` and
+``readlink``). There is no switch, because a floor that can be turned off is not a floor; what
 the switch governs — whether any step runs at all — stays in ``walle.missions`` and stays off
 (D117).
 """
@@ -239,67 +252,119 @@ def hit(relative: str) -> Hit | None:
 # --- on disk ------------------------------------------------------------------------------------
 
 
-def _real(path: str) -> str | None:
-    """Where ``path`` lands, through every link including a dangling one; ``None`` when that
-    cannot be known. ``realpath`` never raises here: it leaves a loop in place, and treats a
-    component it cannot ``lstat`` as a plain name. So every prefix of the result is looked at
-    again, and one that is still a link, or cannot be looked at, means the answer is unknown."""
-    try:
-        real = os.path.realpath(path)
-    except (OSError, ValueError):  # ValueError: an embedded NUL, which no path may carry
-        return None
-    prefix = real
-    while True:
+HOP_LIMIT = 40
+"""Links followed before a walk is called a loop and refused. The kernel's own limit is of
+the same order; a legitimate layout is nowhere near it."""
+
+
+def _walk(path: str) -> tuple[list[str], str] | None:
+    """Resolve an absolute ``path`` one component at a time. Returns every symlink met, each
+    named as itself with its folder already resolved, and where the path finally lands —
+    through a dangling link to the name it would create. ``None`` when the answer is not
+    knowable: a loop, a link or folder that cannot be read, a NUL in a name."""
+    hops: list[str] = []
+    current = os.sep
+    parts = [p for p in path.split(os.sep) if p]
+    while parts:
+        part = parts.pop(0)
+        if part == ".":
+            continue
+        if part == "..":
+            current = os.path.dirname(current)
+            continue
+        candidate = os.path.join(current, part)
         try:
-            if stat.S_ISLNK(os.lstat(prefix).st_mode):
-                return None
+            is_link = stat.S_ISLNK(os.lstat(candidate).st_mode)
         except FileNotFoundError:
-            pass  # the missing tail ``realpath`` appended: nothing there to be a link
+            is_link = False  # nothing there yet: the rest of the path is what would be made
         except (OSError, ValueError):
-            return None  # unreadable, a loop, a file in the way: where it lands is unknown
-        parent = os.path.dirname(prefix)
-        if parent == prefix:
-            return real
-        prefix = parent
+            return None
+        if not is_link:
+            current = candidate
+            continue
+        if len(hops) >= HOP_LIMIT:
+            return None
+        hops.append(candidate)
+        try:
+            target = os.readlink(candidate)
+        except (OSError, ValueError):
+            return None
+        if os.path.isabs(target):
+            current = os.sep
+        parts = [p for p in target.split(os.sep) if p] + parts
+    return hops, current
 
 
 def _relative(path: str, root: str) -> str | None:
-    """``path`` relative to ``root``, both already normalized the same way, or ``None`` when
-    it is not under the root. An empty string is the root itself."""
-    if path == root:
+    """``path`` relative to ``root``, both absolute and normalized the same way, compared
+    without regard to case as ``hit`` compares, or ``None`` when it is not under the root. An
+    empty string is the root itself."""
+    if path.lower() == root.lower():
         return ""
     base = root.rstrip(os.sep) + os.sep
-    if path.startswith(base):
+    if path[: len(base)].lower() == base.lower():
         return path[len(base) :]
     return None
 
 
-def _as_given(root: str, path: str) -> str | None:
-    """The path as the caller spelled it, relative to the root as the caller spelled it."""
-    if not os.path.isabs(path):
-        return path
-    return _relative(os.path.normpath(path), os.path.normpath(root))
+def _absolute(root: str, path: str) -> str:
+    """``path`` as an absolute path, read from ``root`` when relative, folded lexically."""
+    return os.path.abspath(os.path.join(root, path))
+
+
+def _unfolded(root: str, path: str) -> str:
+    """The same, with every ``.`` and ``..`` left in place for ``_walk`` to apply *after* the
+    link before it is followed, as the OS does: ``L/../x`` with ``L -> keys/sub`` is
+    ``keys/x``, which folding first would hide."""
+    joined = os.path.join(root, path)
+    return joined if os.path.isabs(joined) else os.path.join(os.getcwd(), joined)
+
+
+def _check(
+    root_abs: str, root_real: str, path: str, *, at: str | None = None
+) -> tuple[Hit, str | None] | None:
+    """The three questions of the module docstring about one path. ``at`` is the folder a
+    relative path is read from, the root when not given. Returns the hit and the resolved
+    path it was found at (``None`` when found by name), or ``None`` when clear; a hit of
+    ``unresolvable`` when the walk could not finish."""
+    given = _absolute(at or root_abs, path)
+    if (rel := _relative(given, root_abs)) is not None and (found := hit(rel)) is not None:
+        return found, None
+    walked = _walk(_unfolded(at or root_abs, path))
+    if walked is None:
+        return Hit("", "unresolvable"), None
+    hops, landing = walked
+    for hop in hops:
+        rel = _relative(hop, root_real)
+        if rel and (found := hit(rel)) is not None and found.how != "above":
+            return found, hop
+    if (rel := _relative(landing, root_real)) is not None and (found := hit(rel)) is not None:
+        return found, landing
+    return None
 
 
 def floored(root: str | os.PathLike[str], op: Op) -> Floored | None:
-    """Whether any end of ``op`` reaches a floor path under ``root``, by name or after
-    resolving links. ``None`` means the floor does not apply; it says nothing about the
-    manifest, which is ``walle.manifest``'s question.
+    """Whether any end of ``op`` reaches a floor path under ``root``: by name, through any
+    link on the way, or where it lands. ``None`` means the floor does not apply; it says
+    nothing about the manifest, which is ``walle.manifest``'s question.
 
-    Reads the filesystem only to resolve names: ``realpath`` and ``lstat``. Writes nothing.
+    Reads the filesystem only to resolve names: ``lstat`` and ``readlink``. Writes nothing.
     """
-    root_text = os.fspath(root)
-    root_real = _real(root_text)
-    if root_real is None:
+    root_abs = os.path.abspath(os.fspath(root))
+    walked_root = _walk(root_abs)
+    if walked_root is None:
         return Floored(op, "path", op.path, "", "unresolvable")
+    root_real = walked_root[1]
     for end, path in op.ends:
-        given = _as_given(root_text, path)
-        if given is not None and (found := hit(given)) is not None:
-            return Floored(op, end, path, found.protected, found.how)
-        real = _real(os.path.join(root_text, path))
-        if real is None:
-            return Floored(op, end, path, "", "unresolvable")
-        resolved = _relative(real, root_real)
-        if resolved is not None and (found := hit(resolved)) is not None:
-            return Floored(op, end, path, found.protected, found.how, resolved=real)
+        if (result := _check(root_abs, root_real, path)) is not None:
+            found, where = result
+            return Floored(op, end, path, found.protected, found.how, resolved=where)
+    if op.kind is Kind.LINK and op.to is not None and not os.path.isabs(op.to):
+        # a relative symlink target is read from the link's own folder, resolved first
+        folder = _walk(_unfolded(root_abs, os.path.dirname(op.path)))
+        if folder is None:
+            return Floored(op, "to", op.to, "", "unresolvable")
+        if (result := _check(root_abs, root_real, op.to, at=folder[1])) is not None:
+            found, where = result
+            return Floored(op, "to", op.to, found.protected, found.how, resolved=where)
     return None

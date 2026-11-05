@@ -21,15 +21,18 @@ whether missions are off or on. The switch is still off.
     climb out through `..` get `None`: without a root there is no answer by name.
   - `floored(root, op)`, with a root and a filesystem. `Op` is one write of one `Kind` — `write`,
     `delete`, `rename` (both ends), `link` (the name made and the thing it names). For each end
-    it asks `hit` twice: about the path as given, and about where it resolves to through every
-    symlink, dangling ones included. Either floors it. A path that cannot be resolved — a link
-    loop, a component that cannot be looked at, an embedded NUL — is refused as `unresolvable`.
-    The only filesystem calls are `os.path.realpath` and `os.lstat`; nothing is written.
+    it asks `hit` three times: about the path as given (made absolute against the root and
+    folded), about every symlink met on the way (walked one component at a time, as
+    `sandbox._symlink_hops` does), and about where it lands, dangling links included. Any one
+    floors it. A path that cannot be resolved — a link loop, a component that cannot be looked
+    at, an embedded NUL — is refused as `unresolvable`. The only filesystem calls are `os.lstat`
+    and `os.readlink`; nothing is written. (The first commit used `os.path.realpath` and asked
+    twice; the review round below is what changed it.)
 - `src/walle/missions.py`: rule 8 of the docstring, and three lines in `admit`: every path in
   `touch.writes` is asked of `hit` **first** — before the switch, before paused, before the node's
   state, before the manifest — so a declared write to a floored path gets the same refusal, word
   for word, with the switch unset, empty, misspelled or `on`.
-- `tests/test_floors.py`, 112 tests: the table pinned; every floor path by name, under, above,
+- `tests/test_floors.py`, 123 tests after the review round: the table pinned; every floor path by name, under, above,
   however spelled; every floor path on disk against every kind of write; the rename and link ends
   named in the refusal; the symlink cases the issue asks for and the ones around them; what passes;
   the sandbox profile; the gate in every mode; nothing can lift it; the dormant rule; the `Op`'s own
@@ -113,10 +116,11 @@ module, every path of it an error path). Found and fixed:
 - `realpath` treats a component it cannot `lstat` (a folder without search permission) as a plain
   name and carries on, and `os.path.islink` swallows the same error, so the first version's
   loop-detection walk would have called such a path resolved — and the refusal text already claimed
-  otherwise, a status message that lied. The walk now uses `lstat` directly: missing is fine (the
-  tail `realpath` appended), anything else is unknown and refused. Tested with a patched `lstat`.
+  otherwise, a status message that lied. Fixed then with a direct `lstat`; after the review round
+  the component walk is the only resolver and the same rule holds: missing is fine (what would be
+  made), anything else is unknown and refused. Tested with a patched `lstat`.
 Looked for and not found: a way to reach a protected name that neither layer sees (every spelling
-goes through `normpath` and lower-casing; every link through `realpath` and the re-walk; the one
+goes through `normpath` and lower-casing; every link through the component walk (after the review round); the one
 gap is the window above, which is the executor's); a false floor on the agent's own writes (the
 log, the index, `plans/`, `hotel/`, `keystone`, a path outside the root, all tested clear); an
 `Op` that reaches the check with a missing or extra end (refused at construction); a difference
@@ -124,6 +128,49 @@ between `admit` and `floored` on the same relative path (`admit` calls the same 
 
 **Review:** independent review is the reviewer agent's, on this PR, per the brief. No
 `scripts/review.sh` run; the brief replaces it for agent work.
+
+**Review round one (head `b63461a`, Gemini 4 Argon, direct review of all six files): two medium,
+one low, all fixed on the same branch in a second commit.** Each was a real gap, and each got its
+failing test before the fix:
+
+1. *Medium — `floored` asked only about the raw path and the fully resolved one.* A protected
+   folder that is itself a link pointing out of the root was caught only when reached by its own
+   name. Reached through another hop (`scratch/g -> ../grants`), through a `..` climb-out and
+   back (`../walle/principals/p-sam/grants`), across a linked root (`via -> root`, in either
+   direction, which is macOS's `/var`), or with a relative root and an absolute path, the first
+   check saw an innocent name and the second saw a path outside the root. Four tests, one per
+   case, all failing before. Fix: `_walk` resolves one component at a time from the real root and
+   returns every link met, each named as itself with its folder already resolved; every hop that
+   *is* or is *under* a floor path refuses (a hop *above* one does not — it is read on the way
+   through, not written, and a principal folder kept on another disk must still append to its
+   log; `test_a_principal_folder_that_is_a_link_does_not_floor_its_log`). Roots and the as-given
+   path are made absolute with `abspath` so the lexical check agrees across spellings. One thing
+   the reviewer's suggestion would have missed, found while doing it: folding `..` lexically
+   *before* the walk hides `scratch/L/../x` with `L -> ../keys/sub`, which the OS reads as
+   `keys/x`. So the by-name check folds and the walk does not; `_walk` applies `..` to the
+   resolved folder, as the kernel does (`test_a_dot_dot_after_a_link_is_read_as_the_os_reads_it`).
+2. *Medium — a `link`'s relative `to` was read from the root.* `os.symlink(to, path)` reads a
+   relative `to` from `dirname(path)`, so the very links the symlink tests plant
+   (`notes -> hot`, `scratch/g -> ../keys/grocer.key`) passed `floored`. Fix: a relative `to` is
+   also walked from the link's folder, that folder resolved first (`alias -> scratch`, then
+   `alias/k -> ../keys`), and still from the root, which is what a hard link's `to` means. Three
+   tests failing before, one control that an ordinary relative target still passes.
+3. *Low — `_relative` compared the root prefix case-sensitively while `hit` folds case.* Now it
+   folds too, and returns the original slice. One test.
+
+Fail-closed was kept throughout: a hop that cannot be `lstat`ed or `readlink`ed, a folder with a
+file in the way, a NUL, or more than `HOP_LIMIT` (40) links is `unresolvable` and refused. The
+`realpath`-based `_real` is gone; the walk is the one resolver, so the loop and permission cases
+from the first stranger pass are now covered by the same code path as the new ones. The devlog's
+first-commit descriptions above were corrected rather than left to lie. The branch was not behind
+`main` (`e29426c`) at push time, so no merge from main was needed.
+
+```
+uv run pytest               2262 passed, 10 skipped in 84.38s
+uv run ruff check           All checks passed!
+uv run ruff format --check  139 files already formatted
+uv run pyright              0 errors, 0 warnings, 0 informations
+```
 
 **Choices made inside the task:**
 - **Parents are floored, for every kind.** The issue says "including renames", and the rename that
@@ -156,7 +203,7 @@ between `admit` and `floored` on the same relative path (`admit` calls the same 
   `Touch` from the same; `admit` sees the `Touch`, `floored` the `Op`s.
 
 **What to read first:** `PROTECTED` and `hit` in `floors.py` (about 40 lines), then the "Two layers"
-section of its docstring, then `_real` and `floored`. Then
+section of its docstring, then `_walk`, `_check` and `floored`. Then
 `test_a_declared_write_to_a_floor_path_is_refused_in_every_mode`,
 `test_a_link_inside_the_root_under_an_innocent_name_is_refused` and
 `test_a_floor_path_replaced_by_a_link_pointing_out_is_still_refused`, which between them are the
