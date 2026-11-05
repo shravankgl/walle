@@ -1,0 +1,35 @@
+{
+  "principal": "ira",
+  "events": 5,
+  "state_hash": "38a3055e0fb8591d46b831a76c155058339b5e818745851f219f197fea17ae36",
+  "fold": {
+    "current": [],
+    "retired": [],
+    "conflicts": [],
+    "unapplied": [],
+    "staged": []
+  },
+  "sentinels": {
+    "d-tab:1.title": "Sunday meal plan",
+    "d-tab:1.nodes.0.id": "pick-recipes",
+    "d-tab:1.nodes.0.token_budget": 2000,
+    "d-tab:1.nodes.0.cost_budget_usd": 0.1,
+    "d-tab:1.nodes.0.reads.1": "shared/recipes",
+    "d-tab:1.nodes.0.writes.0": "principals/p-ira/plans",
+    "d-tab:1.nodes.1.id": "order-groceries",
+    "d-tab:1.nodes.1.cost_budget_usd": 0.25,
+    "d-tab:1.nodes.1.egress.0": "grocer.example",
+    "d-tab:1.nodes.2.id": "text-arjun",
+    "d-tab:1.nodes.2.assignee": "ira",
+    "d-tab:1.links.1.target": "text-arjun",
+    "d-tab:2.tokens": 800,
+    "d-tab:2.cost_usd": 0.02,
+    "d-tab:3.tokens": 900,
+    "d-tab:3.note": "two dinners picked, still reading the soup notes",
+    "d-tab:4.tokens": 600,
+    "d-tab:4.caused_by.0": "d-tab:3",
+    "d-tab:5.status": "failed",
+    "d-tab:5.note": "node 'pick-recipes' spent 2300 tokens of its 2000 token budget",
+    "d-tab:5.caused_by.2": "d-tab:4"
+  }
+}
