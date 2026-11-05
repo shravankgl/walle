@@ -55,9 +55,14 @@ The model
 implementation here is ``FakeModel``, deterministic and offline: it proposes the person's
 own lines that read as lasting statements, and keeps a staged item on the same test. It
 exists so every path here is testable with no key and no network, and so that ``walle
-propose --model fake`` can be run against a real log to see what the pipeline does. A
-provider adapter (D87: ``provider:model`` through aisuite) is a later task and lives in its
-own module; this one imports no model or network library.
+propose --model fake`` can be run against a real log to see what the pipeline does. The
+provider adapter (D87: ``provider:model`` through aisuite, ``ollama:`` as the local tier)
+lives in ``walle.models``; this module imports no model or network library.
+
+A model that cannot answer, because the provider failed, timed out, refused the connection
+or rate-limited the request, raises ``ModelCallError``. While proposing that ends the run
+before anything is written, like an unreadable reply. While judging, after the proposals
+are durable, it ends the judging and is reported in ``shadow_error``.
 
 Silence is a result (D63)
 -------------------------
@@ -172,6 +177,12 @@ class Model(Protocol):
 class ModelReplyError(Exception):
     """The model's reply could not be read as the list it was asked for. Nothing is written
     from such a reply (D86)."""
+
+
+class ModelCallError(Exception):
+    """The model gave no reply: the provider failed, timed out, could not be reached, or
+    rate-limited the request. The message says which, and never carries a key or the
+    provider's own error text. Raised by an adapter's ``complete``; nothing is retried."""
 
 
 PROPOSE_INSTRUCTIONS = (
@@ -381,7 +392,8 @@ class FakeModel:
 
 
 MODELS: dict[str, type[FakeModel]] = {"fake": FakeModel}
-"""Models the command line can name. Only the fake, until a provider adapter lands."""
+"""Models the command line names by a bare word. Every other model is ``provider:model``,
+built by ``walle.models.resolve``."""
 
 
 # --- replies ------------------------------------------------------------------------------
@@ -664,8 +676,9 @@ def propose(
     """Read the log, stage what the model proposes, record its shadow verdicts.
 
     Raises ``FileNotFoundError`` when the principal has no log (no log is not nothing to
-    propose), ``ValueError`` for an unsafe name, and ``ModelReplyError`` when the proposing
-    reply cannot be read, in which case nothing was written.
+    propose), ``ValueError`` for an unsafe name, ``ModelReplyError`` when the proposing
+    reply cannot be read and ``ModelCallError`` when the model gives no reply at all; in
+    both of those cases nothing was written.
     """
     root = Path(root)
     writer = StreamWriter(root, principal, device)  # validates both names first
@@ -749,7 +762,7 @@ def propose(
             judged, asked = _judge(model, to_judge, when)
             requests += asked
             verdicts = _append_verdicts(verdicts_path(root, principal), judged)
-    except (ModelReplyError, OSError, ValueError) as exc:
+    except (ModelReplyError, ModelCallError, OSError, ValueError) as exc:
         shadow_error = f"{type(exc).__name__}: {exc}"
 
     return ProposeReport(

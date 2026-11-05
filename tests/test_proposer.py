@@ -236,10 +236,10 @@ def test_the_cli_reports_a_run_that_proposed_something(tmp_path: Path) -> None:
 
 
 def test_the_cli_refuses_an_unknown_model(tmp_path: Path) -> None:
+    # Issue #52: `provider:model` is a model name now (test_models.py covers the route), so
+    # the unknown name here is one with no provider at all.
     root = _fixture(tmp_path)
-    code, _out, err = _cli(
-        root, "propose", "--principal", P, "--device", D, "--model", "anthropic:claude"
-    )
+    code, _out, err = _cli(root, "propose", "--principal", P, "--device", D, "--model", "claude")
     assert code == 2
     assert "fake" in err
 
