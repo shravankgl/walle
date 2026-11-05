@@ -561,8 +561,12 @@ class Node(BaseModel):
 
     The manifest is the permission grant (§7 rule 2): ``reads`` and ``writes`` are the paths
     the step may touch and ``egress`` the hosts it may send to, checked before dispatch and
-    not after. A later version that declares more lapses whatever grant the mission had
-    (D117). ``token_budget`` is D22's threshold abort, per step.
+    not after (``walle.manifest``). A later version that declares more lapses whatever grant
+    the mission had (D117). ``token_budget`` and ``cost_budget_usd`` are D22's threshold
+    abort, per step: the fold sums what the node's live status steps report, and a node
+    that has spent more than either is a breach that holds its whole mission. ``None`` is
+    no budget. ``cost_budget_usd`` is optional and was added after the v1 golden log shipped;
+    a line without it loads and hashes unchanged, so it is not a schema bump (D96).
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -573,6 +577,7 @@ class Node(BaseModel):
     writes: list[str] = Field(default_factory=list)
     egress: list[str] = Field(default_factory=list)
     token_budget: int | None = Field(default=None, ge=1)
+    cost_budget_usd: float | None = Field(default=None, gt=0.0, allow_inf_nan=False)
     assignee: str | None = Field(default=None, min_length=1, max_length=64)
     """Who runs it: an actor. ``None`` means whoever runs the mission. Changed by a
     ``reassign`` step, never by rewriting this."""
@@ -659,7 +664,7 @@ class Step(Event):
 
     node: NodeId | None = None
     status: StepStatus | None = None
-    cost_usd: float | None = Field(default=None, ge=0.0)
+    cost_usd: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
     tokens: int | None = Field(default=None, ge=0)
     inject: Node | None = None
     after: list[NodeId] = Field(default_factory=list)
