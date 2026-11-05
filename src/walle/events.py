@@ -33,6 +33,9 @@ D67/D75  ``mission`` is a DAG of steps in ``node_link_data`` shape, each node ca
          manifest (``reads``, ``writes``, ``egress``) and a ``token_budget``; ``step`` is a
          delta against one mission: a node's status, or one of the intervention verbs. The
          resolved DAG is a fold in ``walle.missions``, never a mutation of the mission event.
+D78      ``ask`` is an inbox item — an approval, a question or a notification — keyed by
+         ``(session, tool_call_id)``; ``answer`` resolves one. Resolved once, first responder
+         wins: which answer that is, is a fold in ``walle.inbox``, never an edit of the ask.
 """
 
 from __future__ import annotations
@@ -214,6 +217,34 @@ class StepVerb(StrEnum):
     REASSIGN = "reassign"
 
 
+class AskKind(StrEnum):
+    """What an inbox item asks of a person (D78).
+
+    ``approval`` is a yes or no the run waits on; ``question`` wants words, or one of the
+    item's ``choices``; ``notification`` only wants to be seen. A closed set, like ``Level``.
+    """
+
+    APPROVAL = "approval"
+    QUESTION = "question"
+    NOTIFICATION = "notification"
+
+
+class AnswerOutcome(StrEnum):
+    """How an inbox item was resolved (D78).
+
+    Which outcomes fit which kind of item is ``walle.inbox.FITS``: ``approved`` and ``denied``
+    an approval, ``answered`` a question, ``acknowledged`` a notification. ``orphaned`` fits
+    every kind: the session that asked died, and an orphaned approval can never be
+    meaningfully answered. Only the kernel writes it, and it is never a yes.
+    """
+
+    APPROVED = "approved"
+    DENIED = "denied"
+    ANSWERED = "answered"
+    ACKNOWLEDGED = "acknowledged"
+    ORPHANED = "orphaned"
+
+
 class Level(StrEnum):
     """How an assertion was reached (D94).
 
@@ -339,11 +370,12 @@ class Event(BaseModel):
         return data
 
 
-# --- the five types task 2 covers, task 9's proposal, and Phase 2's mission and step ------
+# --- the five types task 2 covers, task 9's proposal, Phase 2's mission, step, ask, answer -
 #
 # §5.2's taxonomy also has utterance, capability, trust, feedback and outcome. They belong
 # to phases that do not exist yet; adding them now would be guessing at their fields with
-# nothing to check the guess against. `mission` and `step` arrived with Phase 2 (R8, D67).
+# nothing to check the guess against. `mission` and `step` arrived with Phase 2 (R8, D67),
+# and `ask` and `answer` with its inbox (D78).
 
 
 class Observation(Event):
@@ -663,8 +695,105 @@ _STEP_FIELDS: dict[StepVerb, tuple[frozenset[str], frozenset[str]]] = {
 """Per verb: the fields it must carry, and the fields it may."""
 
 
+# --- the inbox (D78) --------------------------------------------------------------------
+
+# A session id or a tool-call id comes from the harness, not from walle: a Claude Code session
+# is a lowercase UUID, a tool call is `toolu_01AbC...`. So mixed case is allowed, unlike a
+# stream id, but whitespace and `/` are not: either would let one id print as two, and the
+# pair is the idempotency key.
+_CALL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
+
+
+def _check_call_id(value: str) -> str:
+    if not _CALL_ID_RE.fullmatch(value):
+        raise ValueError(
+            f"not a session or tool-call id: {value!r} — letters, digits, '_', '.', ':' and '-'"
+        )
+    return value
+
+
+type CallId = Annotated[str, AfterValidator(_check_call_id)]
+
+
+class Ask(Event):
+    """An item in the inbox: something a run needs a person for (D78).
+
+    ``(session, tool_call_id)`` is the item's identity. Asking again with the same pair is the
+    same item, so a run that restarts and re-issues its call does not ask twice. ``body`` is
+    what the person reads. ``choices``, for a question only, are the answers it accepts.
+
+    ``unattended`` records how the person is reached: inline, or through the inbox because
+    nobody is watching. It is routing, never permission — the same outcomes fit the same
+    item either way, and nothing about it lets a run answer itself.
+
+    There is no recipient field on purpose (D63): the run decides *whether* to ask, and
+    configuration decides *where* it goes. ``mission`` and ``node`` say which mission step is
+    waiting, so that a restart can rebuild the wait from the log.
+    """
+
+    type: Literal["ask"] = "ask"
+
+    kind: AskKind
+    session: CallId
+    tool_call_id: CallId
+    body: str = Field(min_length=1)
+    choices: list[str] = Field(default_factory=list)
+    unattended: bool = False
+    mission: Ref | None = None
+    node: NodeId | None = None
+
+    @model_validator(mode="after")
+    def _fields_fit_the_kind(self) -> Ask:
+        if self.choices and self.kind is not AskKind.QUESTION:
+            raise ValueError(f"a {self.kind.value} has no choices; only a question does")
+        if any(not choice.strip() for choice in self.choices):
+            raise ValueError("a choice is empty")
+        if len(set(self.choices)) != len(self.choices):
+            raise ValueError("a choice appears twice")
+        if self.node is not None and self.mission is None:
+            raise ValueError("a node is named without its mission")
+        return self
+
+
+class Answer(Event):
+    """The resolution of one inbox item (D78). ``ask`` is a ref, like ``supersede.target``.
+
+    ``value`` is the words of an ``answered`` question and is carried by nothing else.
+    ``surface`` is where it was answered — ``app``, ``slack``, ``cli`` — for the record only:
+    any surface may answer, and the first answer in the log wins.
+
+    Whether this answer fits its item, and whether its ``actor`` may give it, is decided by
+    the fold, which has the ask in hand; an answer that does not fit is reported, not
+    applied.
+    """
+
+    type: Literal["answer"] = "answer"
+
+    ask: Ref
+    outcome: AnswerOutcome
+    value: str | None = Field(default=None, min_length=1)
+    surface: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def _value_fits_the_outcome(self) -> Answer:
+        if self.outcome is AnswerOutcome.ANSWERED and self.value is None:
+            raise ValueError("an answered question needs a value")
+        if self.outcome is not AnswerOutcome.ANSWERED and self.value is not None:
+            raise ValueError(f"an {self.outcome.value} answer carries no value")
+        return self
+
+
 type AnyEvent = Annotated[
-    Observation | Assertion | Proposal | Supersede | Snapshot | Contradiction | Mission | Step,
+    Observation
+    | Assertion
+    | Proposal
+    | Supersede
+    | Snapshot
+    | Contradiction
+    | Mission
+    | Step
+    | Ask
+    | Answer,
     Field(discriminator="type"),
 ]
 
@@ -679,6 +808,8 @@ EVENT_TYPES: dict[str, type[Event]] = {
     "contradiction": Contradiction,
     "mission": Mission,
     "step": Step,
+    "ask": Ask,
+    "answer": Answer,
 }
 
 
