@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from walle import __version__
 from walle import context as walle_context
+from walle import curator as walle_curator
 from walle import hot as walle_hot
 from walle import index as walle_index
 from walle import models as walle_models
@@ -564,6 +565,85 @@ def propose_command(root: Path, principal: str, device: str, model: str, score: 
         click.echo(f"  shadow: the shadow log is incomplete: {report.shadow_error}", err=True)
     if report.proposed:
         click.echo("Not in the hot tier until you keep them: run `walle review`.")
+
+
+# --- the Curator, propose-only (issue #55) ------------------------------------------------
+
+
+def _curator_model_name(ctx: click.Context, param: click.Parameter, value: str) -> str:
+    """``--model`` for the Curator: the proposer's rule, then D24's: never the local tier."""
+    name = _model_name(ctx, param, value)
+    try:
+        walle_curator.refuse_local(name)
+    except walle_curator.LocalModelRefused as exc:
+        raise click.BadParameter(str(exc)) from None
+    return name
+
+
+@main.command("curate")
+@_ROOT
+@click.option("--principal", required=True, help="Whose beliefs to read, without the p- prefix.")
+@_DEVICE
+@click.option(
+    "--model",
+    required=True,
+    callback=_curator_model_name,
+    help="`fake` (deterministic, offline), or a frontier model as provider:model through "
+    "aisuite. The local tier (`ollama:`) is refused: the Curator never runs on it (D24).",
+)
+def curate_command(root: Path, principal: str, device: str, model: str) -> None:
+    """Read the current beliefs; stage what the model would fuse, record what contradicts
+    (D24, D29, D58).
+
+    Propose-only: consolidations go to the same queue as `walle remember`, and only `walle
+    review` decides them. A contradiction is recorded for you to settle, never resolved
+    here. No assertion is written. A run with nothing to say prints nothing (D63).
+    """
+    try:
+        report = walle_curator.curate(root, principal, device, walle_curator.resolve_model(model))
+    except walle_curator.LocalModelRefused as exc:
+        raise click.UsageError(str(exc)) from None
+    except (
+        walle_models.ModelUnavailable,
+        walle_proposer.ModelReplyError,
+        walle_proposer.ModelCallError,
+        walle_curator.CuratorError,
+    ) as exc:
+        raise click.ClickException(f"nothing written: {exc}") from None
+    except _LOG_ERRORS as exc:
+        raise click.ClickException(_describe(exc)) from exc
+
+    for stream, skip in report.skips:
+        click.echo(f"skipped {stream} line {skip.line}: {skip.reason}", err=True)
+    if report.silent:
+        return
+    said: list[str] = []
+    if report.proposed:
+        said.append(
+            f"proposed {_plural(len(report.proposed), 'consolidation')} to the staging queue: "
+            f"{', '.join(report.proposed)}"
+        )
+    if report.contradictions:
+        said.append(
+            f"recorded {_plural(len(report.contradictions), 'contradiction')}: "
+            f"{', '.join(report.contradictions)}"
+        )
+    click.echo(f"{principal}: {'; '.join(said) if said else 'nothing written this run'}.")
+    if report.withheld:
+        kinds = ", ".join(f"{w.ref} ({', '.join(w.hazards)})" for w in report.withheld)
+        click.echo(
+            f"  withheld {_plural(len(report.withheld), 'assertion')} from the model: {kinds}"
+        )
+    if report.dropped:
+        click.echo(
+            f"  refused {_plural(len(report.dropped), 'reply item')}: {', '.join(report.dropped)}"
+        )
+    if report.already:
+        click.echo(f"  {report.already} already written by another run meanwhile")
+    if report.proposed:
+        click.echo("Not in the hot tier until you keep them: run `walle review`.")
+    if report.contradictions:
+        click.echo("A contradiction is recorded, not resolved: `walle forget` the wrong side.")
 
 
 # --- the transcript observer (issue #40) ------------------------------------------------
