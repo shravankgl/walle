@@ -648,6 +648,11 @@ def curate_command(root: Path, principal: str, device: str, model: str) -> None:
         click.echo("A contradiction is recorded, not resolved: `walle forget` the wrong side.")
 
 
+# --- the benchmark (tasks 25-26) ----------------------------------------------------------
+
+main.add_command(bench_command)
+
+
 # --- the transcript observer (issue #40) ------------------------------------------------
 
 
@@ -733,4 +738,3 @@ def observe_command(root: Path, principal: str, device: str, projects_dir: Path)
 # --- the evals (tasks 19-21) ---------------------------------------------------------------
 
 main.add_command(walle_evals.eval_command)
-main.add_command(bench_command)
