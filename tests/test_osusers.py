@@ -471,52 +471,117 @@ def test_the_module_spawns_nothing_and_changes_no_owner_mode_or_user() -> None:
             assert word not in text.lower(), f"{word!r} appears in a string: {text!r}"
 
 
+SPAWN_CALLS = {
+    "subprocess.run",
+    "subprocess.Popen",
+    "subprocess.call",
+    "subprocess.check_call",
+    "subprocess.check_output",
+    "os.system",
+    "os.popen",
+    "os.execv",
+    "os.execvp",
+    "os.execve",
+    "os.execvpe",
+    "os.spawnv",
+    "os.spawnvp",
+    "os.posix_spawn",
+    "os.posix_spawnp",
+}
+THE_THREE = ("sudo", "dscl", "useradd")
+
+
+def _spawns_of(source: str) -> list[tuple[str, str]]:
+    """Every ``(word, argument)`` where a call to one of ``SPAWN_CALLS`` carries a string
+    constant naming one of the three commands. The one spawn-call logic, for the shipped
+    modules and the tests alike: a word as data, in a docstring, a comment, a list or a
+    fixture, is not a spawn; a word inside the arguments of a spawn call is."""
+    found: list[tuple[str, str]] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = (
+            f"{func.value.id}.{func.attr}"
+            if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
+            else None
+        )
+        if name not in SPAWN_CALLS:
+            continue
+        for arg in ast.walk(node):
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                found.extend((word, arg.value) for word in THE_THREE if word in arg.value)
+    return found
+
+
 def test_no_shipped_module_spawns_sudo_dscl_or_useradd() -> None:
     """The verify criterion's last clause, over every module: no spawn whose arguments name
     one of the three. Docstrings and comments may mention them; a call may not."""
-    spawn_calls = {
-        "subprocess.run",
-        "subprocess.Popen",
-        "subprocess.call",
-        "subprocess.check_call",
-        "subprocess.check_output",
-        "os.system",
-        "os.popen",
-        "os.execv",
-        "os.execvp",
-        "os.execve",
-        "os.execvpe",
-        "os.spawnv",
-        "os.spawnvp",
-        "os.posix_spawn",
-        "os.posix_spawnp",
-    }
     for module in sorted(PACKAGE.rglob("*.py")):
-        tree = ast.parse(module.read_text())
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            name = (
-                f"{func.value.id}.{func.attr}"
-                if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
-                else None
-            )
-            if name not in spawn_calls:
-                continue
-            for arg in ast.walk(node):
-                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                    for word in ("sudo", "dscl", "useradd"):
-                        assert word not in arg.value, f"{module.name} spawns {word}: {arg.value!r}"
+        for word, arg in _spawns_of(module.read_text()):
+            raise AssertionError(f"{module.name} spawns {word}: {arg!r}")
 
 
-def test_only_the_isolation_test_names_the_three_commands() -> None:
+def test_only_the_isolation_test_spawns_the_three_commands() -> None:
+    """The owner's rule on #105 is that no code path *calls* ``sudo``, ``dscl`` or
+    ``useradd`` outside the test setup; the words as data are not banned, and D74's matching
+    corpus (``tests/test_matching.py``) needs them. So the test files get the same AST check
+    as the shipped modules: outside the isolation test, no test spawns one of the three."""
     for test in sorted((ROOT / "tests").glob("*.py")):
-        if test.name == ISOLATION_TESTS.name or test.name == Path(__file__).name:
+        if test.name == ISOLATION_TESTS.name:
             continue
-        text = test.read_text()
-        for word in ("sudo", "dscl", "useradd"):
-            assert word not in text, f"{test.name} mentions {word}"
+        for word, arg in _spawns_of(test.read_text()):
+            raise AssertionError(f"{test.name} spawns {word}: {arg!r}")
+
+
+def test_the_isolation_test_itself_would_be_caught() -> None:
+    """The exemption is doing work: the one file allowed to spawn the three does spawn
+    ``sudo``, and the check sees it. (``useradd`` there goes through a ``_sudo`` wrapper, so
+    it is not a direct argument of a spawn call; the same wrapper in any other test file
+    would still be caught by its ``sudo``.)"""
+    assert ("sudo", "sudo") in _spawns_of(ISOLATION_TESTS.read_text())
+
+
+def test_the_spawn_check_bites_on_a_spawn_and_not_on_data(tmp_path: Path) -> None:
+    """A synthetic file that spawns ``sudo`` is caught, through every spawn call the check
+    knows; a synthetic file holding ``"sudo git status"`` as data, in a list, a dict, an
+    assert, a docstring, a comment and an f-string, is not."""
+    spawning = tmp_path / "test_spawning.py"
+    spawning.write_text(
+        "import os\nimport subprocess\n\n\n"
+        "def test_x():\n"
+        "    subprocess.run(['sudo', '-n', 'true'])\n"
+        "    subprocess.check_output(['dscl', '.', '-list'])\n"
+        "    os.system('useradd synthetic-household-member')\n"
+    )
+    caught = _spawns_of(spawning.read_text())
+    assert {word for word, _ in caught} == {"sudo", "dscl", "useradd"}
+    assert ("sudo", "sudo") in caught and (
+        "useradd",
+        "useradd synthetic-household-member",
+    ) in caught
+    for call in sorted(SPAWN_CALLS):
+        one = f"import os\nimport subprocess\n\n\ndef test_x():\n    {call}(['sudo', 'ls'])\n"
+        assert _spawns_of(one) == [("sudo", "sudo")], call
+    nested = "import subprocess\n\n\ndef test_x():\n    subprocess.run(['sh', '-c', 'sudo ls'])\n"
+    assert _spawns_of(nested) == [("sudo", "sudo ls")]
+
+    data = tmp_path / "test_data.py"
+    data.write_text(
+        '"""A corpus that names sudo, dscl and useradd as data."""\n\n'
+        "import subprocess\n\n"
+        "CORPUS = ['sudo git status', 'dscl . -list', 'useradd x']\n"
+        "TABLE = {'executor': 'sudo'}\n\n\n"
+        "def test_x():\n"
+        '    """sudo is an argument-executor (D74)."""\n'
+        "    # sudo is refused, never run\n"
+        "    assert 'sudo git status' in CORPUS, f\"sudo missing from {CORPUS}\"\n"
+        "    subprocess.run(['true'])\n"
+        "    subprocess.run(CORPUS[1:2])\n"
+    )
+    assert _spawns_of(data.read_text()) == []
+    # The word check this replaced would have refused the data file for the word alone.
+    assert "sudo" in data.read_text()
 
 
 # --- owners are declared, never guessed --------------------------------------------------------
