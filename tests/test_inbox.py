@@ -223,10 +223,22 @@ def test_an_item_is_resolved_once_and_a_late_answer_writes_nothing(tmp_path: Pat
 
 
 def test_asking_again_with_the_same_call_is_the_same_item(tmp_path: Path) -> None:
+    """A run that restarts re-issues the same call with the same text and gets the same item.
+    Routing may differ after a restart (rule 5); the text may not (rule 1, issue #119)."""
     first = _ask(tmp_path)
-    again = _ask(tmp_path, body="Send the note to the school? (asked again after a restart)")
+    again = _ask(tmp_path, unattended=True)
     assert first.new and not again.new
     assert again.item == first.item
+    assert len([r for r in _records(tmp_path) if isinstance(r.event, Ask)]) == 1
+
+
+def test_the_same_call_asked_with_another_text_is_refused(tmp_path: Path) -> None:
+    """Before issue #119 this returned the first item, whatever the new body said; a caller
+    holding a denied command could be handed an approval given to a benign one."""
+    first = _ask(tmp_path)
+    with pytest.raises(ValueError, match="another text"):
+        _ask(tmp_path, body="Send the note to the school? (asked again after a restart)")
+    assert inbox.fold_inbox(_records(tmp_path)).items == (first.item,)
     assert len([r for r in _records(tmp_path) if isinstance(r.event, Ask)]) == 1
 
 

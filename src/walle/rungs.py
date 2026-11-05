@@ -22,6 +22,16 @@ and ``Approved.permits`` compares the call to run against it byte for byte. An i
 command for its whole life: a second ``ask`` under a live or settled id with another command is
 refused, so what was approved and what runs cannot differ.
 
+*Only the owner, operating, settles.* A ``Ledger`` belongs to one principal — the kernel is
+theirs (hard constraint 6) — and ``resolve`` and ``settle`` take ``by``, the authority of the
+speaker whose reply this is (D61): ``walle.speakers.Order`` or ``Request``, as
+``walle.conversation.authority`` decided it. A ``Request`` — another person, a guest, the
+principal in a role that does not operate (D27) — is refused as ``NOT_AN_ORDER`` before the
+reply is read, and so is an ``Order`` for another principal. ``by`` has no default: a caller
+cannot forget it, and an ``Order`` cannot be built for anyone but the principal as operator,
+so holding one is proof of who spoke. The same ``Order`` is what ``walle.grants.grant`` takes
+to write the grant an ``Approved`` stands for (issue #119).
+
 *Once, within fifteen minutes.* A ``Pending`` is settled by its first fitting reply and never
 again: a replay is refused as ``REPLAYED``. A reply more than ``WINDOW_MINUTES`` after the ask
 is refused as ``EXPIRED`` and settles the item, so it cannot be approved later by a clock that
@@ -37,11 +47,20 @@ a destructive call, the card does not show it, and the reply is refused as ``NOT
 said anyway. ``SCOPE_FOR`` maps the two yeses to the scopes ``walle.grants`` offers, so an
 ``Approved`` goes straight to ``grants.grant`` with its ``call`` and ``scope``.
 
-*The inbox.* An unattended ask is an inbox approval (D78): ``to_ask`` makes the ``Ask`` with
-the id as the item's ``tool_call_id`` and the card as its body, so the inbox's own rule —
-resolved once, first answer wins — holds the replay line there too. ``reply_for`` turns an
-inbox outcome back into the reply it stands for: ``approved`` is ``#id approve``, ``denied`` is
-``#id no``, and nothing that arrives through the inbox is the literal word ``always``.
+*The inbox.* An unattended ask is an inbox approval (D78), and this module is the source of
+truth for what it says and what it means; the inbox carries it. ``to_ask`` makes the ``Ask``
+that ``walle.inbox.ask_event`` stores verbatim: the id as the item's ``tool_call_id``, the
+card as its body, timed at the ask. ``INBOX_REPLIES`` is the one table from an inbox outcome
+to the word it stands for — ``approved`` is ``approve``, ``denied`` is ``no`` — and both the
+unattended card (``Pending.card(via_inbox=True)``) and ``reply_for`` are read off it, so the
+card never offers what the inbox cannot carry, and nothing that arrives through the inbox is
+the literal word ``always``. ``settle`` takes the resolved inbox ``Item`` itself and settles
+the ``Pending`` it is bound to: the same session, the same id, and the body the exact card —
+an item saying anything else is ``MISMATCH``, however it was answered. The fifteen-minute
+window is the typed reply's (D62); an inbox item lives by the inbox's rule instead —
+resolved once, first answer wins, orphaned when its session dies (D78) — because a mission
+waits forty minutes for a person who is away (D67), and a yes they gave to the exact command
+must not come back as "expired". An orphaned item settles nothing: orphaned is never a yes.
 
 Rung 4, autonomous-bounded
 --------------------------
@@ -71,7 +90,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -79,14 +98,17 @@ from types import MappingProxyType
 
 from pydantic import TypeAdapter
 
-from walle import matching
+from walle import inbox, matching
 from walle.events import ACTOR_KERNEL, AnswerOutcome, Ask, AskKind, CallId, Instant
 from walle.grants import TOOL_NAME_CHARS, TOOL_NAME_RE, Call, Scope, grants_dir
+from walle.paths import check_name
+from walle.speakers import Authority, Order, Request
 
 __all__ = [
     "ALWAYS",
     "APPROVE",
     "ENVELOPE_FILE",
+    "INBOX_REPLIES",
     "NO",
     "RUNGS_SWITCH",
     "SCOPE_FOR",
@@ -115,6 +137,7 @@ __all__ = [
     "parse",
     "reply_for",
     "resolve",
+    "settle",
     "to_ask",
 ]
 
@@ -137,6 +160,14 @@ WORDS: tuple[str, ...] = (APPROVE, ALWAYS, NO)
 SCOPE_FOR: Mapping[str, Scope] = MappingProxyType({APPROVE: Scope.REQUEST, ALWAYS: Scope.ALWAYS})
 """What each yes means to ``walle.grants``: ``approve`` is this request, ``always`` is the
 standing rule (D73). ``no`` means nothing to grant."""
+
+INBOX_REPLIES: Mapping[AnswerOutcome, str] = MappingProxyType(
+    {AnswerOutcome.APPROVED: APPROVE, AnswerOutcome.DENIED: NO}
+)
+"""The one table from an inbox outcome to the word it stands for. The unattended card offers
+exactly these words, ``reply_for`` and ``settle`` read them back, and ``always`` is not here:
+a standing rule comes from the literal word, typed (D62). ``tests/test_audit_approvals.py``
+holds this equal to ``walle.inbox.FITS[AskKind.APPROVAL]``."""
 
 ENVELOPE_FILE = "envelope.txt"
 """``principals/p-<name>/grants/envelope.txt``: the rung 4 envelope, ``tool: pattern*`` per
@@ -188,25 +219,37 @@ class Pending:
         _check_id(self.session)
         _check_id(self.request)
 
-    def answers(self) -> tuple[str, ...]:
+    def answers(self, *, via_inbox: bool = False) -> tuple[str, ...]:
         """The exact reply strings this item accepts, in card order. A destructive call is
-        offered ``approve`` and ``no`` only (D116)."""
-        words = (APPROVE, NO) if self.call.destructive else WORDS
+        offered ``approve`` and ``no`` only (D116). Through the inbox, only the words an
+        inbox outcome stands for (``INBOX_REPLIES``) are offered, whatever the call."""
+        words: tuple[str, ...] = WORDS
+        if self.call.destructive:
+            words = tuple(w for w in words if w != ALWAYS)
+        if via_inbox:
+            words = tuple(w for w in words if w in INBOX_REPLIES.values())
         return tuple(f"#{self.id} {word}" for word in words)
 
     def buttons(self) -> tuple[Button, ...]:
         """One button per answer, each with payload equal to its label (D62)."""
         return tuple(Button(text, text) for text in self.answers())
 
-    def card(self) -> str:
-        """What the person reads: the exact command, and the answers, verbatim."""
+    def card(self, *, via_inbox: bool = False) -> str:
+        """What the person reads: the exact command, and the answers, verbatim. The inbox
+        card offers only what the inbox can carry, and names the inbox's rule, not the
+        typed reply's window."""
+        how = (
+            "Answer from the inbox; the first answer settles it, and it stands for one of:"
+            if via_inbox
+            else f"Reply with one of these, exactly, within {WINDOW_MINUTES} minutes:"
+        )
         lines = [
             f"{self.call.tool} wants to run, exactly:",
             "",
             f"    {self.call.arguments}",
             "",
-            f"Reply with one of these, exactly, within {WINDOW_MINUTES} minutes:",
-            *(f"    {text}" for text in self.answers()),
+            how,
+            *(f"    {text}" for text in self.answers(via_inbox=via_inbox)),
         ]
         if self.call.destructive:
             lines.append("")
@@ -271,14 +314,18 @@ class Settled:
 
 @dataclass(frozen=True)
 class Ledger:
-    """Every request of one kernel: the ones waiting and the ones settled. Immutable; ``ask``
-    and ``resolve`` return a new one. In memory only: an unattended item's durable form is
-    the inbox's (``to_ask``)."""
+    """Every request of one kernel, which is one principal's: the ones waiting and the ones
+    settled. Immutable; ``ask``, ``resolve`` and ``settle`` return a new one. In memory only:
+    an unattended item's durable form is the inbox's (``to_ask``). Only an ``Order`` for
+    ``principal`` settles anything in it."""
 
+    principal: str
     pending: tuple[Pending, ...] = ()
     settled: tuple[Settled, ...] = ()
 
     def __post_init__(self) -> None:
+        _require(self.principal, str, "principal")
+        check_name(self.principal, kind="principal")
         _require(self.pending, tuple, "pending")
         _require(self.settled, tuple, "settled")
         for item in self.pending:
@@ -290,8 +337,9 @@ class Ledger:
             raise ValueError("an id appears twice in the ledger")
 
     @classmethod
-    def start(cls) -> Ledger:
-        return cls()
+    def start(cls, principal: str) -> Ledger:
+        """A new ledger for one principal's kernel: nothing asked."""
+        return cls(principal)
 
     def find(self, id: str) -> Pending | Settled | None:
         for item in self.pending:
@@ -304,7 +352,7 @@ class Ledger:
 
     def _settle(self, item: Pending, how: How) -> Ledger:
         kept = tuple(p for p in self.pending if p is not item)
-        return Ledger(kept, (*self.settled, Settled(item.id, how)))
+        return Ledger(self.principal, kept, (*self.settled, Settled(item.id, how)))
 
 
 # --- rung 3: what comes out --------------------------------------------------------------------
@@ -323,6 +371,8 @@ class Refusal(StrEnum):
     NOT_OFFERED = "not-offered"
     BUTTON = "button-payload"
     TAKEN = "id-taken"
+    NOT_AN_ORDER = "not-an-order"
+    MISMATCH = "item-mismatch"
     DESTRUCTIVE = "destructive"
     ENVELOPE = "outside-envelope"
 
@@ -374,11 +424,12 @@ class Bounded:
 @dataclass(frozen=True)
 class Refused:
     """Nothing happened. ``ledger`` is the ledger as it now stands: unchanged, except that
-    an expired item has been settled as expired."""
+    an expired item has been settled as expired. ``bounded`` has no ledger and leaves it
+    ``None``."""
 
     kind: Refusal
     reason: str
-    ledger: Ledger = field(default_factory=Ledger)
+    ledger: Ledger | None = None
 
 
 # --- rung 3: the two operations ----------------------------------------------------------------
@@ -408,7 +459,7 @@ def ask(
     item = Pending(id, call, ts, session, request)
     found = ledger.find(id)
     if found is None:
-        return Asked(Ledger((*ledger.pending, item), ledger.settled), item)
+        return Asked(Ledger(ledger.principal, (*ledger.pending, item), ledger.settled), item)
     if isinstance(found, Pending) and found == Pending(id, call, found.asked_at, session, request):
         # The same call, session and request, whenever it was first asked: the same item.
         return Asked(ledger, found)
@@ -424,20 +475,23 @@ def resolve(
     ledger: Ledger,
     reply: str | Button,
     *,
+    by: Authority,
     ts: str,
     environ: Mapping[str, str] | None = None,
 ) -> Approved | Denied | Refused:
-    """What ``reply``, received at ``ts``, does to the ledger.
+    """What ``reply``, spoken by ``by`` and received at ``ts``, does to the ledger.
 
-    In order: off refuses before the reply is read; a ``Button`` whose payload is not its
-    label is refused before its payload is read; a string that is not exactly ``#<id> <word>``
-    is not a reply; an id not in the ledger is unknown; a settled id is replayed, or expired
-    if it expired; a reply before the ask is early; a reply after the window expires the
-    item; ``always`` for a destructive call was not offered. What is left is the one fitting
-    reply, and the item is settled by it.
+    In order: off refuses before the reply is read; a speaker who is not the ledger's
+    principal giving an ``Order`` is refused before the reply is read; a ``Button`` whose
+    payload is not its label is refused before its payload is read; a string that is not
+    exactly ``#<id> <word>`` is not a reply; an id not in the ledger is unknown; a settled id
+    is replayed, or expired if it expired; a reply before the ask is early; a reply after the
+    window expires the item; ``always`` for a destructive call was not offered. What is left
+    is the one fitting reply, and the item is settled by it.
     """
     _require(ledger, Ledger, "ledger")
     _require(ts, str, "ts")
+    _require_authority(by)
     now = _instant(ts)
     if not enabled(environ):
         return Refused(
@@ -445,6 +499,8 @@ def resolve(
             f"the rung protocols are off; the owner turns them on with {RUNGS_SWITCH}={SWITCH_ON}",
             ledger,
         )
+    if (who := _not_an_order(ledger, by)) is not None:
+        return who
     if isinstance(reply, Button):
         if reply.payload != reply.label:
             return Refused(
@@ -490,6 +546,18 @@ def resolve(
 
 
 _EXPIRED = f"this request is older than {WINDOW_MINUTES} minutes; ask again"
+_NOT_AN_ORDER = (
+    "this reply is not an order from the owner of this ledger speaking as the operator; "
+    "nothing is settled on a request (D61, D27)"
+)
+
+
+def _not_an_order(ledger: Ledger, by: Authority) -> Refused | None:
+    """The refusal for a speaker who may not settle this ledger, or ``None`` for the
+    principal as operator. Fixed text: it never names the speaker."""
+    if isinstance(by, Order) and by.principal == ledger.principal:
+        return None
+    return Refused(Refusal.NOT_AN_ORDER, _NOT_AN_ORDER, ledger)
 
 
 # --- rung 3: the inbox -------------------------------------------------------------------------
@@ -497,9 +565,10 @@ _EXPIRED = f"this request is older than {WINDOW_MINUTES} minutes; ask again"
 
 def to_ask(pending: Pending, *, unattended: bool) -> Ask:
     """The inbox item for a request nobody is watching (D78): an approval, keyed by the
-    session and the id, whose body is the card, timed at the ask and written by the kernel.
-    The inbox resolves it once, first answer wins, so a replay fails there as it fails
-    here. Nothing is written: the caller hands the event to ``walle.inbox.ask``."""
+    session and the id, whose body is the inbox card, timed at the ask and written by the
+    kernel. The inbox resolves it once, first answer wins, so a replay fails there as it
+    fails here. Nothing is written: the caller hands the event to ``walle.inbox.ask_event``,
+    which stores it as it is, and the resolved item back to ``settle``."""
     _require(pending, Pending, "pending")
     return Ask(
         ts=pending.asked_at,
@@ -507,22 +576,87 @@ def to_ask(pending: Pending, *, unattended: bool) -> Ask:
         kind=AskKind.APPROVAL,
         session=pending.session,
         tool_call_id=pending.id,
-        body=pending.card(),
+        body=pending.card(via_inbox=True),
         unattended=unattended,
     )
 
 
 def reply_for(pending: Pending, outcome: AnswerOutcome) -> str | None:
-    """The reply an inbox outcome stands for: ``approved`` is ``#id approve``, ``denied`` is
-    ``#id no``, anything else is no reply. There is no outcome that is ``always``: a standing
-    rule comes from the literal word, typed, and never from a button in an inbox."""
+    """The reply an inbox outcome stands for, from ``INBOX_REPLIES``: ``approved`` is
+    ``#id approve``, ``denied`` is ``#id no``, anything else is no reply. There is no outcome
+    that is ``always``: a standing rule comes from the literal word, typed, and never from a
+    button in an inbox."""
     _require(pending, Pending, "pending")
     _require(outcome, AnswerOutcome, "outcome")
-    if outcome is AnswerOutcome.APPROVED:
-        return f"#{pending.id} {APPROVE}"
-    if outcome is AnswerOutcome.DENIED:
-        return f"#{pending.id} {NO}"
-    return None
+    word = INBOX_REPLIES.get(outcome)
+    return None if word is None else f"#{pending.id} {word}"
+
+
+def settle(
+    ledger: Ledger,
+    item: inbox.Item,
+    *,
+    by: Authority,
+    environ: Mapping[str, str] | None = None,
+) -> Approved | Denied | Refused:
+    """What a resolved inbox ``item``, read back by ``by``, does to the ledger.
+
+    In order: off refuses before the item is read; a speaker who is not the ledger's
+    principal giving an ``Order`` is refused before the item is read; an item whose id is
+    not in the ledger is unknown; a settled id is replayed, or expired if it expired; an
+    item that is not this pending's — another session, or a body that is not the exact inbox
+    card — is a mismatch, approved or not; an item still pending, or orphaned, or whose
+    answer does not fit it by the inbox's own ``misfit`` (a machine actor's, say), is not a
+    reply. What is left is a person's approved or denied, and the item is settled by it:
+    ``approve`` for this request (``Scope.REQUEST``), never ``always``. No window: the
+    inbox's rule governs the inbox.
+    """
+    _require(ledger, Ledger, "ledger")
+    _require(item, inbox.Item, "item")
+    _require_authority(by)
+    if not enabled(environ):
+        return Refused(
+            Refusal.OFF,
+            f"the rung protocols are off; the owner turns them on with {RUNGS_SWITCH}={SWITCH_ON}",
+            ledger,
+        )
+    if (who := _not_an_order(ledger, by)) is not None:
+        return who
+    found = ledger.find(item.ask.tool_call_id)
+    if found is None:
+        return Refused(Refusal.UNKNOWN, "no request has this id", ledger)
+    if isinstance(found, Settled):
+        if found.how is How.EXPIRED:
+            return Refused(Refusal.EXPIRED, _EXPIRED, ledger)
+        return Refused(
+            Refusal.REPLAYED, "this request was already answered; an answer is used once", ledger
+        )
+    bound = (
+        item.ask.kind is AskKind.APPROVAL
+        and item.ask.session == found.session
+        and item.ask.body == found.card(via_inbox=True)
+        and not item.ask.choices
+    )
+    if not bound:
+        return Refused(
+            Refusal.MISMATCH,
+            "this inbox item is not the request it names: another session, or another text "
+            "than the exact command the person was shown",
+            ledger,
+        )
+    word = None
+    if item.answer is not None and inbox.misfit(item.ask, item.answer) is None:
+        word = INBOX_REPLIES.get(item.answer.outcome)
+    if word is None:
+        return Refused(
+            Refusal.NOT_A_REPLY,
+            "this inbox item is not a person's approved or denied: pending, orphaned, or an "
+            "answer that does not fit it settles nothing",
+            ledger,
+        )
+    if word == NO:
+        return Denied(ledger._settle(found, How.DENIED), found)
+    return Approved(ledger._settle(found, How.APPROVED), found, SCOPE_FOR[word])
 
 
 # --- rung 4: the envelope ----------------------------------------------------------------------
@@ -660,6 +794,13 @@ def _check_id(value: object) -> str:
 def _require(value: object, kind: type, name: str) -> None:
     if not isinstance(value, kind):
         raise TypeError(f"{name} is a {kind.__name__}, not {type(value).__name__}")
+
+
+def _require_authority(value: object) -> None:
+    if not isinstance(value, Order | Request):
+        raise TypeError(
+            f"by is the speaker's authority, an Order or a Request, not {type(value).__name__}"
+        )
 
 
 def _require_on(environ: Mapping[str, str] | None) -> None:
