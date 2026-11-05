@@ -70,7 +70,6 @@ from __future__ import annotations
 
 import json
 import os
-import posixpath
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -91,6 +90,7 @@ from walle.events import (
     now_instant,
     parse_ref,
 )
+from walle.floors import segments
 from walle.reader import Record
 from walle.resolver import Staged, live_events
 from walle.writer import StreamWriter
@@ -527,16 +527,21 @@ def _read_step(item: object) -> WorkflowStep | str:
 
 
 def _inside(path: str) -> str | None:
-    """``None`` when ``path`` names something inside the workspace, or why not."""
+    """``None`` when ``path`` names something inside the workspace, or why not. Whether it is
+    a path by name at all — relative, not climbing out, no NUL — is the floor's one answer
+    (``walle.floors.segments``, issue #118); the length cap, the shell's ``~`` and a backslash
+    are refused here because a command, not a filesystem, would read them."""
     if not path or path.strip() != path:
         return "a path is empty or padded"
     if len(path) > PATH_CHARS:
         return f"a path is longer than {PATH_CHARS} characters"
-    if posixpath.isabs(path) or path.startswith("~") or "\\" in path or "\x00" in path:
+    if path.startswith("~") or "\\" in path:
         return "a path is not relative to the workspace"
-    norm = posixpath.normpath(path)
-    if norm == "." or norm == ".." or norm.startswith("../"):
-        return "a path names the workspace itself or climbs out of it"
+    parts = segments(path)
+    if parts is None:
+        return "a path is not relative to the workspace, or climbs out of it"
+    if not parts:
+        return "a path names the workspace itself"
     return None
 
 
