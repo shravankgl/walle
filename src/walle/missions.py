@@ -50,8 +50,11 @@ The rules
    ``kernel/``, ``shared/``, a principal's ``grants/``, ``keys/`` or ``hot/``, anything under
    one or any parent of one — is refused whether or not the node declared it, and before
    every other reason, the switch included: the same refusal in every mode. ``admit`` asks
-   ``walle.floors.hit`` by name; a runner with a root asks ``walle.floors.floored`` as well,
-   which follows links. Nothing in the log, the environment or a call lifts it.
+   ``walle.floors.hit`` by name, and a path ``hit`` cannot answer about by name — absolute,
+   or climbing out through ``..`` — is its own refusal, not a pass and not "missions are
+   off" (issue #118 finding 1.1; ``walle.reviewer.review`` asks the same function and gives
+   the same sentence). A runner with a root asks ``walle.floors.floored`` as well, which
+   follows links. Nothing in the log, the environment or a call lifts it.
 
 Anything the fold cannot apply is **reported, not dropped**, as the resolver does: a step
 whose mission the fold was not given, whose ``mission`` ref is not a mission, or whose node
@@ -314,7 +317,8 @@ def admit(
     """The gate before a step touches anything (rules 5 to 8). ``None`` means go.
 
     Refuses, in this order and with the first reason that holds: a write in ``touch`` is
-    floored (rule 8, in any mode, declared or not); missions are off; the mission is paused;
+    floored or cannot be answered about by name (rule 8, in any mode, declared or not);
+    missions are off; the mission is paused;
     the mission is aborted on a breach; the node is unknown, finished, or not ready;
     something in ``touch`` is not in the node's manifest, every such item named. A
     ``running`` node is admitted, because this is also the check at each tool call.

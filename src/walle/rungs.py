@@ -81,7 +81,8 @@ from pydantic import TypeAdapter
 
 from walle import matching
 from walle.events import ACTOR_KERNEL, AnswerOutcome, Ask, AskKind, CallId, Instant
-from walle.grants import TOOL_NAME_CHARS, TOOL_NAME_RE, Call, Scope, grants_dir
+from walle.grants import TOOL_NAME_CHARS, TOOL_NAME_RE, Call, Scope, read_plain
+from walle.profiles import CrossPrincipalError
 
 __all__ = [
     "ALWAYS",
@@ -590,16 +591,21 @@ class Envelope:
 
 def load_envelope(root: Path, principal: str) -> Envelope | str:
     """The principal's envelope, or one string saying why there is none. A missing file is
-    an empty envelope. A link is not read; a file that cannot be read is reported by its
-    error class; a line that is not a rule voids the file (D86). Reading is not acting: this
-    works while off, and ``bounded`` refuses regardless."""
-    path = grants_dir(root, principal) / ENVELOPE_FILE
+    an empty envelope. It is read through ``walle.grants.read_plain`` — the profile's plain
+    door, so a link is not read whether it stands at the file, at ``grants/``, at the
+    principal's folder or at ``principals/`` (issue #118 finding 1.4); a file that cannot be
+    read is reported by its error class; a line that is not a rule voids the file (D86).
+    Reading is not acting: this works while off, and ``bounded`` refuses regardless."""
     try:
-        if os.path.islink(path):
-            return f"{ENVELOPE_FILE} is a link, which is not read: the envelope is a plain file"
-        text = path.read_text(encoding="utf-8")
+        text = read_plain(root, principal, ENVELOPE_FILE)
     except FileNotFoundError:
         return Envelope()
+    except CrossPrincipalError:
+        return (
+            f"{ENVELOPE_FILE} is a link, or is reached through one, or its folder cannot be "
+            "resolved, so it is not read: the envelope is a plain file in the principal's own "
+            "folder"
+        )
     except (OSError, ValueError) as exc:
         return f"{ENVELOPE_FILE} could not be read ({type(exc).__name__})"
     try:

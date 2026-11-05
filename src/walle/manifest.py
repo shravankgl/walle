@@ -10,12 +10,15 @@ refused *before* it touches the thing, never after.
 
 What a declaration covers
 -------------------------
-- A declared path covers itself and everything under it, after both sides are normalized
-  with ``posixpath.normpath``: ``a/b`` covers ``a/b/c/../d`` and ``./a//b``. It does not cover
-  ``a/b-old`` (a shared prefix is not containment), ``a`` (above it), or anything that climbs
-  out through ``..`` — a touched path that normalizes to start with ``..`` is inside nothing.
-  Absolute and relative never match each other, and case is significant: the log is one
-  spelling for one thing, and a grant is read the same way.
+- A declared path covers itself and everything under it, after both sides are spelled the
+  one way ``walle.floors.segments`` spells a path by name: ``a/b`` covers ``a/b/c/../d`` and
+  ``./a//b``. It does not cover ``a/b-old`` (a shared prefix is not containment), ``a``
+  (above it), or anything that climbs out through ``..`` — a touched path that normalizes to
+  start with ``..`` is inside nothing. A path the floor cannot answer about by name — an
+  absolute one, or one holding a NUL — covers nothing and is covered by nothing: a manifest
+  is root-relative, and ``/`` used to cover every absolute path (issue #118 finding 1.1).
+  Case is significant: the log is one spelling for one thing, and a grant is read the same
+  way.
 - A declared host covers exactly that host, compared lower-case and without a trailing dot.
   Not its subdomains, no wildcard, no port, no path: a grant names what it grants.
 - ``reads`` and ``writes`` are separate grants. Writing a path needs it in ``writes``;
@@ -24,9 +27,10 @@ What a declaration covers
 
 from __future__ import annotations
 
-import posixpath
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
+from walle.floors import segments
 
 if TYPE_CHECKING:
     from walle.events import Node
@@ -44,13 +48,12 @@ class Touch:
 
 def _normalized(path: str) -> str | None:
     """One spelling for a path, or ``None`` for a path no grant can cover: empty, the current
-    directory, or one that climbs out of wherever it starts."""
-    if not path:
+    directory, absolute, one that climbs out of wherever it starts, or not a path at all —
+    the floor's answer (``walle.floors.segments``), so the two never disagree."""
+    parts = segments(path)
+    if not parts:
         return None
-    norm = posixpath.normpath(path)
-    if norm == "." or norm == ".." or norm.startswith("../"):
-        return None
-    return norm
+    return "/".join(parts)
 
 
 def covers_path(declared: str, touched: str) -> bool:

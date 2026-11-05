@@ -48,6 +48,14 @@ none. A link that has appeared since is the layout having changed under the deci
 refused rather than followed. Names are compared case-folded throughout (``HOT/`` is ``hot/``
 on APFS and NTFS, and so it is here, on every filesystem).
 
+``open(..., plain=True)`` is the stricter door the rule files need (``walle.grants``,
+``walle.rungs``; issue #118 finding 1.4): the name must land exactly on itself,
+``Resolved.plain``, so a link anywhere on the way is refused even when it stays inside the
+folder. A rule file is a plain file, and a link where one should be would carry a rule, or a
+grant, somewhere else — that was the grants' own rule for the leaf, and this is the same rule
+for every component from ``principals/`` down, decided once and acted on with no second
+resolution in between.
+
 The role is on the context and ``path`` does not look at it. There is no ``read_as``, no
 ``open_for``, no parameter that names a second principal on anything that reads. An admin's
 profile is the admin's own folder, exactly as an operator's is, and the tests check this by
@@ -358,6 +366,13 @@ class Resolved:
     def folded(self) -> tuple[str, ...]:
         return tuple(p.lower() for p in self.parts)
 
+    @property
+    def plain(self) -> bool:
+        """Whether the name landed exactly where it says — no link was followed on the way,
+        not even one that stays inside the folder. Compared case-folded, as everything is."""
+        given = tuple(p.lower() for p in self.given.split(os.sep) if p not in ("", "."))
+        return given == self.folded
+
 
 def _open_below(folder: str, parts: tuple[str, ...], flags: int, *, mkdirs: bool = False) -> int:
     """Open ``folder/parts`` following **no** link at any component: the folder is opened
@@ -516,14 +531,23 @@ class Profile:
         is used. ``CrossPrincipalError`` as ``resolve`` gives."""
         return Path(self.resolve(relative).real)
 
-    def open(self, relative: str | os.PathLike[str], mode: str = "rb") -> IO[Any]:
+    def open(
+        self, relative: str | os.PathLike[str], mode: str = "rb", *, plain: bool = False
+    ) -> IO[Any]:
         """Open where ``relative`` lands, following no link at open time: the resolved
         components are opened one by one relative to the folder's descriptor, each
-        ``O_NOFOLLOW``. Modes are ``r``, ``w``, ``a``, ``x``, binary or text."""
+        ``O_NOFOLLOW``. Modes are ``r``, ``w``, ``a``, ``x``, binary or text. With ``plain``,
+        the name must also land exactly on itself (``Resolved.plain``): a link anywhere on
+        the way, inside the folder or not, is ``CrossPrincipalError``."""
         kind, text = mode.replace("b", ""), "b" not in mode
         if kind not in _MODES:
             raise ValueError(f"mode {mode!r} is not one of r, w, a, x (with or without b)")
         resolved = self.resolve(relative)
+        if plain and not resolved.plain:
+            raise CrossPrincipalError(
+                f"{self.principal!r}: {resolved.given!r} is reached through a link, which is "
+                "not followed for a plain file; refused"
+            )
         fd = _open_below(resolved.folder, resolved.parts, _MODES[kind])
         return open(fd, mode if not text else kind, encoding="utf-8" if text else None)
 

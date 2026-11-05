@@ -583,6 +583,23 @@ MALFORMED = [
 ]
 
 
+@pytest.mark.parametrize(
+    "path",
+    ["/etc/passwd", "/", "../outside", "plans/../../outside", "", ".", "a/\x00b", "./", "x/.."],
+)
+def test_a_workspace_path_is_judged_by_the_floor_s_one_spelling(path: str) -> None:
+    """Issue #118: whether a path is answerable by name is decided in ``walle.floors`` once;
+    the builder's workspace rule reads the same answer, so the two cannot drift."""
+    from walle.floors import segments
+
+    assert segments(path) is None or segments(path) == ()
+    assert builder._inside(path) is not None
+    assert builder._inside("plans/meals.md") is None and segments("plans/meals.md") == (
+        "plans",
+        "meals.md",
+    )
+
+
 @pytest.mark.parametrize("reply", MALFORMED)
 def test_a_reply_that_is_not_exactly_a_workflow_is_refused_whole(root: Path, reply: str) -> None:
     model = Scripted(reply)
