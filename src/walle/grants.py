@@ -35,22 +35,28 @@ afterwards — not the same command from the next call, even inside the request.
 per-call key can cover a destructive call, and neither rule file carries one, no file ever
 covers a destructive call, whatever it says.
 
+Who grants (D61, D72)
+---------------------
+``grant`` takes ``by``, the authority of the speaker whose yes this is, as
+``walle.conversation.authority`` decided it: an ``Order`` — the principal speaking as the
+operator — or a ``Request``, anyone else. A ``Request`` is ``NotGrantableError`` before any
+file is opened: nothing is granted on a request, however it was worded. The folder written is
+the ``Order``'s own principal's; there is no ``principal`` argument to pass something else, and
+an ``Order`` cannot be built for anyone but its principal as operator (``walle.speakers``), so
+the grant lands in the folder of the person who gave it, and ``by`` has no default, so a
+caller cannot leave it out (issue #119). ``check`` still takes a ``principal``: reading is
+gated by ``walle.conversation.permit``, which passes only an ``Order``'s.
+
 Fail closed (D86)
 -----------------
 A grant that cannot be resolved is no grant. A rule file with one line that does not parse
 is not a rule file: nothing in it applies, and ``problems`` says which line. A rule from a
 newer build (``v`` past ``KNOWN_V``) is unresolvable, as a newer event is (D111). A rule file
 that is a link is not read: the floor stops the agent writing ``grants/``, and a link there
-would carry a rule, or a grant, somewhere else. Nor is a rule file reached *through* a link —
-``grants/`` itself, the principal's folder, or ``principals/`` standing as one (issue #118
-finding 1.4): every rule file is opened through ``walle.profiles.Profile.open(plain=True)``,
-the one door that resolves the name from ``principals/p-<name>`` down, refuses it unless it
-lands exactly on itself, and opens every component ``O_NOFOLLOW``. So a linked ``grants/``
-never reads, and never appends to, another principal's rules; ``Profile`` refuses it with
-``CrossPrincipalError`` and this module reports the class, as for any other error. A file
-that cannot be read for any other reason is reported by its error class, never its message.
-A grant the person gave this session is still resolvable when the always file is broken, so
-it still applies; the problem is reported beside it.
+would carry a rule, or a grant, somewhere else. A file that cannot be read for any other
+reason is reported by its error class, never its message. A grant the person gave this
+session is still resolvable when the always file is broken, so it still applies; the problem
+is reported beside it.
 
 Types are checked before anything is read or written: a scope given as a plain string, a
 call that is not a ``Call``, a ``Live`` that is not one, are ``TypeError``; a tool name, call
@@ -70,12 +76,10 @@ Two writers, step by step
 -------------------------
 Kernels A and B, for the same principal, each saving an ``always`` grant.
 
-1. A resolves ``grants/`` and makes it if it is missing, then takes ``grants/always.lock``
-   (exclusive), opened through the profile's plain door. B blocks, having opened nothing else.
-2. A opens ``always.jsonl`` for append through the same door — the name resolved, checked to
-   be plain, every component ``O_NOFOLLOW`` — writes its one line, ``fsync``s, closes, and
-   releases the lock.
-3. B wakes, opens the same way, appends its line after A's, ``fsync``s, releases.
+1. A takes ``grants/always.lock`` (exclusive). B blocks, having opened nothing else.
+2. A checks that ``always.jsonl`` is not a link, opens it for append, writes its one line,
+   ``fsync``s, closes, and releases the lock.
+3. B wakes, makes the same check, appends its line after A's, ``fsync``s, releases.
 
 Either order gives a file of two whole lines. A reader (``check``) takes no lock: it reads
 whole lines, and a line a writer is mid-way through has no newline yet, so it is read on the
@@ -87,23 +91,21 @@ person looks, which is the fail-closed answer, not a repair.
 from __future__ import annotations
 
 import contextlib
-import errno
 import json
 import os
 import re
-import stat
 import sys
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import IO, Annotated, Any
+from typing import Annotated
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 from walle.events import CallId, Instant
 from walle.paths import principal_dir
-from walle.profiles import CrossPrincipalError, Profile, bind
+from walle.speakers import Authority, Order, Request
 
 if sys.platform == "win32":  # pragma: no cover - POSIX only in Phase 0
     raise ImportError(
@@ -145,7 +147,6 @@ __all__ = [
     "grants_dir",
     "key_for",
     "offered",
-    "read_plain",
 ]
 
 GRANTS_SWITCH = "WALLE_GRANTS"
@@ -447,30 +448,40 @@ def grant(
     call: Call,
     scope: Scope,
     *,
+    by: Authority,
     call_id: str,
     root: Path,
-    principal: str,
     ts: str,
     environ: Mapping[str, str] | None = None,
 ) -> Granted:
-    """Record that a person approved ``call`` at ``scope``.
+    """Record that ``by``, a person, approved ``call`` at ``scope``, in their own folder.
 
     Checks, in this order and before anything is read or written: grants are on
     (``GrantsOffError``); every argument has its type and shape (``TypeError``,
-    ``ValueError``); the scope is one ``offered`` for this call (``NotGrantableError``).
-    Then ``request`` and ``session`` go into memory; ``always`` is appended to the rule file,
-    and when that fails for any ``OSError``, or because the file is reached through a link
-    (``CrossPrincipalError``), it goes into memory at ``session`` scope with a ``note``
-    saying so (D73). ``ts`` is passed in: this module reads no clock.
+    ``ValueError``); ``by`` is an ``Order``, not a ``Request`` (``NotGrantableError``); the
+    scope is one ``offered`` for this call (``NotGrantableError``). Then ``request`` and
+    ``session`` go into memory; ``always`` is appended to the rule file under the
+    ``Order``'s principal, and when that fails for any ``OSError`` it goes into memory at
+    ``session`` scope with a ``note`` saying so (D73). ``ts`` is passed in: this module reads
+    no clock.
     """
     _require_on(environ)
     _require(live, Live, "live")
     _require(call, Call, "call")
     _require(scope, Scope, "scope")
+    if not isinstance(by, Order | Request):
+        raise TypeError(
+            f"by is the speaker's authority, an Order or a Request, not {type(by).__name__}"
+        )
     key = key_for(call, call_id)
     _require(ts, str, "ts")
     given_at = _INSTANT.validate_python(ts)
-    profile = _profile(root, principal)
+    if isinstance(by, Request):
+        raise NotGrantableError(
+            "a grant is given by the principal speaking as the operator; this is a request, "
+            "not an order, and nothing is granted on a request (D61, D27)"
+        )
+    folder = grants_dir(root, by.principal)
     if scope not in offered(call):
         if scope is Scope.CONFIG:
             raise NotGrantableError(
@@ -492,8 +503,8 @@ def grant(
         request=live.request,
     )
     try:
-        _append(profile, rule)
-    except (OSError, CrossPrincipalError) as exc:
+        _append(folder / ALWAYS_FILE, rule)
+    except OSError as exc:
         held = Grant(key, Scope.SESSION, live.session, live.request)
         note = (
             f"always could not be saved ({type(exc).__name__} writing {ALWAYS_FILE}), so this "
@@ -524,7 +535,7 @@ def check(
     _require(live, Live, "live")
     _require(call, Call, "call")
     key = key_for(call, call_id)
-    profile = _profile(root, principal)
+    folder = grants_dir(root, principal)
     if not enabled(environ):
         return Refused(f"grants are off; the owner turns them on with {GRANTS_SWITCH}={SWITCH_ON}")
     # Both files are read on every check, even when a grant in memory will decide it, so a
@@ -535,7 +546,7 @@ def check(
         (Scope.ALWAYS, ALWAYS_FILE, AlwaysRule),
         (Scope.CONFIG, CONFIG_FILE, ConfigRule),
     ):
-        rules = _load(profile, name, model)
+        rules = _load(folder / name, model)
         if isinstance(rules, str):
             problems.append(rules)
         else:
@@ -561,61 +572,19 @@ def check(
 # --- files -------------------------------------------------------------------------------------
 
 
-def _profile(root: Path, principal: str) -> Profile:
-    """The principal's own folder, the only place a rule file is read from or written to.
-    Validates the principal's name; opens nothing."""
-    return Profile(bind(root, principal))
-
-
-def _plain_name(name: str) -> str:
-    return f"{GRANTS_DIRNAME}/{name}"
-
-
-def _require_principals(profile: Profile) -> None:
-    """A root with no ``principals/`` at all is ``FileNotFoundError`` — nothing of anyone's
-    is there — rather than the profile's "cannot be resolved", so a missing folder is never
-    reported as a link. The profile's own checks follow; this only names the error."""
-    principals = profile.folder.parent
-    if not os.path.lexists(principals):
-        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(principals))
-
-
-def _open_plain(profile: Profile, name: str, mode: str) -> IO[Any]:
-    """``grants/<name>`` through ``Profile.open(plain=True)``: the name resolved from
-    ``principals/p-<name>`` down, refused unless it lands exactly on itself, every component
-    opened ``O_NOFOLLOW``."""
-    _require_principals(profile)
-    return profile.open(_plain_name(name), mode, plain=True)
-
-
-def read_plain(root: Path, principal: str, name: str) -> str:
-    """The text of ``grants/<name>`` in the principal's own folder, read through
-    ``Profile.open(plain=True)``: refused with ``CrossPrincipalError`` when the file, or
-    ``grants/``, or the principal's folder, or ``principals/`` is a link, or the name lands
-    anywhere but on itself. ``FileNotFoundError`` when there is no such file; any other
-    ``OSError`` or ``ValueError`` as the read raises it. ``walle.rungs`` reads its envelope
-    through this, so the two rule folders are one folder, judged once (issue #118)."""
-    with _open_plain(_profile(root, principal), name, "r") as f:
-        return f.read()
-
-
-def _load[R: ConfigRule](profile: Profile, name: str, model: type[R]) -> tuple[R, ...] | str:
-    """Every rule in ``grants/<name>``, or one string saying why none of them count. A
-    missing file is no rules and no problem. Everything else that is not a whole file of
-    valid lines is a problem: a link anywhere on the way to it, a line that is not JSON, a
-    line that is not a ``model``, a line from a newer build. Blank lines are skipped."""
+def _load[R: ConfigRule](path: Path, model: type[R]) -> tuple[R, ...] | str:
+    """Every rule in ``path``, or one string saying why none of them count. A missing file
+    is no rules and no problem. Everything else that is not a whole file of valid lines is a
+    problem: a link, a line that is not JSON, a line that is not a ``model``, a line from a
+    newer build. Blank lines are skipped."""
     try:
-        with _open_plain(profile, name, "r") as f:
-            text = f.read()
+        if os.path.islink(path):
+            return f"{path.name} is a link, which is not read: a rule file is a plain file"
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return ()
-    except CrossPrincipalError:
-        return (
-            f"{name} is a link, or is reached through one, or its folder cannot be resolved, "
-            "so it is not read: a rule file is a plain file in the principal's own folder"
-        )
     except (OSError, ValueError) as exc:
-        return f"{name} could not be read ({type(exc).__name__})"
+        return f"{path.name} could not be read ({type(exc).__name__})"
     rules: list[R] = []
     for number, line in enumerate(text.split("\n"), start=1):
         if not line.strip():
@@ -623,47 +592,37 @@ def _load[R: ConfigRule](profile: Profile, name: str, model: type[R]) -> tuple[R
         try:
             data = json.loads(line)
         except (ValueError, RecursionError):  # nesting past the limit is malformed too (#94)
-            return f"{name} line {number} is not JSON"
+            return f"{path.name} line {number} is not JSON"
         if not isinstance(data, dict):
-            return f"{name} line {number} is not a rule object"
+            return f"{path.name} line {number} is not a rule object"
         v = data.get("v", 1)
         if isinstance(v, int) and not isinstance(v, bool) and v > KNOWN_V:
-            return f"{name} line {number} is a v{v} rule; this build knows v{KNOWN_V}"
+            return f"{path.name} line {number} is a v{v} rule; this build knows v{KNOWN_V}"
         try:
             rules.append(model.model_validate(data))
         except ValidationError:
-            return f"{name} line {number} is not a rule"
+            return f"{path.name} line {number} is not a rule"
     return tuple(rules)
 
 
-def _append(profile: Profile, rule: AlwaysRule) -> None:
-    """Append one line to the always file, under ``always.lock``, both opened through the
-    profile's plain door. Raises ``OSError`` for anything that stops it, and
-    ``CrossPrincipalError`` for a link anywhere on the way — the file, ``grants/``, the
-    profile folder or ``principals/``. A principal folder that is not there is an ``OSError``
-    from ``mkdir``: a misspelt principal must not get a profile folder."""
-    _require_principals(profile)
-    folder = profile.resolve(GRANTS_DIRNAME)
-    if not folder.plain:
-        raise CrossPrincipalError(f"{GRANTS_DIRNAME}/ is a link; a rule folder is a plain folder")
-    with contextlib.suppress(FileExistsError):
-        os.mkdir(folder.real)  # grants/ only, never its parents
-    if not stat.S_ISDIR(os.lstat(folder.real).st_mode):
-        # named for what it is; the O_NOFOLLOW open below would refuse it anyway
-        raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), folder.real)
-    with (
-        _exclusive(profile),
-        _open_plain(profile, ALWAYS_FILE, "ab") as f,
-    ):
-        f.write((rule.model_dump_json() + "\n").encode("utf-8"))
-        f.flush()
-        os.fsync(f.fileno())
+def _append(path: Path, rule: AlwaysRule) -> None:
+    """Append one line to the always file, under ``always.lock``. Raises ``OSError`` for
+    anything that stops it, including a link where the file should be, and a principal
+    folder that is not there: a misspelt principal must not get a profile folder."""
+    path.parent.mkdir(exist_ok=True)  # grants/ only, never its parents
+    with _exclusive(path.parent / LOCK_FILE):
+        if os.path.islink(path):
+            raise FileExistsError(f"{path.name} is a link; a rule file is a plain file")
+        line = rule.model_dump_json() + "\n"
+        with open(path, "ab") as f:
+            f.write(line.encode("utf-8"))
+            f.flush()
+            os.fsync(f.fileno())
 
 
 @contextlib.contextmanager
-def _exclusive(profile: Profile) -> Iterator[None]:
-    # "a": opening never truncates, and the file stays empty
-    with _open_plain(profile, LOCK_FILE, "ab") as f:
+def _exclusive(lock: Path) -> Iterator[None]:
+    with open(lock, "ab") as f:  # "a": opening never truncates, and the file stays empty
         fcntl.flock(f.fileno(), fcntl.LOCK_EX)
         yield
         # The lock goes with close.
