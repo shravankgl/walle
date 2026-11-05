@@ -96,12 +96,13 @@ from typing import NoReturn
 
 from walle.paths import hot_dir
 
-# These four names are the renderer's (walle.hot), copied so this module does not import it:
+# These five names are the renderer's (walle.hot), copied so this module does not import it:
 # walle.hot pulls in the index, sqlite3 and pydantic, which a session would pay for on every
 # start. tests/test_hook.py checks they still match.
 RULES = "rules.md"
 ORDER = ("identity.md", "user.md", RULES, "learned.md")
 RENDER_LOCK = "render.lock"
+MANIFEST = "rendered.json"
 
 BUDGET = 2.0
 """Seconds from ``main`` starting to giving up (D115)."""
@@ -120,6 +121,10 @@ EVENT = "SessionStart"
 
 class Silent(Exception):
     """Why the hook emitted nothing. Only ever shown with ``--measure``."""
+
+
+class Busy(Silent):
+    """A render holds ``render.lock`` and the caller asked not to wait (``wait=False``)."""
 
 
 class _Deadline(BaseException):
@@ -179,6 +184,21 @@ def context(root: Path, principal: str) -> str:
 
     Blocks while a render holds the lock; the caller's alarm bounds that.
     """
+    return _tier(root, principal, wait=True, manifest=False)[0]
+
+
+def snapshot(root: Path, principal: str, *, wait: bool = True) -> tuple[str, bytes | None]:
+    """``context``'s text and the bytes of ``rendered.json``, both read under one shared lock.
+
+    For the MCP Resource (``walle.hot_resource``, D83): the manifest says which fold the text
+    came from, and reading both under one lock means they describe the same render. ``None``
+    for the manifest when there is none. With ``wait=False``, a render in progress raises
+    ``Busy`` at once instead of blocking. The hook itself never calls this.
+    """
+    return _tier(root, principal, wait=wait, manifest=True)
+
+
+def _tier(root: Path, principal: str, *, wait: bool, manifest: bool) -> tuple[str, bytes | None]:
     import fcntl  # here, not at the top: on a platform without it, this is an error like any other
 
     folder = hot_dir(root, principal)  # ValueError for an unsafe name, before any path is used
@@ -187,7 +207,10 @@ def context(root: Path, principal: str) -> str:
     except FileNotFoundError:
         raise Silent(f"{folder / RENDER_LOCK}: no render yet") from None
     try:
-        fcntl.flock(lock, fcntl.LOCK_SH)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH if wait else fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Busy(f"{folder / RENDER_LOCK}: a render is in progress") from None
         parts: list[str] = []
         for name in ORDER:
             text = _read(folder / name, optional=name == RULES)
@@ -203,9 +226,17 @@ def context(root: Path, principal: str) -> str:
                     "them. They win over anything learned. -->\n" + text
                 )
             parts.append(text if text.endswith("\n") else text + "\n")
+        recorded = None
+        if manifest:
+            try:
+                recorded = _read_bytes(folder / MANIFEST)
+            except Silent:
+                # Not a manifest walle wrote (a link, a FIFO, too big), but the tier itself
+                # is whole: report the record as unreadable rather than the tier as missing.
+                recorded = b""
     finally:
         os.close(lock)  # releases the flock
-    return "\n".join(parts)
+    return "\n".join(parts), recorded
 
 
 def _open(path: Path) -> int:
@@ -231,17 +262,25 @@ def _open(path: Path) -> int:
     return fd
 
 
-def _read(path: Path, *, optional: bool) -> str | None:
+def _read_bytes(path: Path) -> bytes | None:
+    """A file's bytes, bounded, through ``_open``; ``None`` when it does not exist."""
     try:
         fd = _open(path)
     except FileNotFoundError:
-        if optional:
-            return None
-        raise Silent(f"{path}: missing, so the hot tier is incomplete") from None
+        return None
     with os.fdopen(fd, "rb") as f:
         data = f.read(MAX_FILE_BYTES + 1)
     if len(data) > MAX_FILE_BYTES:
         raise Silent(f"{path}: over {MAX_FILE_BYTES:,} bytes, too big to be a hot tier")
+    return data
+
+
+def _read(path: Path, *, optional: bool) -> str | None:
+    data = _read_bytes(path)
+    if data is None:
+        if optional:
+            return None
+        raise Silent(f"{path}: missing, so the hot tier is incomplete")
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError as exc:
