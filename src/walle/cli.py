@@ -21,6 +21,7 @@ from walle import models as walle_models
 from walle import observer as walle_observer
 from walle import proposer as walle_proposer
 from walle import staging as walle_staging
+from walle import stats as walle_stats
 from walle import why as walle_why
 from walle.evals import report as walle_evals
 from walle.events import AnyEvent, Assertion, FutureSchemaError, Proposal, Supersede
@@ -800,3 +801,40 @@ def acp_command(
 # --- the evals (tasks 19-21) ---------------------------------------------------------------
 
 main.add_command(walle_evals.eval_command)
+
+
+# --- the acceptance rate (issue #53) -----------------------------------------------------
+
+
+@main.command("stats")
+@_ROOT
+@click.option("--principal", required=True, help="Whose log to count, without the p- prefix.")
+def stats_command(root: Path, principal: str) -> None:
+    """Count the proposals kept, edited and dropped: the Phase 1 gate metric (D49).
+
+    Counted from the log alone; the index only makes it quick, and rebuilding it gives the
+    same numbers. Prints counts only, never what a proposal says.
+    """
+    try:
+        report = walle_stats.stats(root, principal)
+    except _LOG_ERRORS as exc:
+        # Without content: a line the reader refuses is quoted in pydantic's message.
+        raise click.ClickException(_without_content(exc)) from exc
+
+    counts = report.counts
+    if report.skipped_lines:
+        click.echo(
+            f"{principal}: skipped {_plural(report.skipped_lines, 'unreadable line')} in the "
+            "log; anything on them is not counted below. `walle rebuild` names them.",
+            err=True,
+        )
+    click.echo(f"{principal}: {_plural(counts.proposals, 'proposal')} in the log.")
+    click.echo(f"  kept: {counts.kept}")
+    click.echo(f"  edited: {counts.edited}")
+    click.echo(f"  dropped: {counts.dropped}")
+    click.echo(f"  still staged: {counts.staged}")
+    if counts.decided:
+        rate = walle_stats.percent(counts.accepted, counts.decided)
+        click.echo(f"acceptance: {counts.accepted} of {counts.decided} decided ({rate}%).")
+    else:
+        click.echo("acceptance: nothing decided yet.")
