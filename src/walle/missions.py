@@ -26,12 +26,26 @@ The rules
    validator already refuses a cyclic plan, so the only way a cycle can be asked for is
    here, and the answer is no.
 5. **Dispatch is not the fold.** ``ready`` is what the DAG says. ``dispatchable`` is what a
-   runner may actually start: nothing while the mission is paused, and nothing at all unless
-   the owner has turned missions on — outside the log, in the environment, where no event
-   the agent appends can reach (D117: install is not enable). There is no runner in this
-   build; this function is the seam one will have to come through. A pause holds what has
-   not started; a status delta on a step already running is still recorded while paused,
-   because the log records what happened, not what should have.
+   runner may actually start: nothing while the mission is paused, nothing once it is
+   aborted (rule 6), and nothing at all unless the owner has turned missions on — outside
+   the log, in the environment, where no event the agent appends can reach (D117: install
+   is not enable). There is no runner in this build; ``dispatchable`` and ``admit`` are the
+   seam one will have to come through. A pause holds what has not started; a status delta
+   on a step already running is still recorded while paused, because the log records what
+   happened, not what should have.
+6. **A budget breach aborts the mission (D22).** Each node may declare a ``token_budget`` and
+   a ``cost_budget_usd``; the fold sums what its live status steps report. The moment a
+   node has spent more than either, the mission is aborted: ``breach`` says which node,
+   how much and of what, ``dispatchable`` is empty and ``admit`` refuses every node with
+   that reason, on every branch, on or off. This is read from the log, not from a flag a
+   runner remembers to set, so a runner that crashed mid-step and comes back finds the
+   same abort. ``abort_step`` is the event it appends to say so: the node ``failed``, the
+   reason as its note. Undoing the spend is a tombstone on a status step (rule 1); a bigger
+   budget is a new mission, because the plan is never edited.
+7. **The manifest is checked before the touch (D32 rule 2, D67).** ``admit`` takes what a
+   step is about to read, write and send to, and refuses anything the node did not declare,
+   naming every undeclared item — before the step starts and again at each tool call while
+   it runs. The matching rules are ``walle.manifest``'s.
 
 Anything the fold cannot apply is **reported, not dropped**, as the resolver does: a step
 whose mission the fold was not given, whose ``mission`` ref is not a mission, or whose node
@@ -47,6 +61,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from walle.events import (
+    ACTOR_KERNEL,
     AnyEvent,
     Mission,
     Node,
@@ -57,6 +72,7 @@ from walle.events import (
     find_cycle,
     parse_ref,
 )
+from walle.manifest import Touch, undeclared
 from walle.resolver import live_events
 
 if TYPE_CHECKING:  # annotations only: the fold takes records, it never reads them itself
@@ -106,8 +122,66 @@ class NodeState:
     spent: tuple[float, int]
     """``(cost_usd, tokens)`` summed over this node's live status deltas (D22)."""
 
+    spent_from: tuple[str, ...] = ()
+    """Refs of the live status steps that reported spend, in ref order: what an abort step
+    cites, and what a later exporter reads the per-step figures from."""
+
     injected_by: str | None = None
+
+    @property
+    def breaches(self) -> tuple[Breach, ...]:
+        """Rule 6, for this node: tokens first, then cost, each only if a budget is declared
+        and the spend is strictly over it."""
+        cost, tokens = self.spent
+        out: list[Breach] = []
+        if self.node.token_budget is not None and tokens > self.node.token_budget:
+            out.append(Breach(self.id, "tokens", tokens, self.node.token_budget))
+        if self.node.cost_budget_usd is not None and cost > self.node.cost_budget_usd:
+            out.append(Breach(self.id, "cost_usd", cost, self.node.cost_budget_usd))
+        return tuple(out)
+
     """The step that added it, or ``None`` for a node the mission event declared."""
+
+
+type BreachKind = Literal["tokens", "cost_usd"]
+
+
+@dataclass(frozen=True)
+class Breach:
+    """A node that has spent more than one of its budgets (D22)."""
+
+    node: str
+    kind: BreachKind
+    spent: int | float
+    budget: int | float
+
+    @property
+    def reason(self) -> str:
+        """The sentence the abort step carries and ``admit`` refuses with. Dollars are shown
+        to the cent at least and to the millionth at most, never rounded into equality: a
+        breach of $0.0061 over a $0.005 budget says so, not "$0.01 of its $0.01"."""
+        if self.kind == "tokens":
+            return f"node {self.node!r} spent {self.spent} tokens of its {self.budget} token budget"
+        spent, budget = _dollars(self.spent), _dollars(self.budget)
+        return f"node {self.node!r} spent ${spent} of its ${budget} cost budget"
+
+
+def _dollars(amount: int | float) -> str:
+    text = f"{amount:.6f}".rstrip("0")
+    whole, _, cents = text.partition(".")
+    return f"{whole}.{cents.ljust(2, '0')}"
+
+
+NOTHING = Touch()
+"""A step that touches nothing, which every manifest covers: ``admit``'s default."""
+
+
+@dataclass(frozen=True)
+class Refusal:
+    """Why ``admit`` would not let a step start or go on."""
+
+    node: str
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -173,6 +247,21 @@ class MissionState:
         cost = sum(n.spent[0] for n in self.nodes)
         return (round(cost, 6), sum(n.spent[1] for n in self.nodes))
 
+    @property
+    def breaches(self) -> tuple[Breach, ...]:
+        """Rule 6: every budget breach, in node order."""
+        return tuple(b for n in self.nodes for b in n.breaches)
+
+    @property
+    def breach(self) -> Breach | None:
+        """The first breach in node order — the reason the mission is aborted — or ``None``."""
+        breaches = self.breaches
+        return breaches[0] if breaches else None
+
+    @property
+    def aborted(self) -> bool:
+        return bool(self.breaches)
+
 
 @dataclass(frozen=True)
 class Missions:
@@ -189,12 +278,70 @@ class Missions:
         raise KeyError(f"{ref} is not a live mission")
 
 
+def _held(state: MissionState, environ: Mapping[str, str] | None) -> str | None:
+    """Why nothing in this mission may run now, or ``None``: off, paused, aborted, in that
+    order, so one refusal tells the reader the earlier reasons did not apply."""
+    if not enabled(environ):
+        return "missions are off"
+    if state.paused:
+        return "mission is paused"
+    if (breach := state.breach) is not None:
+        return f"aborted: {breach.reason}"
+    return None
+
+
 def dispatchable(state: MissionState, environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
-    """Rule 5: the ready nodes a runner may start now — none unless missions are on, and
-    none while the mission is paused."""
-    if not enabled(environ) or state.paused:
+    """Rule 5: the ready nodes a runner may start now — none unless missions are on, none
+    while the mission is paused, and none once a budget is breached (rule 6)."""
+    if _held(state, environ) is not None:
         return ()
     return state.ready
+
+
+def admit(
+    state: MissionState,
+    node_id: str,
+    touch: Touch = NOTHING,
+    environ: Mapping[str, str] | None = None,
+) -> Refusal | None:
+    """The gate before a step touches anything (rules 5 to 7). ``None`` means go.
+
+    Refuses, in this order and with the first reason that holds: missions are off; the
+    mission is paused; the mission is aborted on a breach; the node is unknown, finished, or
+    not ready; something in ``touch`` is not in the node's manifest, every such item named.
+    A ``running`` node is admitted, because this is also the check at each tool call.
+    """
+    if (held := _held(state, environ)) is not None:
+        return Refusal(node_id, held)
+    try:
+        node = state.node(node_id)
+    except KeyError:
+        return Refusal(node_id, f"{state.ref} has no node {node_id!r}")
+    if node.status in (StepStatus.COMPLETED, StepStatus.FAILED):
+        return Refusal(node_id, f"already {node.status.value}")
+    if node.status is StepStatus.PENDING and node_id not in state.ready:
+        status = {n.id: n.status for n in state.nodes}
+        waiting = [p for p in node.predecessors if status[p] is not StepStatus.COMPLETED]
+        return Refusal(node_id, f"not ready: waiting on {', '.join(waiting)}")
+    if missing := undeclared(node.node, touch):
+        return Refusal(node_id, "; ".join(missing))
+    return None
+
+
+def abort_step(state: MissionState, breach: Breach, *, ts: str, actor: str = ACTOR_KERNEL) -> Step:
+    """The event a runner appends when it stops on a breach: the node ``failed``, the reason
+    as its note, caused by the status steps whose spend crossed the line. ``ts`` is passed
+    in — this module reads no clock — and the step carries no spend of its own."""
+    return Step(
+        ts=ts,
+        actor=actor,
+        caused_by=list(state.node(breach.node).spent_from),
+        mission=state.ref,
+        verb=StepVerb.STATUS,
+        node=breach.node,
+        status=StepStatus.FAILED,
+        note=breach.reason,
+    )
 
 
 def dag_hash(state: MissionState) -> str:
@@ -240,6 +387,7 @@ class _Building:
     status: dict[str, StepStatus]
     assignee: dict[str, str | None]
     spent: dict[str, tuple[float, int]]
+    spent_from: dict[str, list[str]]
     injected_by: dict[str, str | None]
     paused: bool = False
 
@@ -264,6 +412,8 @@ class _Building:
                     round(cost + (step.cost_usd or 0.0), 6),
                     tokens + (step.tokens or 0),
                 )
+                if step.cost_usd is not None or step.tokens is not None:
+                    self.spent_from[node].append(ref)
             else:
                 self.assignee[node] = step.assignee
         return None
@@ -287,6 +437,7 @@ class _Building:
         self.status[node.id] = StepStatus.PENDING
         self.assignee[node.id] = node.assignee
         self.spent[node.id] = (0.0, 0)
+        self.spent_from[node.id] = []
         self.injected_by[node.id] = ref
         return None
 
@@ -306,6 +457,7 @@ class _Building:
                     predecessors=tuple(sorted(predecessors[node_id], key=order.__getitem__)),
                     assignee=self.assignee[node_id],
                     spent=self.spent[node_id],
+                    spent_from=tuple(self.spent_from[node_id]),
                     injected_by=self.injected_by[node_id],
                 )
                 for node_id, node in self.nodes.items()
@@ -325,6 +477,7 @@ def _start(ref: str, mission: Mission) -> _Building:
         status=dict.fromkeys((n.id for n in mission.nodes), StepStatus.PENDING),
         assignee={node.id: node.assignee for node in mission.nodes},
         spent=dict.fromkeys((n.id for n in mission.nodes), (0.0, 0)),
+        spent_from={node.id: [] for node in mission.nodes},
         injected_by=dict.fromkeys((n.id for n in mission.nodes), None),
     )
 
