@@ -30,6 +30,8 @@ from walle.events import (
     Ask,
     AskKind,
     Assertion,
+    Automation,
+    AutomationVerb,
     Contradiction,
     Event,
     FutureSchemaError,
@@ -142,6 +144,14 @@ def _one_of_each() -> list[AnyEvent]:
             outcome=AnswerOutcome.ANSWERED,
             value="thursday",
             surface="cli",
+        ),
+        Automation(
+            ts=TS,
+            actor=ACTOR_USER,
+            verb=AutomationVerb.ADD,
+            name="water-plants",
+            title="Remind me to water the plants on Sunday",
+            note="synthetic",
         ),
     ]
 

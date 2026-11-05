@@ -1,0 +1,12 @@
+{"actor":"ines","caused_by":[],"name":"water-plants","seq":1,"title":"Remind me to water the plants on Sunday","ts":"2026-11-05T09:00:00.000000+00:00","type":"automation","v":1,"verb":"add"}
+{"actor":"ines","caused_by":[],"name":"bin-night","seq":2,"title":"Tell me on Tuesday evening which bins go out","ts":"2026-11-05T09:01:00.000000+00:00","type":"automation","v":1,"verb":"add"}
+{"actor":"ines","caused_by":[],"name":"school-run","seq":3,"title":"Text the school-run rota every Monday","ts":"2026-11-05T09:02:00.000000+00:00","type":"automation","v":1,"verb":"add"}
+{"actor":"ines","caused_by":[],"note":"the council fines missed bins","seq":4,"target":"d-mbp:2","ts":"2026-11-05T09:03:00.000000+00:00","type":"automation","v":1,"verb":"pin"}
+{"actor":"ines","caused_by":[],"note":"not needed in the holidays","seq":5,"target":"d-mbp:3","ts":"2026-11-05T09:04:00.000000+00:00","type":"automation","v":1,"verb":"retire"}
+{"actor":"kernel","caused_by":[],"name":"car-service","seq":6,"title":"Book the car service","ts":"2026-11-05T09:05:00.000000+00:00","type":"automation","v":1,"verb":"add"}
+{"actor":"ines","caused_by":[],"reason":"trying to drop it without unpinning","seq":7,"target":"d-mbp:2","ts":"2026-11-05T09:06:00.000000+00:00","type":"supersede","v":1}
+{"actor":"ines","caused_by":[],"seq":8,"target":"d-mbp:2","ts":"2026-11-05T09:07:00.000000+00:00","type":"automation","v":1,"verb":"retire"}
+{"actor":"ines","caused_by":[],"name":"bin-night","seq":9,"title":"A second bin reminder","ts":"2026-11-05T09:08:00.000000+00:00","type":"automation","v":1,"verb":"add"}
+{"actor":"ines","caused_by":[],"seq":10,"target":"d-mbp:2","ts":"2026-11-05T09:09:00.000000+00:00","type":"automation","v":1,"verb":"unpin"}
+{"actor":"ines","caused_by":["d-mbp:5"],"name":"school-run","note":"term has started","seq":11,"title":"Text the school-run rota every Monday","ts":"2026-11-05T09:10:00.000000+00:00","type":"automation","v":1,"verb":"add"}
+{"actor":"ines","caused_by":[],"seq":12,"target":"d-mbp:11","ts":"2026-11-05T09:11:00.000000+00:00","type":"automation","v":1,"verb":"pin"}
