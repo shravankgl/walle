@@ -22,11 +22,19 @@ MODEL_OR_NETWORK = {
     "litellm",
     "ollama",
     "openai",
+    "opik",
     "requests",
 }
 
 # Runtime dependencies decided so far (D87, D106). Anything else needs Shravan.
 ALLOWED_DEPENDENCIES = {"aisuite", "click", "fastmcp", "pydantic"}
+
+# Optional extras decided so far, each with what it may install. D25 as narrowed on 2026-11-05:
+# Opik is optional and off by default, so it is an extra, never a runtime dependency.
+ALLOWED_EXTRAS = {"opik": {"opik"}}
+
+# The one module that may import opik (issue #80). Every other module works without it.
+OPIK_EXPORTER = "opik_export"
 
 
 def imports_of(source: str) -> set[str]:
@@ -97,3 +105,38 @@ def test_runtime_dependencies_are_on_the_allowlist() -> None:
         re.split(r"[\s<>=!~;\[]", spec, maxsplit=1)[0].lower() for spec in project["dependencies"]
     }
     assert names <= ALLOWED_DEPENDENCIES
+
+
+def package_names(specs: list[str]) -> set[str]:
+    return {re.split(r"[\s<>=!~;\[]", spec, maxsplit=1)[0].lower() for spec in specs}
+
+
+def test_optional_extras_are_on_the_allowlist() -> None:
+    """An optional extra is a decision too, not a way round the dependency allowlist."""
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+    extras = project.get("optional-dependencies", {})
+    assert set(extras) <= set(ALLOWED_EXTRAS)
+    for name, specs in extras.items():
+        assert package_names(specs) <= ALLOWED_EXTRAS[name]
+
+
+def importers_of(package: Path, name: str) -> set[str]:
+    """Every module under `package` that imports `name`, anywhere in the file, as a dotted path."""
+    return {
+        ".".join(path.relative_to(package).with_suffix("").parts)
+        for path in package.rglob("*.py")
+        if name in imports_of(path.read_text())
+    }
+
+
+def test_only_the_exporter_imports_opik() -> None:
+    """D25: walle works the same without Opik, so nothing else may reach for it."""
+    assert importers_of(PACKAGE, "opik") <= {OPIK_EXPORTER}
+
+
+def test_the_opik_check_sees_a_lazy_import_in_any_module(tmp_path: Path) -> None:
+    (tmp_path / "sub").mkdir()
+    (tmp_path / OPIK_EXPORTER).with_suffix(".py").write_text("import opik\n")
+    (tmp_path / "sub" / "lazy.py").write_text("def f():\n    from opik import Opik\n")
+    (tmp_path / "clean.py").write_text("import json\n")
+    assert importers_of(tmp_path, "opik") == {OPIK_EXPORTER, "sub.lazy"}

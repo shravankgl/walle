@@ -261,11 +261,12 @@ def test_a_declared_touch_on_a_ready_node_is_admitted() -> None:
 
 def test_every_undeclared_item_is_in_the_refusal() -> None:
     state = _one(_stream(_meal_plan()))
-    touch = Touch(writes=("principals/p-ira/keys",), egress=("tracker.example",))
+    # `notes` is declared for reading, not writing; task 69 floored the `keys` this used
+    touch = Touch(writes=("principals/p-ira/notes",), egress=("tracker.example",))
     refusal = admit(state, "pick-recipes", touch, ON)
     assert refusal is not None
     assert refusal.reason == (
-        "write 'principals/p-ira/keys' is not in writes; "
+        "write 'principals/p-ira/notes' is not in writes; "
         "egress to 'tracker.example' is not in egress"
     )
 
@@ -282,8 +283,11 @@ def test_a_running_node_may_keep_touching_what_it_declared() -> None:
     records = _stream(_meal_plan(), _status("d-tab:1", "pick-recipes", StepStatus.RUNNING))
     state = _one(records)
     assert admit(state, "pick-recipes", Touch(reads=("shared/recipes",)), ON) is None
-    refusal = admit(state, "pick-recipes", Touch(writes=("shared/recipes",)), ON)
-    assert refusal == Refusal(node="pick-recipes", reason="write 'shared/recipes' is not in writes")
+    # `notes` is read-only in the manifest; task 69 floored the `shared/recipes` write this used
+    refusal = admit(state, "pick-recipes", Touch(writes=("principals/p-ira/notes",)), ON)
+    assert refusal == Refusal(
+        node="pick-recipes", reason="write 'principals/p-ira/notes' is not in writes"
+    )
 
 
 @pytest.mark.parametrize("status", [StepStatus.COMPLETED, StepStatus.FAILED])
