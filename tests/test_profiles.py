@@ -345,6 +345,30 @@ def test_no_path_reaches_another_principal_s_folder_through_a_link(
     assert profile.path("notes/mine").resolve() == (ada / "log").resolve()
 
 
+def test_a_plain_open_follows_no_link_even_one_that_stays_inside(tmp_path: Path) -> None:
+    """Issue #118 finding 1.4: the grants' rule files are opened through this door with
+    ``plain=True``, which refuses a name that lands anywhere but on itself — a link inside the
+    folder included, which ``open`` alone would follow because it is still Ada's."""
+    root = _household(tmp_path)
+    ada = principal_dir(root, A)
+    (ada / "grants").mkdir()
+    (ada / "grants" / "real.jsonl").write_text("")
+    (ada / "grants" / "always.jsonl").symlink_to("real.jsonl")
+    (ada / "rules").symlink_to("grants")
+    profile = Profile(bind(root, A))
+    with profile.open("grants/always.jsonl") as f:  # the ordinary door follows it: it is inside
+        assert f.read() == b""
+    for name in ("grants/always.jsonl", "rules/real.jsonl", "rules/missing.jsonl"):
+        assert not profile.resolve(name).plain
+        with pytest.raises(CrossPrincipalError, match="link"):
+            profile.open(name, plain=True)
+    assert profile.resolve("grants/real.jsonl").plain
+    assert profile.resolve("grants/missing.jsonl").plain  # nothing there yet: it would be made here
+    with profile.open("grants/real.jsonl", plain=True) as f:
+        assert f.read() == b""
+    assert profile.resolve("GRANTS/Real.jsonl").plain  # compared case-folded, as everywhere here
+
+
 def test_a_principal_folder_that_is_itself_a_link_is_refused(tmp_path: Path) -> None:
     """``principals/p-ada`` replaced by a link to Sam's folder: Ada's own paths would all land
     in Sam's. Nothing is reachable."""
