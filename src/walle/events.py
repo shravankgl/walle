@@ -39,6 +39,9 @@ D78      ``ask`` is an inbox item — an approval, a question or a notification 
 D6/D114  ``automation`` is one change to the register of active automations: ``add``,
          ``retire``, ``pin`` or ``unpin``. Which automations are active, and whether the WIP
          cap allows another, is a fold in ``walle.automations``, never an edit of an add.
+D6/D20   ``outcome`` is one observed run of an automation, ``ok`` or ``failed``, against the
+         ref of its add. How many shipped automations still run at day 30 is a fold in
+         ``walle.survival`` over the log and an explicit ``as_of``.
 """
 
 from __future__ import annotations
@@ -263,6 +266,19 @@ class AutomationVerb(StrEnum):
     UNPIN = "unpin"
 
 
+class OutcomeResult(StrEnum):
+    """How one run of an automation went (D19, D20).
+
+    ``ok`` means it ran and did its job; ``failed`` means it ran and did not. There is no
+    ``stopped``: an automation that stopped produces no outcome at all, and that silence is
+    what ``walle.survival`` counts against it. A closed set, like ``StepVerb``: adding a member
+    is a version bump with an upcaster (D88).
+    """
+
+    OK = "ok"
+    FAILED = "failed"
+
+
 class Level(StrEnum):
     """How an assertion was reached (D94).
 
@@ -393,7 +409,8 @@ class Event(BaseModel):
 # §5.2's taxonomy also has utterance, capability, trust, feedback and outcome. They belong
 # to phases that do not exist yet; adding them now would be guessing at their fields with
 # nothing to check the guess against. `mission` and `step` arrived with Phase 2 (R8, D67),
-# `ask` and `answer` with its inbox (D78), and `automation` with Phase 3's register (D6).
+# `ask` and `answer` with its inbox (D78), `automation` with Phase 3's register (D6), and
+# `outcome` with its survival report (D20).
 
 
 class Observation(Event):
@@ -848,6 +865,29 @@ class Automation(Event):
         return self
 
 
+# --- outcomes (D19, D20) ------------------------------------------------------------------
+
+
+class Outcome(Event):
+    """One observed run of an automation: ``target`` is the ref of its add, ``result`` how it
+    went, ``note`` free text (what it sent, why it failed).
+
+    §5.2 says an outcome is observed against a ``capability`` or a ``mission``. Which kinds of
+    target count is the reader's call, not the event's: ``walle.survival`` counts outcomes
+    against an automation's add and reports any other. ``ts`` is when the run was recorded,
+    which for the runner that writes it is when it ran.
+
+    There is no ``survived`` or ``active`` field: whether an automation survived is what the
+    fold says over every event up to a date, never something one run declares.
+    """
+
+    type: Literal["outcome"] = "outcome"
+
+    target: Ref
+    result: OutcomeResult
+    note: str | None = None
+
+
 type AnyEvent = Annotated[
     Observation
     | Assertion
@@ -859,7 +899,8 @@ type AnyEvent = Annotated[
     | Step
     | Ask
     | Answer
-    | Automation,
+    | Automation
+    | Outcome,
     Field(discriminator="type"),
 ]
 
@@ -877,6 +918,7 @@ EVENT_TYPES: dict[str, type[Event]] = {
     "ask": Ask,
     "answer": Answer,
     "automation": Automation,
+    "outcome": Outcome,
 }
 
 

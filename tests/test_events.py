@@ -40,6 +40,8 @@ from walle.events import (
     Mission,
     Node,
     Observation,
+    Outcome,
+    OutcomeResult,
     Proposal,
     Snapshot,
     Step,
@@ -151,6 +153,13 @@ def _one_of_each() -> list[AnyEvent]:
             verb=AutomationVerb.ADD,
             name="water-plants",
             title="Remind me to water the plants on Sunday",
+            note="synthetic",
+        ),
+        Outcome(
+            ts=TS,
+            actor=ACTOR_KERNEL,
+            target="d-mbp:1",
+            result=OutcomeResult.OK,
             note="synthetic",
         ),
     ]
