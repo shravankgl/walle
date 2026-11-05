@@ -666,6 +666,7 @@ def test_the_mission_fold_does_no_io_and_reads_no_clock() -> None:
         "os",
         "typing",
         "walle.events",
+        "walle.floors",  # task 69: the floor under the manifest; its own tests pin what it imports
         "walle.manifest",  # task 68: the gate's matching rules; held to the same purity test
         "walle.resolver",
     }
