@@ -23,6 +23,7 @@ from walle import proposer as walle_proposer
 from walle import staging as walle_staging
 from walle import stats as walle_stats
 from walle import why as walle_why
+from walle.bench import bench_command
 from walle.evals import report as walle_evals
 from walle.events import AnyEvent, Assertion, FutureSchemaError, Proposal, Supersede
 from walle.paths import principal_dir
@@ -648,6 +649,11 @@ def curate_command(root: Path, principal: str, device: str, model: str) -> None:
         click.echo("Not in the hot tier until you keep them: run `walle review`.")
     if report.contradictions:
         click.echo("A contradiction is recorded, not resolved: `walle forget` the wrong side.")
+
+
+# --- the benchmark (tasks 25-26) ----------------------------------------------------------
+
+main.add_command(bench_command)
 
 
 # --- the transcript observer (issue #40) ------------------------------------------------
