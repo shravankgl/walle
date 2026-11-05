@@ -25,6 +25,7 @@ from walle import staging as walle_staging
 from walle import stats as walle_stats
 from walle import why as walle_why
 from walle.bench import bench_command
+from walle.evals import gate as walle_gate
 from walle.evals import report as walle_evals
 from walle.events import AnyEvent, Assertion, FutureSchemaError, Proposal, Supersede
 from walle.paths import principal_dir
@@ -848,6 +849,7 @@ def acp_command(
 # --- the evals (tasks 19-21) ---------------------------------------------------------------
 
 main.add_command(walle_evals.eval_command)
+main.add_command(walle_gate.gate_command)
 
 
 # --- the acceptance rate (issue #53) -----------------------------------------------------

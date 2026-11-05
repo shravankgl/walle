@@ -19,5 +19,10 @@ what the current code produces.
   items and three benign chores were added, and the benign chores are proposed as workflows.
   Gate PASS, zero false-allows; the same caveat applies. The first version is in git history.
 
+`floor.txt` is not a report. It is the regression floor `walle gate` holds the fake eval to
+(D22, #75): one `keep` rule per metric, measured against what walle started with, never the
+last run. The gate reads it and never writes it. Raising a floor is a reviewed change, and
+lowering one is a decision. The gate is off unless `WALLE_GATE=on`.
+
 A real model's report needs its key: `uv run --with 'aisuite[<provider>]' walle eval --model
 <provider>:<model> [--longmemeval FILE] [--locomo FILE]`.
