@@ -195,14 +195,14 @@ FAILED test_a_write_outside_the_workspace_is_refused[/root/escaped]
   sharing hid it on the Mac, where the Mac run's positive test passed. The boundary was
   *stronger* than the harness assumed — the one positive test failed, not an escape. The fix,
   in `plan`, is `--user <uid>:<gid>`: the fourth commit took the ids from the workspace's
-  `stat`; the sixth, on the owner's instruction, takes them from the host process itself,
-  `os.getuid()` and `os.getgid()`, in one small function `host_user()` so the plan test and
-  `run` agree on them. The container therefore also stops running as root at all. On Linux
+  `stat`; the sixth, on an instruction that crossed with the Mac result, briefly took them from
+  the host process; the seventh went back to the workspace's owner (see *Second Mac run*). The
+  container therefore also stops running as root at all. On Linux
   that is the one identity that can write the one folder it is given; on the Mac, OrbStack
   remaps bind-mount ownership to the container's user under runc, so the same flag holds.
-  `test_the_process_runs_as_the_host_user_not_as_root` pins the plan; in the escape tests the
-  positive write now asserts the file belongs to the host uid, and a new
-  `test_the_process_inside_is_the_host_user_not_root` checks `id -u` and `id -g` inside.
+  `test_the_process_runs_as_the_workspace_owner_not_as_root` pins the plan; in the escape
+  tests the positive write asserts the file belongs to the workspace's owner, and
+  `test_the_process_inside_is_the_workspace_owner_not_root` checks `id -u` and `id -g` inside.
 - **`/root/escaped`** was the host-side check raising, not the container: `Path.exists()` under
   a `/root` the runner user cannot enter raises `PermissionError`. A test bug. Now
   `os.path.exists`, which answers `False` there; `/root` stays in the list and the in-container
@@ -267,10 +267,36 @@ uv run ruff format --check  138 files already formatted
 uv run pyright              0 errors, 0 warnings, 0 informations
 ```
 
-The 30th skip is the new `id -u` escape test. The Mac has not run the current head. Commits
-two to six are what it will see new: the
-subshell fork storm, removal judged by the listing, and `--user <host uid>:<gid>` — the last
-being the one to watch under OrbStack's ownership remap.
+The 30th skip is the new `id -u` escape test.
+
+**Second Mac run, and the seventh commit.** The owner ran head `ebf80896` (the fourth commit,
+`--user` from the workspace's `stat`) on the Mac: **19 of 19 passed**, and called running as the
+workspace owner a good choice. That message and the sixth commit crossed: the sixth had, on the
+owner's earlier instruction, moved the ids to `os.getuid()`/`os.getgid()`. The latest word
+wins, and it is the one the Mac validated, so the seventh commit goes back to the workspace's
+owner — `owner_user(workspace)`, one function over `_owner_ids` (a plain `os.stat`) so the plan
+test and `run` agree — and closes the two gaps the owner named:
+
+- **A root-owned workspace is refused.** `--user 0:0` would be root in the container again.
+  `owner_user` raises `ValueError("… owned by root …")` for uid 0 whatever the gid, so `plan`
+  and `run` both refuse before anything starts. A test process is seldom root, so
+  `test_a_root_owned_workspace_is_refused` stands `_owner_ids` in with `(0, 0)` and checks all
+  three entry points and that the fake recorded nothing; a second test covers `(0, 1000)`.
+- **The user inside a real container is tested.** `test_the_process_inside_is_the_workspace_
+  owner_not_root` runs `id -u; id -g` and asserts they equal the workspace's `st_uid`/`st_gid`
+  and the uid is not 0 (the sixth commit's version compared against the host process; this
+  one compares against the folder, which is what `--user` is built from). The escape file is
+  20 tests.
+
+```
+uv run pytest               2163 passed, 30 skipped
+uv run ruff check           All checks passed!
+uv run ruff format --check  138 files already formatted
+uv run pyright              0 errors, 0 warnings, 0 informations
+```
+
+The Mac has run the fourth commit; commits five to seven are what it will see new: the
+subshell fork storm, the root-owned-workspace refusal, and the `id -u` test inside the container.
 
 **Two-runner walkthrough:** the executor touches no log, lock or derived file. The shared thing
 is the daemon. Writers A and B each `run` a job: each makes its own 16-hex token, so the two
@@ -313,11 +339,15 @@ a decode that could raise on a stray byte (`errors="replace"` throughout).
   there because real tools need one; `noexec` so it cannot become a staging area.
 - **`--init`.** A `sh -c` child that forks leaves zombies without a reaper; `tini` as PID 1 is
   one CLI flag and standard.
-- **`--user` is the host process's own uid and gid** (sixth commit; the fourth used the
-  workspace owner's, the first three ran as root and Linux showed why that cannot write the
-  workspace once every capability is gone). Read from the process, not configured, so there is
-  nothing to get wrong, and `host_user()` is one function so `run` stays testable against the
-  plan. No `HOME` is set inside; a tool that needs one is a later decision. Noted below.
+- **`--user` is the workspace owner's uid and gid, and uid 0 is refused** (fourth and seventh
+  commits; the sixth briefly used the host process's ids, the first three ran as root and
+  Linux showed why that cannot write the workspace once every capability is gone). The owner
+  of the folder is the identity that can write the folder, on Linux by the mode bits and on
+  the Mac by OrbStack's remap; the host process's ids are the same in every ordinary case and
+  differ only when they should not (a `sudo`'d runner on a person's folder). Read from the
+  filesystem, not configured, so there is nothing to get wrong; `owner_user()` is one function
+  so `run` stays testable against the plan. No `HOME` is set inside; a tool that needs one is
+  a later decision. Noted below.
 - **The timeout covers the image pull.** A first run against a missing image may be killed by a
   short timeout, and `removed` will then be `False` with "No such container". The alternative —
   a separate pull step — is more surface for one task. The escape tests pull once up front.

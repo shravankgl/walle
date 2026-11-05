@@ -14,8 +14,8 @@ What is attempted, and what must hold, each in its own test:
 
   write outside the workspace      the root filesystem is read-only; ``/``, ``/etc``, ``/usr``
                                    and ``/root`` refuse a new file, and nothing lands on the host
-  not root                         the process inside is the host user, ``id -u`` is the host's
-                                   uid and not 0, so nothing root-only is reachable to begin with
+  not root                         the process inside is the workspace's owner: ``id -u`` is the
+                                   folder's ``st_uid`` and not 0, so nothing root-only is reachable
   read beside the workspace        a sibling folder of the workspace, holding a synthetic
                                    secret, is not in the container at any path
   keep a capability                the effective capability set is empty; ``mount`` and
@@ -129,14 +129,14 @@ def _containers(label: str) -> list[str]:
 # --- the workspace itself works ---------------------------------------------------------------
 
 
-def test_a_write_inside_the_workspace_reaches_the_host_and_belongs_to_the_host_user(
+def test_a_write_inside_the_workspace_reaches_the_host_and_belongs_to_its_owner(
     workspace: Path,
 ) -> None:
     outcome = _sh(workspace, "cat inside.txt && echo made-inside > made.txt")
     assert outcome.exit_code == 0, outcome.stderr
     assert outcome.stdout == "synthetic workspace file\n"
     assert (workspace / "made.txt").read_text() == "made-inside\n"
-    assert (workspace / "made.txt").stat().st_uid == os.getuid()
+    assert (workspace / "made.txt").stat().st_uid == workspace.stat().st_uid
 
 
 # --- write outside the workspace ----------------------------------------------------------------
@@ -193,10 +193,11 @@ def test_only_one_mount_is_a_bind_from_the_host(workspace: Path) -> None:
 # --- not root -----------------------------------------------------------------------------------
 
 
-def test_the_process_inside_is_the_host_user_not_root(workspace: Path) -> None:
+def test_the_process_inside_is_the_workspace_owner_not_root(workspace: Path) -> None:
+    info = workspace.stat()
     outcome = _sh(workspace, "id -u; id -g")
     assert outcome.exit_code == 0, outcome.stderr
-    assert outcome.stdout.split() == [str(os.getuid()), str(os.getgid())]
+    assert outcome.stdout.split() == [str(info.st_uid), str(info.st_gid)]
     assert outcome.stdout.split()[0] != "0"
 
 

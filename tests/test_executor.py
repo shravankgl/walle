@@ -1,10 +1,10 @@
 """Issue #72's container executor, without a container (D68, D99, D117).
 
   the plan is the boundary   the ``docker run`` the executor builds mounts the workspace and
-                             nothing else, runs as the workspace's owner, drops every
-                             capability, forbids new privileges, caps memory, CPU and PIDs,
-                             closes the network, and labels the container so a crashed
-                             parent's child can be found
+                             nothing else, runs as the workspace's owner and never as root,
+                             drops every capability, forbids new privileges, caps memory, CPU
+                             and PIDs, closes the network, and labels the container so a
+                             crashed parent's child can be found
   the client is driven       with a fake ``docker`` standing in for the real one: the argv the
                              fake records is the plan exactly, the outcome carries exit code and
                              output, a hang is killed and the container removed by name, and the
@@ -36,6 +36,7 @@ from pathlib import Path
 import pytest
 
 from test_constraints import MODEL_OR_NETWORK, forbidden_in_closure
+from walle import executor
 from walle.executor import (
     DEFAULT_IMAGE,
     EXECUTOR_SWITCH,
@@ -50,7 +51,7 @@ from walle.executor import (
     Refusal,
     check_workspace,
     enabled,
-    host_user,
+    owner_user,
     plan,
     reap,
     run,
@@ -115,14 +116,41 @@ def test_only_the_workspace_is_mounted(tmp_path: Path) -> None:
     assert _flag(argv, "--workdir") == [MOUNT_POINT]
 
 
-def test_the_process_runs_as_the_host_user_not_as_root(tmp_path: Path) -> None:
+def test_the_process_runs_as_the_workspace_owner_not_as_root(tmp_path: Path) -> None:
     """With every capability dropped, root has no ``CAP_DAC_OVERRIDE`` and cannot write a
-    bind mount the host user owns; the host user can, and what the step leaves behind is
-    theirs. The ids come from one function, so this test and ``run`` agree on them."""
-    argv = plan(_job(tmp_path), token=TOKEN)
-    assert _flag(argv, "--user") == [host_user()] == [f"{os.getuid()}:{os.getgid()}"]
-    assert host_user() != "0:0" or os.getuid() == 0
+    bind mount it does not own; the owner can, and what the step leaves behind is theirs.
+    The ids come from one function, so this test and ``run`` agree on them."""
+    ws = _workspace(tmp_path)
+    info = ws.stat()
+    if info.st_uid == 0:
+        pytest.skip("this test process is root, so its workspace is root-owned and refused")
+    argv = plan(Job(ws, ("true",)), token=TOKEN)
+    assert _flag(argv, "--user") == [owner_user(ws)] == [f"{info.st_uid}:{info.st_gid}"]
     assert "--privileged" not in argv
+
+
+def test_a_root_owned_workspace_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--user 0:0`` would be root in the container again. A test process is seldom root,
+    so the owner lookup is stood in for; what is pinned is that uid 0 never reaches the plan."""
+    ws = _workspace(tmp_path)
+    monkeypatch.setattr(executor, "_owner_ids", lambda path: (0, 0))
+    with pytest.raises(ValueError, match="owned by root"):
+        owner_user(ws)
+    with pytest.raises(ValueError, match="owned by root"):
+        plan(Job(ws, ("true",)), token=TOKEN)
+    docker, record = _fake(tmp_path)
+    with pytest.raises(ValueError, match="owned by root"):
+        run(Job(ws, ("true",)), environ=ON, docker=docker, token=TOKEN)
+    assert _calls(record) == []
+
+
+def test_a_root_owned_workspace_with_a_non_root_group_is_still_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = _workspace(tmp_path)
+    monkeypatch.setattr(executor, "_owner_ids", lambda path: (0, 1000))
+    with pytest.raises(ValueError, match="owned by root"):
+        plan(Job(ws, ("true",)), token=TOKEN)
 
 
 def test_the_root_filesystem_is_read_only_with_a_private_tmp(tmp_path: Path) -> None:

@@ -25,11 +25,13 @@ things it does:
 
   The root filesystem is read-only and ``/tmp`` is a private tmpfs nothing can execute from,
   so the workspace is the only place a write can land and the only place one is looked for.
-  The process runs as the host user (``--user <uid>:<gid>``, from ``os.getuid()`` and
-  ``os.getgid()``), not as root. Two reasons. With every capability dropped, root has no
-  ``CAP_DAC_OVERRIDE`` and cannot write a bind mount the host user owns — the first run in a
-  real Linux container (CI) failed exactly there, where OrbStack's file sharing had hidden it
-  on the Mac. And files the step leaves behind should belong to the person, not to root.
+  The process runs as the workspace's owner (``--user <uid>:<gid>``, from the folder's
+  ``stat`` on the host), never as root. Two reasons. With every capability dropped, root has
+  no ``CAP_DAC_OVERRIDE`` and cannot write a bind mount the host user owns — the first run in
+  a real Linux container (CI) failed exactly there, where OrbStack's file sharing had hidden
+  it on the Mac. And files the step leaves behind should belong to the person, not to root.
+  A workspace owned by uid 0 is refused outright, because its owner *is* root and the
+  container would run as root again.
   ``--memory-swap`` equal to ``--memory`` is how the CLI spells "no swap". Nothing from the
   host environment is passed in: ``docker run`` gives a container an empty environment
   unless told otherwise, and it is not told.
@@ -245,10 +247,22 @@ def check_workspace(path: Path) -> Path:
     return resolved
 
 
-def host_user() -> str:
-    """``uid:gid`` of this process, as ``--user`` takes it: who the container runs as. One
-    place, so a test can pin the plan against it and a runner can say who ran."""
-    return f"{os.getuid()}:{os.getgid()}"
+def owner_user(workspace: Path) -> str:
+    """``uid:gid`` of the workspace's owner, as ``--user`` takes it: who the container runs
+    as. Raises ``ValueError`` for a workspace owned by uid 0, since that would put root back
+    in the container. One place, so a test can pin the plan against it and a runner can say
+    who ran."""
+    uid, gid = _owner_ids(workspace)
+    if uid == 0:
+        raise ValueError(
+            f"workspace {str(workspace)!r} is owned by root; the container would run as root"
+        )
+    return f"{uid}:{gid}"
+
+
+def _owner_ids(path: Path) -> tuple[int, int]:
+    info = os.stat(path)
+    return info.st_uid, info.st_gid
 
 
 def _check_token(token: str) -> str:
@@ -260,8 +274,9 @@ def _check_token(token: str) -> str:
 def plan(job: Job, *, token: str) -> tuple[str, ...]:
     """The ``docker run`` argv for ``job``, after the client: the boundary as a list of strings.
 
-    Starts no process. ``token`` names and labels the container; ``run`` makes one when the
-    caller has none. Raises ``ValueError`` for a workspace or token that fails its check.
+    Starts no process, but does ``stat`` the workspace for its owner. ``token`` names and
+    labels the container; ``run`` makes one when the caller has none. Raises ``ValueError``
+    for a workspace or token that fails its check, and for a root-owned workspace.
     """
     workspace = check_workspace(job.workspace)
     token = _check_token(token)
@@ -278,7 +293,7 @@ def plan(job: Job, *, token: str) -> tuple[str, ...]:
         "--workdir",
         MOUNT_POINT,
         "--user",
-        host_user(),
+        owner_user(workspace),
         "--read-only",
         "--tmpfs",
         TMPFS,
