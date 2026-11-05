@@ -40,8 +40,6 @@ from walle.reviewer import REVIEWER_SWITCH, Action, Context, FakeReviewer, Stand
 from walle.speakers import Order, Speaker
 
 TS = "2026-11-05T10:00:00+00:00"
-ADA = Order("ada", Speaker("ada", Role.OPERATOR))
-"""Ada speaking as the operator: the authority a grant is given by (issue #119)."""
 EVERYTHING_ON = {
     MISSIONS_SWITCH: SWITCH_ON,
     REVIEWER_SWITCH: SWITCH_ON,
@@ -50,6 +48,11 @@ EVERYTHING_ON = {
     "WALLE_MATCHING": "on",
 }
 EVERYTHING_OFF: dict[str, str] = {}
+
+
+def _order(principal: str) -> Order:
+    return Order(principal, Speaker(principal, Role.OPERATOR))
+
 
 UNANSWERABLE = (
     "/",
@@ -234,7 +237,7 @@ def test_1_4_a_linked_grants_folder_grants_nothing_and_is_written_nothing(
             grants.Scope.ALWAYS,
             call_id="c1",
             root=two_principals,
-            by=ADA,
+            by=_order("ada"),
             ts=TS,
             environ=environ,
         )
@@ -249,7 +252,7 @@ def test_1_4_a_linked_grants_folder_grants_nothing_and_is_written_nothing(
                 grants.Scope.ALWAYS,
                 call_id="c1",
                 root=two_principals,
-                by=ADA,
+                by=_order("ada"),
                 ts=TS,
                 environ=environ,
             )
@@ -284,7 +287,7 @@ def test_1_4_a_linked_principal_folder_is_refused_the_same_way(tmp_path: Path) -
         grants.Scope.ALWAYS,
         call_id="c1",
         root=tmp_path,
-        by=ADA,
+        by=_order("ada"),
         ts=TS,
         environ=EVERYTHING_ON,
     )
@@ -332,3 +335,133 @@ def test_1_4_a_rule_file_that_is_a_link_inside_the_folder_is_still_not_read(
         environ=EVERYTHING_ON,
     )
     assert isinstance(decision, grants.Refused) and any("link" in p for p in decision.problems)
+
+
+# --- review round 2: plain is "no link was followed", not "the names fold the same" -----------
+
+
+def _case_sensitive(tmp_path: Path) -> bool:
+    probe = tmp_path / "probe-case"
+    probe.mkdir()
+    (probe / "a").write_text("")
+    return not (probe / "A").exists()
+
+
+CASE_VARIANTS = (
+    # (what is linked, the link's name, the target's spelling)
+    ("folder", grants.GRANTS_DIRNAME, "GRANTS"),
+    ("folder", grants.GRANTS_DIRNAME, "Grants"),
+    ("leaf", grants.CONFIG_FILE, "CONFIG.JSONL"),
+    ("leaf", grants.ALWAYS_FILE, "ALWAYS.JSONL"),
+    ("leaf", grants.LOCK_FILE, "ALWAYS.LOCK"),
+    ("leaf", rungs.ENVELOPE_FILE, "ENVELOPE.TXT"),
+)
+
+
+def _case_variant(root: Path, principal: str, what: str, name: str, spelled: str) -> None:
+    """A principal whose rule file or ``grants/`` is a link to a case-variant spelling that is
+    a real file or folder beside it, with a config rule and an envelope under the target."""
+    folder = principal_dir(root, principal)
+    rule = '{"v": 1, "tool": "shell", "arguments": "git status"}\n'
+    if what == "folder":
+        (folder / spelled).mkdir(parents=True)
+        (folder / spelled / grants.CONFIG_FILE).write_text(rule)
+        (folder / spelled / grants.ALWAYS_FILE).write_text(rule)
+        (folder / spelled / rungs.ENVELOPE_FILE).write_text("shell: git *\n")
+        os.symlink(spelled, folder / name)
+    else:
+        target = folder / grants.GRANTS_DIRNAME / spelled
+        target.parent.mkdir(parents=True)
+        target.write_text("shell: git *\n" if name == rungs.ENVELOPE_FILE else rule)
+        os.symlink(spelled, target.parent / name)
+
+
+@pytest.mark.parametrize(("what", "name", "spelled"), CASE_VARIANTS)
+def test_round_2_a_link_to_a_case_variant_is_still_a_link_for_reads_and_writes(
+    tmp_path: Path, what: str, name: str, spelled: str
+) -> None:
+    """The reviewer's reproduction. ``Resolved.plain`` used to fold case before comparing the
+    name given to the name landed on, so ``grants -> GRANTS`` or ``config.jsonl ->
+    CONFIG.JSONL`` counted as plain and the link was followed for reads and for writes. Plain
+    now means the walk met no link, recorded by the walk itself. On a case-insensitive
+    filesystem the target spelling *is* the link's own name and the link cannot be made, so
+    the test is skipped there rather than passed."""
+    if not _case_sensitive(tmp_path):
+        pytest.skip("case-insensitive filesystem: a link to a case variant of itself is a loop")
+    root = tmp_path / "root"
+    _case_variant(root, "ada", what, name, spelled)
+    profile = Profile(bind(root, "ada"))
+    for rule_file in (grants.CONFIG_FILE, grants.ALWAYS_FILE, rungs.ENVELOPE_FILE):
+        relative = f"{grants.GRANTS_DIRNAME}/{rule_file}"
+        if what == "folder" or name == rule_file:
+            assert not profile.resolve(relative).plain, relative
+            with pytest.raises(CrossPrincipalError, match="link"):
+                profile.open(relative, plain=True)
+    live = grants.Live.start("s1", "r1")
+    call = grants.Call("shell", "git status")
+    decision = grants.check(
+        live, call, call_id="c1", root=root, principal="ada", environ=EVERYTHING_ON
+    )
+    if what == "folder" or name in (grants.CONFIG_FILE, grants.ALWAYS_FILE):
+        assert isinstance(decision, grants.Refused), decision
+        assert any("link" in p for p in decision.problems)
+    loaded = rungs.load_envelope(root, "ada")
+    if what == "folder" or name == rungs.ENVELOPE_FILE:
+        assert isinstance(loaded, str) and "link" in loaded
+    before = {p: p.read_bytes() for p in principal_dir(root, "ada").rglob("*") if p.is_file()}
+    given = grants.grant(
+        live,
+        call,
+        grants.Scope.ALWAYS,
+        by=_order("ada"),
+        call_id="c1",
+        root=root,
+        ts=TS,
+        environ=EVERYTHING_ON,
+    )
+    if what == "folder" or name in (grants.ALWAYS_FILE, grants.LOCK_FILE):
+        assert given.degraded and "CrossPrincipalError" in given.note
+        after = {p: p.read_bytes() for p in principal_dir(root, "ada").rglob("*") if p.is_file()}
+        # nothing written anywhere, under either spelling: the only file that may appear is
+        # the empty lock, taken in the real folder before the append was refused
+        lock = grants.grants_dir(root, "ada") / grants.LOCK_FILE
+        new_files = {k: v for k, v in after.items() if k not in before}
+        assert {k: v for k, v in after.items() if k in before} == before
+        assert new_files in ({}, {lock: b""}), new_files
+    else:
+        assert not given.degraded  # a link at some other file is no reason to refuse this one
+
+
+def test_round_2_a_case_variant_name_with_no_link_is_plain(tmp_path: Path) -> None:
+    """The other side: case folding still matches floor names, and a name spelled in another
+    case that lands on itself with no link met is plain on any filesystem."""
+    root = tmp_path / "root"
+    folder = grants.grants_dir(root, "ada")
+    folder.mkdir(parents=True)
+    (folder / grants.CONFIG_FILE).write_text("")
+    profile = Profile(bind(root, "ada"))
+    assert profile.resolve(f"{grants.GRANTS_DIRNAME}/{grants.CONFIG_FILE}").plain
+    if not _case_sensitive(tmp_path):
+        assert profile.resolve("GRANTS/CONFIG.JSONL").plain
+    assert profile.resolve(f"{grants.GRANTS_DIRNAME}/missing.jsonl").plain  # would be made here
+    assert profile.resolve("GRANTS/missing.jsonl").plain
+
+
+@pytest.mark.parametrize("spelled", ["GRANTS", "Grants", "HOT", "Hot"])
+def test_round_2_the_floor_still_folds_case_through_a_case_variant_link(
+    tmp_path: Path, spelled: str
+) -> None:
+    """Finding 1.2 and the floor table through the same variants: a link named in one case to a
+    floor folder spelled in another is followed by the walk and the landing is floored, because
+    matching floor *names* folds case — that is what case folding is for."""
+    if not _case_sensitive(tmp_path):
+        pytest.skip("case-insensitive filesystem")
+    root = tmp_path / "root"
+    folder = principal_dir(root, "sam")
+    (folder / spelled).mkdir(parents=True)
+    os.symlink(spelled, folder / "notes")
+    found = floored(root, Op(Kind.WRITE, "principals/p-sam/notes/rules.md"))
+    assert found is not None
+    assert found.protected == f"principals/p-sam/{spelled.lower()}" and found.how == "under"
+    by_name = hit(f"principals/p-sam/{spelled}/rules.md")
+    assert by_name is not None and by_name.protected == f"principals/p-sam/{spelled.lower()}"

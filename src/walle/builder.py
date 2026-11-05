@@ -70,7 +70,6 @@ from __future__ import annotations
 
 import json
 import os
-import posixpath
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -536,7 +535,7 @@ def _inside(path: str) -> str | None:
         return "a path is empty or padded"
     if len(path) > PATH_CHARS:
         return f"a path is longer than {PATH_CHARS} characters"
-    if posixpath.isabs(path) or path.startswith("~") or "\\" in path or "\x00" in path:
+    if path.startswith("~") or "\\" in path:
         return "a path is not relative to the workspace"
     parts = segments(path)
     if parts is None:

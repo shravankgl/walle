@@ -49,12 +49,16 @@ refused rather than followed. Names are compared case-folded throughout (``HOT/`
 on APFS and NTFS, and so it is here, on every filesystem).
 
 ``open(..., plain=True)`` is the stricter door the rule files need (``walle.grants``,
-``walle.rungs``; issue #118 finding 1.4): the name must land exactly on itself,
+``walle.rungs``; issue #118 finding 1.4): the walk must have met no link at all,
 ``Resolved.plain``, so a link anywhere on the way is refused even when it stays inside the
-folder. A rule file is a plain file, and a link where one should be would carry a rule, or a
-grant, somewhere else — that was the grants' own rule for the leaf, and this is the same rule
-for every component from ``principals/`` down, decided once and acted on with no second
-resolution in between.
+folder. ``plain`` is recorded by the walk itself — ``walk_links`` returns every link it met,
+and plain is that list being empty — never by comparing the name given to the name landed on:
+names here are compared case-folded, and a fold can make ``grants -> GRANTS`` look like no
+link on a case-sensitive filesystem (PR #123, review round 2). Case folding matches floor
+names; it does not decide whether a link was followed. A rule file is a plain file, and a
+link where one should be would carry a rule, or a grant, somewhere else — that was the
+grants' own rule for the leaf, and this is the same rule for every component from
+``principals/`` down, decided once and acted on with no second resolution in between.
 
 The role is on the context and ``path`` does not look at it. There is no ``read_as``, no
 ``open_for``, no parameter that names a second principal on anything that reads. An admin's
@@ -351,12 +355,14 @@ class Resolved:
     ``parts`` are the landing's components below the profile's real folder, as spelled on
     disk; ``folded`` is the same, lower-cased, for every rule that compares names (the
     filesystems walle ships on fold case, so ``HOT/`` is ``hot/`` there). ``real`` is the
-    landing as an absolute path. Nothing has been opened.
+    landing as an absolute path. ``plain`` is whether the walk that resolved the name met no
+    link — the walk's own count, not a comparison of names. Nothing has been opened.
     """
 
     given: str
     folder: str
     parts: tuple[str, ...]
+    plain: bool
 
     @property
     def real(self) -> str:
@@ -365,13 +371,6 @@ class Resolved:
     @property
     def folded(self) -> tuple[str, ...]:
         return tuple(p.lower() for p in self.parts)
-
-    @property
-    def plain(self) -> bool:
-        """Whether the name landed exactly where it says — no link was followed on the way,
-        not even one that stays inside the folder. Compared case-folded, as everything is."""
-        given = tuple(p.lower() for p in self.given.split(os.sep) if p not in ("", "."))
-        return given == self.folded
 
 
 def _open_below(folder: str, parts: tuple[str, ...], flags: int, *, mkdirs: bool = False) -> int:
@@ -524,7 +523,7 @@ class Profile:
                 f"{self.principal!r}: {given!r} lands outside the profile folder; refused"
             )
         below = landing[len(real_folder) :].strip(os.sep)
-        return Resolved(given, real_folder, tuple(below.split(os.sep)))
+        return Resolved(given, real_folder, tuple(below.split(os.sep)), plain=not hops)
 
     def path(self, relative: str | os.PathLike[str]) -> Path:
         """Where ``relative`` lands, as a path: the resolved one, so what is checked is what
@@ -537,8 +536,8 @@ class Profile:
         """Open where ``relative`` lands, following no link at open time: the resolved
         components are opened one by one relative to the folder's descriptor, each
         ``O_NOFOLLOW``. Modes are ``r``, ``w``, ``a``, ``x``, binary or text. With ``plain``,
-        the name must also land exactly on itself (``Resolved.plain``): a link anywhere on
-        the way, inside the folder or not, is ``CrossPrincipalError``."""
+        the walk must also have met no link (``Resolved.plain``): a link anywhere on the
+        way, inside the folder or not, to any spelling, is ``CrossPrincipalError``."""
         kind, text = mode.replace("b", ""), "b" not in mode
         if kind not in _MODES:
             raise ValueError(f"mode {mode!r} is not one of r, w, a, x (with or without b)")

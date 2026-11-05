@@ -134,31 +134,6 @@ uv run ruff format --check  196 files already formatted
 uv run pyright              0 errors, 0 warnings, 0 informations
 ```
 
-`main` moved again, to `dfbeb90` (#124 approvals, after #119 speakers), and the PR went
-`dirty`: conflicts in `grants.py` and `rungs.py`. Main gave `grant` a required `by: Authority`
-in place of `principal` and refuses a `Request` before any file is opened; this task routes
-every rule-file open through `Profile`. The two are orthogonal, and both are kept: `grant`
-checks `by` exactly as main does and then binds `_profile(root, by.principal)`, so the grant
-still lands only in the `Order`'s own folder and is still opened through the plain door; the
-docstring names both refusals. `rungs.py` takes main's imports (`inbox`, `check_name`,
-`speakers`) with this task's `read_plain` and `CrossPrincipalError` in place of `grants_dir`,
-which nothing in `rungs` uses any more. The three `grant(...)` calls in this task's own
-`tests/test_audit_paths.py` passed `principal="ada"`; they now pass `by=ADA`, an `Order` for
-ada as operator — the same assertions, main's signature. No test of main's was edited. The agent's
-tool makes only single-parent commits, and committing the resolved files alone still
-conflicts, since both sides changed the same lines from the old base. So, in three steps,
-none forced: one commit sets `grants.py` and `rungs.py` to `main`'s own text (the branch is
-broken for that one commit, and no check can pass on it, so nothing merges); `update-branch`
-then merges `main` in cleanly; a last commit puts the resolution described here on top. The
-squash makes it one commit. With `main` merged, the four checks:
-
-```
-uv run pytest               4088 passed, 35 skipped in 128.19s (0:02:08)
-uv run ruff check           All checks passed!
-uv run ruff format --check  199 files already formatted
-uv run pyright              0 errors, 0 warnings, 0 informations
-```
-
 The issue's own reproduction script, run against the branch: `covers_path("/", …)` is `False`;
 `admit` returns the unanswerable refusal on and off; `review` is `blocked`; the four `floored`
 calls return `Floored(how="above", through=True, resolved=…/principals/p-sam)`; `grants.check`
@@ -276,3 +251,86 @@ are the contract.
   the policy.
 
 **Cost:** not visible to the author from inside this run; the owner reads it from Hyperagent.
+
+## Review round 2 — `plain` was a comparison of names, and names fold case
+
+The reviewer (Gemini 4 Argon, direct read of all 16 files; `ocr` could not be installed behind
+the egress firewall) failed head `84cba28` with one medium and one low.
+
+**Medium.** `Resolved.plain` compared the name given to the name landed on, case-folded — the
+same folding every other name comparison in `profiles` uses. On a case-sensitive filesystem
+that made `grants -> GRANTS`, `config.jsonl -> CONFIG.JSONL`, `always.jsonl -> ALWAYS.JSONL`,
+`always.lock -> ALWAYS.LOCK` and `envelope.txt -> ENVELOPE.TXT` count as plain: `walk_links`
+followed the link, the folded segments matched, and `_open_below` opened the *target's*
+segments with `O_NOFOLLOW` never seeing the link. Reads (`grants.check`, `load_envelope`) and
+writes (`grant(ALWAYS)`) all went through. The reviewer's reproduction held here.
+
+*Fix, as the owner directed:* names are not compared at all. `Resolved.plain` is now a field
+set by `Profile.resolve` from the walk itself — `plain=not hops`, `hops` being the list of
+links `walk_links` met — so it cannot disagree with what was walked. Case folding stays where
+it belongs, matching floor names (`HOT/` is `hot/`), and no longer decides whether a link was
+followed. The old property is deleted. The verbatim-segment alternative the reviewer also
+offered would have worked, but it still derives the answer from the name rather than from the
+event, and a future `..`-normalising or case-mapping change in `_walk` would break it silently;
+the hop count cannot be fooled by a spelling.
+
+*Tests, written first and failing on the folded `plain`:*
+- `test_round_2_a_link_to_a_case_variant_is_still_a_link_for_reads_and_writes` — six variants
+  from the reproduction: a directory link (`grants -> GRANTS`, `-> Grants`) and a leaf link
+  for each of `config.jsonl`, `always.jsonl`, `always.lock`, `envelope.txt`. For each:
+  `resolve(...).plain` is `False` and `open(plain=True)` is `CrossPrincipalError`;
+  `grants.check` is `Refused` naming the link where the link is on its path; `load_envelope`
+  is the problem string where it is; `grant(ALWAYS)` degrades with `CrossPrincipalError` in
+  the note where the link is on the write's path, and every file under the profile has the
+  same bytes after as before — the one file that may appear is the empty `always.lock` taken
+  in the real folder before the append was refused (the pre-#123 code took the lock before its
+  leaf `islink` check too). Where the link is on another file's path (`config.jsonl` linked,
+  `always.jsonl` written) the grant is *not* degraded: a link elsewhere is no reason. Skipped,
+  saying why, on a case-insensitive filesystem, where a link to a case variant of its own name
+  is a loop and the test would prove nothing; this sandbox is case-sensitive and all six ran.
+- `test_round_2_a_case_variant_name_with_no_link_is_plain` — the other side: a name spelled in
+  another case that lands with no link met is plain, on any filesystem, so `GRANTS/missing.jsonl`
+  is still somewhere a file would be made.
+- `test_round_2_the_floor_still_folds_case_through_a_case_variant_link` — findings 1.2 and the
+  floor table through the same variants (`notes -> GRANTS`, `-> Grants`, `-> HOT`, `-> Hot`):
+  the landing is floored as `principals/p-sam/grants` or `.../hot`, and `hit` by name folds
+  the same way. Case folding is for matching floor names, and that still works.
+- The 1.1 tests take string paths with no filesystem, so case variants do not reach them; the
+  existing `test_the_root_prefix_is_compared_without_regard_to_case_like_the_floor_is` and the
+  manifest's `("principals/p-ira/notes", "Principals/p-ira/notes")` already pin that the
+  manifest is case-significant and the floor is not.
+
+**Low.** `builder._inside` kept #117's `posixpath.isabs(...) or "\x00"` line in front of
+`segments` so the branch would merge; with `main` merged, the line and `import posixpath` are
+gone, and `segments` is the one check there as in `manifest` and `reviewer`. The *Noticed*
+item above is done.
+
+**Merge.** `main` moved again to `dfbeb90` (#124: approvals bind to the speaker's `Order`).
+While this round was being written, the scheduled author pushed the merge with main to this
+branch (`3533f84`, `ce82945`, `e5f5e69`: `grant` takes `by: Authority`, refuses a `Request`,
+builds the profile from `by.principal` and goes through the plain door; `rungs` keeps
+`read_plain`; the seam tests pass `by=Order(...)`). Its resolution is byte-for-byte the one
+this agent had made locally, so this round's fix was rebased onto `e5f5e69` as a fast-forward
+rather than pushed beside it — checked first, as the owner asked, and pushed only on his word.
+The review failure at `e5f5e69` is the same finding as at `84cba28`: the fix was not there yet.
+
+```
+uv run pytest               4099 passed, 35 skipped in 131.11s (0:02:11)
+uv run ruff check           All checks passed!
+uv run ruff format --check  199 files already formatted
+uv run pyright              0 errors, 0 warnings, 0 informations
+```
+
+The reviewer's reproduction, re-run on the branch: `check` is `Refused`, `load_envelope` is the
+problem string, `grant(ALWAYS)` is degraded, and `GRANTS/always.jsonl` does not exist.
+
+**Stranger pass on the round:** `Resolved` is `frozen, slots=True`; the new field is required
+(no default), so the one constructor call in `resolve` is the only place it is set and pyright
+would catch another. `hops` is the list `_check` in `floors` also reads, so "a link was met" is
+one fact in two modules. The `before == after` check in the test walks `rglob("*")` and reads
+every file, so a write under *either* spelling is caught, not only under the link's name.
+
+**Noticed, not done (round 2):** `_exclusive` opens the lock before the append's own
+`plain` check, so a refused append still leaves an empty `always.lock` in the real folder. It
+is empty and harmless (the lock is documented to stay empty), and the previous code did the
+same, but a lock could be taken *after* resolving the always file and found not plain.
