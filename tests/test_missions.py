@@ -668,6 +668,7 @@ def test_the_mission_fold_does_no_io_and_reads_no_clock() -> None:
         "walle.events",
         "walle.floors",  # task 69: the floor under the manifest; its own tests pin what it imports
         "walle.manifest",  # task 68: the gate's matching rules; held to the same purity test
+        "walle.merge",  # issue #120: the shared merge order; test_merge pins that it reads no clock
         "walle.resolver",
     }
     assert imports <= allowed, imports - allowed
@@ -742,3 +743,99 @@ def pinned_nodes(sentinels: dict[str, Any]) -> list[str]:
 
 
 DAG_HASH = "e8570686c220488852c782f2946d886ec8c0b3fc0ee9ed823fd4be3beffcf854"
+
+
+# --- issue #120 (audit 5.2): two devices fold in time order, not stream order ----------------
+
+
+def _at(hhmm: str) -> str:
+    return f"2026-11-05T{hhmm}:00.000000+00:00"
+
+
+def _on() -> dict[str, str]:
+    return {MISSIONS_SWITCH: "on"}
+
+
+def _stamped(step: Step, ts: str) -> Step:
+    return step.model_copy(update={"ts": ts})
+
+
+def test_a_pause_from_the_laptop_after_a_resume_from_the_phone_holds() -> None:
+    """The audit's reproduction. Resumed on the phone at 10:01, paused on the laptop at
+    10:10. In stream order the pause (``d-mbp:2``) was applied before the resume
+    (``d-phone:1``) and the mission ran on; in time order it is paused."""
+    mission = _mission([_node("a")], [])
+    resume = _stamped(_resume("d-mbp:1"), _at("10:01"))
+    pause = _stamped(_pause("d-mbp:1"), _at("10:10"))
+    records = [*_stream(mission, pause), *_stream(resume, device="phone")]
+
+    state = _one(fold_missions(records))
+    assert state.paused is True
+    assert dispatchable(state, environ=_on()) == ()
+    assert fold_missions(records).unapplied == ()
+
+
+def test_a_status_from_the_laptop_for_a_node_the_phone_injected_applies() -> None:
+    """Injected from the phone at 10:02, completed by the laptop's runner at 10:05. In
+    stream order the status came first and was reported as naming a node the mission had
+    no node of; in time order it applies."""
+    mission = _mission([_node("a")], [])
+    inject = _stamped(_inject("d-mbp:1", _node("b"), after=["a"]), _at("10:02"))
+    done_a = _stamped(_status("d-mbp:1", "a", StepStatus.COMPLETED), _at("10:03"))
+    done_b = _stamped(_status("d-mbp:1", "b", StepStatus.COMPLETED), _at("10:05"))
+    records = [*_stream(mission, done_a, done_b), *_stream(inject, device="phone")]
+
+    folded = fold_missions(records)
+    assert folded.unapplied == ()
+    assert _statuses(_one(folded)) == {"a": "completed", "b": "completed"}
+    assert _one(folded).applied == ("d-phone:1", "d-mbp:2", "d-mbp:3")
+
+
+def test_the_last_delta_is_the_last_by_time_across_devices() -> None:
+    """Rule 2 in time order: the laptop says ``failed`` at 10:05, the phone says
+    ``completed`` at 10:09. Completed wins, on every machine that folds both streams."""
+    mission = _mission([_node("a")], [])
+    failed = _stamped(_status("d-mbp:1", "a", StepStatus.FAILED), _at("10:05"))
+    completed = _stamped(_status("d-mbp:1", "a", StepStatus.COMPLETED), _at("10:09"))
+    records = [*_stream(mission, failed), *_stream(completed, device="phone")]
+    assert _statuses(_one(fold_missions(records))) == {"a": "completed"}
+
+    later_failed = _stamped(_status("d-mbp:1", "a", StepStatus.FAILED), _at("10:15"))
+    records = [*_stream(mission, later_failed), *_stream(completed, device="phone")]
+    assert _statuses(_one(fold_missions(records))) == {"a": "failed"}
+
+
+def test_a_clock_that_steps_back_on_one_device_keeps_that_devices_own_order() -> None:
+    """The phone reports ``running`` at 10:10, its clock steps back, and it reports
+    ``completed`` at 10:05. A stream keeps its seq order (D57), so the node is completed —
+    a plain sort by stamp would leave it running. The laptop's pause at 10:07 is interleaved
+    before the phone's run, so the fold is still one answer, however the records arrive."""
+    mission = _mission([_node("a"), _node("b")], [_link("a", "b")])
+    running = _stamped(_status("d-mbp:1", "a", StepStatus.RUNNING), _at("10:10"))
+    completed = _stamped(_status("d-mbp:1", "a", StepStatus.COMPLETED), _at("10:05"))
+    pause = _stamped(_pause("d-mbp:1"), _at("10:07"))
+    records = [*_stream(mission, pause), *_stream(running, completed, device="phone")]
+
+    expected = fold_missions(records)
+    state = _one(expected)
+    assert expected.unapplied == ()
+    assert _statuses(state) == {"a": "completed", "b": "pending"}
+    assert state.paused is True
+    assert state.applied == ("d-mbp:2", "d-phone:1", "d-phone:2")
+    for seed in range(10):
+        shuffled = list(records)
+        random.Random(seed).shuffle(shuffled)
+        assert fold_missions(shuffled) == expected
+    assert fold_missions(records) == expected
+
+
+def test_the_same_instant_on_two_devices_falls_back_to_stream_order() -> None:
+    """A tie is ordered ``(stream, seq)`` (D57): with a pause and a resume stamped alike,
+    the laptop's pause is applied first and the phone's resume second."""
+    mission = _mission([_node("a")], [])
+    pause = _stamped(_pause("d-mbp:1"), _at("10:10"))
+    resume = _stamped(_resume("d-mbp:1"), _at("10:10"))
+    records = [*_stream(mission, pause), *_stream(resume, device="phone")]
+    assert _one(fold_missions(records)).paused is False
+    swapped = [*_stream(mission, resume), *_stream(pause, device="phone")]
+    assert _one(fold_missions(swapped)).paused is True

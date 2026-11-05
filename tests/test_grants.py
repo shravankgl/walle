@@ -284,8 +284,8 @@ def test_nothing_in_the_module_writes_the_config_file(
     written: list[Path] = []
     real = grants._append
 
-    def watching(target: Path, rule: grants.AlwaysRule) -> None:
-        written.append(target)
+    def watching(target: grants.Profile, rule: grants.AlwaysRule) -> None:
+        written.append(target.folder / grants.GRANTS_DIRNAME / grants.ALWAYS_FILE)
         real(target, rule)
 
     monkeypatch.setattr(grants, "_append", watching)

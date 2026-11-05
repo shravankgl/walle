@@ -47,10 +47,14 @@ containment (``hotel/`` is not ``hot/``), and the names only count where the lay
 Two layers
 ----------
 ``hit`` is pure: a root-relative path in, a ``Hit`` or ``None`` out, nothing read. It is what
-``walle.missions.admit`` asks about every path in a step's ``writes`` before the switch, before
-the manifest, before anything — so a plan that declares a floored write is refused the same
-way in every mode. It answers nothing about an absolute path or one that climbs out through
-``..``, because without a root there is no answer.
+``walle.missions.admit`` and ``walle.reviewer.review`` ask about every path in a step's
+``writes`` before the switch, before the manifest, before anything — so a plan that declares a
+floored write is refused the same way in every mode, by every gate. A path it cannot answer
+about by name — absolute, climbing out through ``..``, or holding a NUL — is not ``None``: it
+is a ``Hit`` of how ``unanswerable``, and a refusal (D86). Issue #118 found two gates reading
+``None`` two ways; now there is one answer and one reader of it. ``segments`` is the spelling
+that answer rests on, and the manifest (``walle.manifest``) and the builder's workspace rule
+(``walle.builder``) read a path through it too, so what one calls a path the others do.
 
 ``floored`` has a root and a filesystem. For each end of the operation it asks ``hit`` about
 three things, and any one floors it:
@@ -63,8 +67,12 @@ three things, and any one floors it:
   already resolved. A protected folder replaced by a link pointing *out* of the root is seen
   here whatever name it was reached through, because the host loads ``hot/rules.md`` by that
   name and follows the link: a write through the name is a write to what the host reads. A
-  hop counts when it *is* or is *under* a floor path, not when it is above one — a hop is
-  read on the way through, and what gets written is where it leads;
+  hop counts when it *is* or is *under* a floor path, and also when it is *above* one —
+  ``principals/`` or a principal's own folder standing as a link. That last used to be let
+  through, as a folder read on the way to a write elsewhere; but a profile is physical (hard
+  constraint 6, D32), ``walle.profiles`` and ``walle.osusers`` already refuse it, and once a
+  walk has followed such a link onto another disk the floor paths under it are out of the
+  root's sight (issue #118 finding 1.2). The refusal names the link;
 - **where it lands**, the fully resolved path, including the missing target of a dangling link,
   which is where a write would create something.
 
@@ -134,7 +142,7 @@ class Kind(StrEnum):
 
 
 type End = Literal["path", "to"]
-type How = Literal["is", "under", "above", "unresolvable"]
+type How = Literal["is", "under", "above", "unresolvable", "unanswerable"]
 
 
 @dataclass(frozen=True)
@@ -170,16 +178,40 @@ class Hit:
     how: How
 
     def reason(
-        self, kind: Kind, path: str, *, end: End = "path", resolved: str | None = None
+        self,
+        kind: Kind,
+        path: str,
+        *,
+        end: End = "path",
+        resolved: str | None = None,
+        through: bool = False,
     ) -> str:
-        """The sentence a refusal carries."""
+        """The sentence a refusal carries. ``resolved`` is where the hit was found when it was
+        not found by name; ``through`` says it was a link met on the way rather than where the
+        path lands."""
         verb = f"{kind} to" if end == "to" else str(kind)
-        where = f"resolves to {resolved!r}, {self.how}" if resolved else self.how
         if self.how == "unresolvable":
             return (
                 f"{verb} {path!r} is floored: it cannot be resolved (a link loop, or a link that "
                 "cannot be read), so where it would land is unknown and it is refused (D72)"
             )
+        if self.how == "unanswerable":
+            return (
+                f"{verb} {path!r} is floored: it is absolute, climbs out through '..', or is not "
+                "a path, so the floor cannot be answered by name and it is refused (D72, D86)"
+            )
+        if through and self.how == "above":
+            return (
+                f"{verb} {path!r} is floored: it passes through a link at {resolved!r}, which "
+                f"stands above {self.protected!r}; a folder above a floor path is physical, never "
+                "a link (D32, D72)"
+            )
+        if through:
+            where = f"passes through a link at {resolved!r}, {self.how}"
+        elif resolved:
+            where = f"resolves to {resolved!r}, {self.how}"
+        else:
+            where = self.how
         return (
             f"{verb} {path!r} is floored: {where} {self.protected!r}, "
             "which nothing the agent does may write, in any mode (D72)"
@@ -188,8 +220,9 @@ class Hit:
 
 @dataclass(frozen=True)
 class Floored:
-    """Why ``floored`` refused an operation: which end, which path, which floor, and the
-    resolved path when the hit came through a link."""
+    """Why ``floored`` refused an operation: which end, which path, which floor, the
+    resolved path when the hit came through a link, and whether that path is the link itself
+    (``through``) or where the operation lands."""
 
     op: Op
     end: End
@@ -197,21 +230,28 @@ class Floored:
     protected: str
     how: How
     resolved: str | None = None
+    through: bool = False
 
     @property
     def reason(self) -> str:
         return Hit(self.protected, self.how).reason(
-            self.op.kind, self.path, end=self.end, resolved=self.resolved
+            self.op.kind, self.path, end=self.end, resolved=self.resolved, through=self.through
         )
 
 
 # --- by name ------------------------------------------------------------------------------------
 
 
-def _segments(relative: str) -> tuple[str, ...] | None:
-    """The segments of a root-relative path, or ``None`` when there is no answer by name:
-    absolute, or climbing out through ``..``. Empty is the root."""
-    if posixpath.isabs(relative):
+def segments(relative: str) -> tuple[str, ...] | None:
+    """The one spelling of a path by name: its segments after ``posixpath.normpath``, or
+    ``None`` when there is no answer by name — absolute, climbing out through ``..``, or
+    holding a NUL, which no filesystem takes. Empty is the root (``""`` or ``.``). Pure.
+
+    Every module that asks whether a path is answerable reads this: ``hit`` for the floor,
+    ``walle.manifest`` for what a declaration covers, ``walle.builder`` for what stays inside
+    a workspace. One function, so the answers cannot disagree (issue #118).
+    """
+    if posixpath.isabs(relative) or "\x00" in relative:
         return None
     norm = posixpath.normpath(relative) if relative else "."
     if norm == ".":
@@ -236,13 +276,20 @@ def _against(parts: tuple[str, ...], entry: Protected) -> Hit | None:
     return Hit(spelled, "above")
 
 
+UNANSWERABLE = Hit("", "unanswerable")
+"""The answer for a path the floor cannot judge by name. A refusal, not a pass (D86)."""
+
+
 def hit(relative: str) -> Hit | None:
     """Whether a root-relative path is, is under, or is above a floor path. Pure: nothing is
-    read. ``None`` for a path that is clear, and for one this cannot answer about (absolute,
-    or climbing out) — ``floored`` answers those with a root in hand."""
-    parts = _segments(relative)
+    read. ``None`` for a path that is clear. A path this cannot answer about by name —
+    absolute, climbing out, or not a path — is ``UNANSWERABLE``, a hit of its own: the gates
+    that ask by name have no root in hand to do better, so the answer is no. ``floored``,
+    which has a root, never asks this about such a path; it folds the path against the root
+    first."""
+    parts = segments(relative)
     if parts is None:
-        return None
+        return UNANSWERABLE
     for entry in PROTECTED:
         if (found := _against(parts, entry)) is not None:
             return found
@@ -322,24 +369,25 @@ def _unfolded(root: str, path: str) -> str:
 
 def _check(
     root_abs: str, root_real: str, path: str, *, at: str | None = None
-) -> tuple[Hit, str | None] | None:
+) -> tuple[Hit, str | None, bool] | None:
     """The three questions of the module docstring about one path. ``at`` is the folder a
-    relative path is read from, the root when not given. Returns the hit and the resolved
-    path it was found at (``None`` when found by name), or ``None`` when clear; a hit of
-    ``unresolvable`` when the walk could not finish."""
+    relative path is read from, the root when not given. Returns the hit, the resolved path
+    it was found at (``None`` when found by name) and whether that path is a link met on the
+    way; or ``None`` when clear; a hit of ``unresolvable`` when the walk could not finish."""
     given = _absolute(at or root_abs, path)
     if (rel := _relative(given, root_abs)) is not None and (found := hit(rel)) is not None:
-        return found, None
+        return found, None, False
     walked = _walk(_unfolded(at or root_abs, path))
     if walked is None:
-        return Hit("", "unresolvable"), None
+        return Hit("", "unresolvable"), None, False
     hops, landing = walked
     for hop in hops:
-        rel = _relative(hop, root_real)
-        if rel and (found := hit(rel)) is not None and found.how != "above":
-            return found, hop
+        # A hop above a floor path is a linked ``principals/`` or principal folder: refused,
+        # as the profile refuses it (hard constraint 6), not read through (issue #118, 1.2).
+        if (rel := _relative(hop, root_real)) and (found := hit(rel)) is not None:
+            return found, hop, True
     if (rel := _relative(landing, root_real)) is not None and (found := hit(rel)) is not None:
-        return found, landing
+        return found, landing, False
     return None
 
 
@@ -357,14 +405,14 @@ def floored(root: str | os.PathLike[str], op: Op) -> Floored | None:
     root_real = walked_root[1]
     for end, path in op.ends:
         if (result := _check(root_abs, root_real, path)) is not None:
-            found, where = result
-            return Floored(op, end, path, found.protected, found.how, resolved=where)
+            found, where, through = result
+            return Floored(op, end, path, found.protected, found.how, where, through)
     if op.kind is Kind.LINK and op.to is not None and not os.path.isabs(op.to):
         # a relative symlink target is read from the link's own folder, resolved first
         folder = _walk(_unfolded(root_abs, os.path.dirname(op.path)))
         if folder is None:
             return Floored(op, "to", op.to, "", "unresolvable")
         if (result := _check(root_abs, root_real, op.to, at=folder[1])) is not None:
-            found, where = result
-            return Floored(op, "to", op.to, found.protected, found.how, resolved=where)
+            found, where, through = result
+            return Floored(op, "to", op.to, found.protected, found.how, where, through)
     return None

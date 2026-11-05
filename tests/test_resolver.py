@@ -436,7 +436,15 @@ def test_the_resolver_does_no_io_and_reads_no_clock() -> None:
             runtime_imports.update(alias.name.split(".")[0] for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module:
             runtime_imports.add(node.module)
-    allowed = {"__future__", "dataclasses", "datetime", "pydantic", "typing", "walle.events"}
+    allowed = {
+        "__future__",
+        "dataclasses",
+        "datetime",
+        "pydantic",
+        "typing",
+        "walle.events",
+        "walle.merge",  # issue #120: the shared orders; test_merge pins that it reads no clock
+    }
     assert runtime_imports <= allowed
 
     called = {

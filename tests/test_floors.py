@@ -207,8 +207,10 @@ def test_what_is_not_a_floor_path_is_not_a_hit(path: str) -> None:
 
 @pytest.mark.parametrize("path", ["../kernel/x", "../../shared", "/abs/principals/p-sam/hot"])
 def test_by_name_cannot_tell_for_a_path_that_leaves_or_is_absolute(path: str) -> None:
-    """Without a root there is no answer by name; the resolving check has one."""
-    assert hit(path) is None
+    """Without a root there is no answer by name, and no answer is its own hit, a refusal
+    (issue #118: it used to be ``None``, the same as clear). The resolving check has one."""
+    found = hit(path)
+    assert found is not None and found.how == "unanswerable"
 
 
 # --- on disk: every floor path in every mode -------------------------------------------------
@@ -344,15 +346,18 @@ def test_a_link_loop_cannot_be_resolved_and_is_refused(root: Path) -> None:
 def test_a_relative_path_that_climbs_out_and_back_in_is_refused(root: Path) -> None:
     """By name there is no answer for a path that leaves the root; resolution has one."""
     path = f"../{root.name}/principals/p-{P}/hot/rules.md"
-    assert hit(path) is None
+    by_name = hit(path)
+    assert by_name is not None and by_name.how == "unanswerable"
     found = floored(root, Op(Kind.WRITE, path))
     assert found is not None and found.protected == f"principals/p-{P}/hot"
 
 
 def test_a_path_that_cannot_be_a_path_is_refused_not_raised(root: Path) -> None:
-    """An embedded NUL makes ``realpath`` raise ``ValueError``, not ``OSError``; fail closed."""
+    """An embedded NUL is not a path on any filesystem; fail closed. By name it is
+    ``unanswerable`` (issue #118: ``segments`` refuses it before any ``lstat`` could raise)."""
     found = floored(root, Op(Kind.WRITE, f"principals/p-{P}/plans/we\0ek.md"))
-    assert found is not None and found.how == "unresolvable"
+    assert found is not None and found.how == "unanswerable"
+    assert "not a path" in found.reason
 
 
 def test_a_link_that_cannot_be_looked_at_is_refused(
@@ -481,17 +486,45 @@ def test_a_dot_dot_after_a_link_is_read_as_the_os_reads_it(root: Path) -> None:
     assert found is not None and found.protected == f"principals/p-{P}/keys"
 
 
-def test_a_principal_folder_that_is_a_link_does_not_floor_its_log(
+def test_a_principal_folder_that_is_a_link_floors_everything_under_it(
     root: Path, tmp_path: Path
 ) -> None:
-    """A hop *above* a floor path is read on the way through, not written: a principal kept
-    on another disk still gets to append to its log. The folder itself stays floored."""
+    """Issue #118 finding 1.2 reversed what this test used to pin: a hop *above* a floor path
+    used to be let through so a principal kept on another disk could append to its log, but
+    once the walk is on the other disk the floor paths under it are out of sight, so
+    ``notes -> hot`` there was a clean write. A profile folder is physical (hard constraint 6,
+    D32), as ``walle.profiles`` and ``walle.osusers`` already insist; the floor now agrees,
+    and the link itself is the reason given."""
     disk = tmp_path / "disk" / "p-ana"
     (disk / "log").mkdir(parents=True)
+    (disk / "hot").mkdir()
+    (disk / "notes").symlink_to("hot")
     (root / "principals" / "p-ana").symlink_to(disk, target_is_directory=True)
-    assert floored(root, Op(Kind.WRITE, "principals/p-ana/log/d-mbp.jsonl")) is None
-    assert floored(root, Op(Kind.DELETE, "principals/p-ana")) is not None
-    assert floored(root, Op(Kind.WRITE, "principals/p-ana/hot/rules.md")) is not None
+    for op in (
+        Op(Kind.WRITE, "principals/p-ana/log/d-mbp.jsonl"),
+        Op(Kind.WRITE, "principals/p-ana/notes/rules.md"),
+        Op(Kind.DELETE, "principals/p-ana"),
+        Op(Kind.WRITE, "principals/p-ana/hot/rules.md"),
+    ):
+        found = floored(root, op)
+        assert found is not None, op
+        assert found.protected.startswith("principals/p-ana/")
+    through = floored(root, Op(Kind.WRITE, "principals/p-ana/log/d-mbp.jsonl"))
+    assert through is not None and through.through and through.how == "above"
+    assert through.resolved == str(root.resolve() / "principals" / "p-ana")
+    assert "passes through a link" in through.reason and "D32" in through.reason
+
+
+@pytest.mark.parametrize(
+    "path", ["/", "/principals/p-sam/hot", "..", "../x", "a/../../b", "a\x00b"]
+)
+def test_hit_answers_unanswerable_for_what_it_cannot_answer_by_name(path: str) -> None:
+    """Issue #118 finding 1.1: ``None`` used to mean both clear and unknown, and two callers
+    read it two ways. Now unknown is its own answer, and it is a refusal (D86)."""
+    found = hit(path)
+    assert found is not None and found.how == "unanswerable" and found.protected == ""
+    reason = found.reason(Kind.WRITE, path)
+    assert reason.startswith(f"write {path!r} is floored") and "D86" in reason
 
 
 def test_a_link_target_to_an_ordinary_place_is_not_floored(root: Path) -> None:

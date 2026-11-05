@@ -23,8 +23,9 @@ ones the staging queue already uses, so `walle review` and `walle stats` cannot 
   queue (hard constraint 2), so it is counted there.
 
 If more than one assertion cites a proposal (two devices keeping it before they synced), the
-first in ref order decides keep versus edit, the one `walle review` would name. An "edit"
-that changed nothing is a keep: the log cannot tell them apart, and the text is what counts.
+first in merge order (`walle.merge`: by stamp across streams, by seq within one) decides keep
+versus edit, the one `walle review` would name. An "edit" that changed nothing is a keep: the
+log cannot tell them apart, and the text is what counts.
 
 Counts only, never text. The report holds integers and nothing else, so the command cannot
 print what a proposal says even by mistake.
@@ -37,7 +38,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from walle import index
-from walle.events import Assertion, Proposal, parse_ref
+from walle.events import Assertion, Proposal
+from walle.merge import fold_order
 from walle.reader import Record
 from walle.resolver import retired_refs, staged
 
@@ -88,7 +90,7 @@ def count(records: Iterable[Record]) -> Counts:
     events = {record.ref: record.event for record in records}
 
     first_citing: dict[str, Assertion] = {}
-    for ref in sorted(events, key=parse_ref):
+    for ref in fold_order(events):
         event = events[ref]
         if isinstance(event, Assertion):
             for cause in event.caused_by:
