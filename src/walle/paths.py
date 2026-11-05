@@ -44,6 +44,7 @@ INDEX_FILENAME = "index.sqlite"
 INDEX_LOCK_FILENAME = "index.lock"
 HOT_DIRNAME = "hot"
 STAGING_LOCK_FILENAME = "staging.lock"
+INBOX_LOCK_FILENAME = "inbox.lock"
 
 
 def check_name(name: str, *, kind: str) -> str:
@@ -110,3 +111,13 @@ def staging_lock_path(root: Path, principal: str) -> Path:
     must still see each other's decisions.
     """
     return principal_dir(root, principal) / STAGING_LOCK_FILENAME
+
+
+def inbox_lock_path(root: Path, principal: str) -> Path:
+    """``<root>/principals/p-<principal>/inbox.lock`` — held while one inbox item is asked or
+    resolved (D78).
+
+    Per principal, like ``staging.lock``: two answers given on two devices' streams of the same
+    profile must still see each other, or both would win.
+    """
+    return principal_dir(root, principal) / INBOX_LOCK_FILENAME

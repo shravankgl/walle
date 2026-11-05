@@ -1,0 +1,39 @@
+{
+  "principal": "lena",
+  "events": 9,
+  "state_hash": "38a3055e0fb8591d46b831a76c155058339b5e818745851f219f197fea17ae36",
+  "fold": {
+    "current": [],
+    "retired": [],
+    "conflicts": [],
+    "unapplied": [],
+    "staged": []
+  },
+  "sentinels": {
+    "d-mbp:1.title": "A note to the school",
+    "d-mbp:1.nodes.1.egress.0": "gmail.googleapis.com",
+    "d-mbp:2.kind": "approval",
+    "d-mbp:2.session": "s-7f3a",
+    "d-mbp:2.tool_call_id": "toolu_01Send",
+    "d-mbp:2.body": "Send the note to the school?",
+    "d-mbp:2.unattended": true,
+    "d-mbp:2.mission": "d-mbp:1",
+    "d-mbp:2.node": "send-note",
+    "d-mbp:3.kind": "question",
+    "d-mbp:3.choices.1": "thursday",
+    "d-mbp:3.unattended": false,
+    "d-mbp:4.ask": "d-mbp:2",
+    "d-mbp:4.outcome": "approved",
+    "d-mbp:4.surface": "app",
+    "d-mbp:4.actor": "lena",
+    "d-mbp:5.outcome": "answered",
+    "d-mbp:5.value": "thursday",
+    "d-mbp:5.caused_by.0": "d-mbp:3",
+    "d-mbp:6.kind": "notification",
+    "d-mbp:7.outcome": "orphaned",
+    "d-mbp:7.actor": "kernel",
+    "d-mbp:8.outcome": "denied",
+    "d-mbp:8.surface": "slack",
+    "d-mbp:9.tool_call_id": "toolu_04Ready"
+  }
+}
