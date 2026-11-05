@@ -888,6 +888,34 @@ class Outcome(Event):
     note: str | None = None
 
 
+class Digest(Event):
+    """One run of a principal's digest (D31): ``slot`` is the start of the schedule slot it
+    ran for, ``body`` what it said, ``model`` what composed it.
+
+    ``body`` is ``None`` when the run had nothing to say. Silence is a result (D63): it is
+    recorded, so the slot is spent, and nothing is sent. A body that is only whitespace is
+    refused, so silence has one spelling. When there is a body it is written here because a
+    composed digest is not reproducible by replay (hard constraint 4), the same reason a
+    ``snapshot`` carries its body.
+
+    There is no recipient field on purpose (D63): the run decides *whether* there is
+    something to say, and configuration decides *where* it goes. Nothing appended to the log
+    can steer a later run's delivery. ``ts`` is when the run happened.
+    """
+
+    type: Literal["digest"] = "digest"
+
+    slot: Instant
+    body: str | None = None
+    model: str | None = None
+
+    @model_validator(mode="after")
+    def _silence_has_one_spelling(self) -> Digest:
+        if self.body is not None and not self.body.strip():
+            raise ValueError("a digest with nothing to say has no body, not a blank one")
+        return self
+
+
 type AnyEvent = Annotated[
     Observation
     | Assertion
@@ -900,7 +928,8 @@ type AnyEvent = Annotated[
     | Ask
     | Answer
     | Automation
-    | Outcome,
+    | Outcome
+    | Digest,
     Field(discriminator="type"),
 ]
 
@@ -919,6 +948,7 @@ EVENT_TYPES: dict[str, type[Event]] = {
     "answer": Answer,
     "automation": Automation,
     "outcome": Outcome,
+    "digest": Digest,
 }
 
 
