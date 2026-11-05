@@ -1,0 +1,37 @@
+{
+  "principal": "ines",
+  "events": 12,
+  "state_hash": "38a3055e0fb8591d46b831a76c155058339b5e818745851f219f197fea17ae36",
+  "fold": {
+    "current": [],
+    "retired": [],
+    "conflicts": [],
+    "unapplied": [],
+    "staged": []
+  },
+  "sentinels": {
+    "d-mbp:1.verb": "add",
+    "d-mbp:1.name": "water-plants",
+    "d-mbp:1.title": "Remind me to water the plants on Sunday",
+    "d-mbp:2.name": "bin-night",
+    "d-mbp:4.verb": "pin",
+    "d-mbp:4.target": "d-mbp:2",
+    "d-mbp:4.note": "the council fines missed bins",
+    "d-mbp:5.verb": "retire",
+    "d-mbp:5.target": "d-mbp:3",
+    "d-mbp:5.note": "not needed in the holidays",
+    "d-mbp:6.actor": "kernel",
+    "d-mbp:6.name": "car-service",
+    "d-mbp:7.type": "supersede",
+    "d-mbp:7.target": "d-mbp:2",
+    "d-mbp:8.verb": "retire",
+    "d-mbp:8.target": "d-mbp:2",
+    "d-mbp:9.title": "A second bin reminder",
+    "d-mbp:10.verb": "unpin",
+    "d-mbp:11.name": "school-run",
+    "d-mbp:11.note": "term has started",
+    "d-mbp:11.caused_by.0": "d-mbp:5",
+    "d-mbp:12.verb": "pin",
+    "d-mbp:12.target": "d-mbp:11"
+  }
+}

@@ -36,6 +36,9 @@ D67/D75  ``mission`` is a DAG of steps in ``node_link_data`` shape, each node ca
 D78      ``ask`` is an inbox item — an approval, a question or a notification — keyed by
          ``(session, tool_call_id)``; ``answer`` resolves one. Resolved once, first responder
          wins: which answer that is, is a fold in ``walle.inbox``, never an edit of the ask.
+D6/D114  ``automation`` is one change to the register of active automations: ``add``,
+         ``retire``, ``pin`` or ``unpin``. Which automations are active, and whether the WIP
+         cap allows another, is a fold in ``walle.automations``, never an edit of an add.
 """
 
 from __future__ import annotations
@@ -245,6 +248,21 @@ class AnswerOutcome(StrEnum):
     ORPHANED = "orphaned"
 
 
+class AutomationVerb(StrEnum):
+    """What an ``automation`` event does to the register (D6, D114).
+
+    ``add`` puts an automation in the register as active; ``retire`` takes one out, and it
+    stays in the log as retired (D8); ``pin`` and ``unpin`` set and clear the human mark that
+    no automatic transition may cross. A closed set, like ``StepVerb``: adding a member is a
+    version bump with an upcaster (D88).
+    """
+
+    ADD = "add"
+    RETIRE = "retire"
+    PIN = "pin"
+    UNPIN = "unpin"
+
+
 class Level(StrEnum):
     """How an assertion was reached (D94).
 
@@ -375,7 +393,7 @@ class Event(BaseModel):
 # §5.2's taxonomy also has utterance, capability, trust, feedback and outcome. They belong
 # to phases that do not exist yet; adding them now would be guessing at their fields with
 # nothing to check the guess against. `mission` and `step` arrived with Phase 2 (R8, D67),
-# and `ask` and `answer` with its inbox (D78).
+# `ask` and `answer` with its inbox (D78), and `automation` with Phase 3's register (D6).
 
 
 class Observation(Event):
@@ -788,6 +806,48 @@ class Answer(Event):
         return self
 
 
+# --- the automation register (D6, D114) ---------------------------------------------------
+
+
+class Automation(Event):
+    """One change to the register of active automations (D6, D114).
+
+    An ``add`` names the automation (``name``, a path-safe token like a node id) and says
+    what it is (``title``); its ref is the automation's identity from then on, so a name
+    retired and added again is a new automation with a new ref. ``retire``, ``pin`` and
+    ``unpin`` carry ``target``, the ref of the add they act on, like ``supersede.target``.
+    The validator holds each verb to exactly its own fields. ``note`` is free text for any
+    verb: why it was retired, why it matters enough to pin.
+
+    There is no ``pinned`` or ``active`` field: both are what the fold says after reading
+    every event, never something an add declares about itself. Whether this event may change
+    the register at all (a person wrote it, the cap allows it, its target is not pinned) is
+    decided by the fold, which has the register in hand; one that may not is reported, not
+    applied.
+    """
+
+    type: Literal["automation"] = "automation"
+
+    verb: AutomationVerb
+    name: NodeId | None = None
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    target: Ref | None = None
+    note: str | None = None
+
+    @model_validator(mode="after")
+    def _fields_fit_the_verb(self) -> Automation:
+        if self.verb is AutomationVerb.ADD:
+            required, allowed = {"name", "title"}, {"name", "title"}
+        else:
+            required, allowed = {"target"}, {"target"}
+        present = {n for n in ("name", "title", "target") if getattr(self, n) is not None}
+        if missing := required - present:
+            raise ValueError(f"an automation {self.verb.value} needs {sorted(missing)}")
+        if extra := present - allowed:
+            raise ValueError(f"an automation {self.verb.value} does not carry {sorted(extra)}")
+        return self
+
+
 type AnyEvent = Annotated[
     Observation
     | Assertion
@@ -798,7 +858,8 @@ type AnyEvent = Annotated[
     | Mission
     | Step
     | Ask
-    | Answer,
+    | Answer
+    | Automation,
     Field(discriminator="type"),
 ]
 
@@ -815,6 +876,7 @@ EVENT_TYPES: dict[str, type[Event]] = {
     "step": Step,
     "ask": Ask,
     "answer": Answer,
+    "automation": Automation,
 }
 
 
