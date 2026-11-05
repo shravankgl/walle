@@ -13,6 +13,10 @@ dependencies = [
   "pydantic>=2.7",
 ]
 
+[project.optional-dependencies]
+# D25 as narrowed on 2026-11-05: Opik is optional and off by default (issue #80).
+opik = ["opik>=1.8"]
+
 [project.scripts]
 walle = "walle.cli:main"
 walle-hook = "walle.hook:main"
