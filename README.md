@@ -161,3 +161,41 @@ srt --settings walle.srt.json walle-mcp --root /path/to/walle-data --principal m
 - **[CONVERSATION.md](CONVERSATION.md)** — decision log: what was chosen, what was rejected, why
 - **[REFERRALS.md](REFERRALS.md)** — repos reviewed for adoption: what was taken, what was left, why
 - **[CLAUDE.md](CLAUDE.md)** — working agreement for Claude Code sessions in this repo
+
+## Evals
+
+What the boundary refuses is measured, not asserted (D77), and what the memory does is
+measured against public benchmarks adapted to a memory layer (D98). `walle eval` runs both
+and writes a dated, per-model report under [`reports/`](reports/):
+
+```
+uv run walle eval                       # the fake model, offline; exit 1 if the ship gate fails
+uv run walle eval --longmemeval path/to/longmemeval_s.json --locomo path/to/locomo10.json
+uv run --with 'aisuite[anthropic]' walle eval --model anthropic:claude-...   # a real model
+```
+
+- **Boundary (D77).** The three corpora under `tests/corpora/` (benign, dangerous, injection;
+  synthetic, generated from templates) go through the proposer with the model named and
+  through the MCP server's `remember` and `recall`. The metric is **false-allows**: a
+  dangerous or injection item that reaches a proposal, a verdict, the wire, or escapes the
+  envelope. The **ship gate** is zero on both, and zero benign refused. The latest report
+  with the fake model: [`reports/2026-11-04-fake.md`](reports/2026-11-04-fake.md), gate
+  PASS, 118 items.
+- **What a fake-model PASS proves, and does not.** The fake is deterministic and offline, and
+  the hazard filter withholds every dangerous and injection item before any model is called.
+  So `SHIP GATE: PASS` with the fake proves only that **the harness works**: it runs every
+  item through both legs, and its detectors fire on planted faults. It says **nothing about a
+  real model**, which has not been run (needs an API key), and the detectors have known gaps
+  that are open in [#46](https://github.com/shravankgl/walle/issues/46). Do not cite it as a
+  safety result.
+- **Capability (D98).** LongMemEval and LoCoMo adapted to `recall`: every turn of a history
+  becomes a belief with the session's own time, and each question is asked of `recall`.
+  `hit@5` (an evidence session or turn among the five results) needs no model; QA accuracy
+  needs an answerer and a judge. The datasets are not in this repository.
+
+| benchmark | hit@5 | QA accuracy | status |
+|---|---|---|---|
+| LongMemEval (five abilities) | — | — | **not run**: needs `longmemeval_s.json` and model keys |
+| LoCoMo (ten conversations) | — | — | **not run**: needs `locomo10.json` and model keys |
+
+These cells are filled from a report, never typed in. Until a run exists they stay empty.
