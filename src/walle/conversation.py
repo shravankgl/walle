@@ -46,7 +46,9 @@ their own folder; a guest the platform cannot name; the principal speaking as an
 stakeholder, roles that do not operate (D27) — gives a ``Request``: nothing runs on their
 say-so, no grant file is opened, and the frame has already told the model that their
 instructions are requests, not orders. There is no parameter anywhere that names a speaker
-other than the one on the turn.
+other than the one on the turn. The types — ``Speaker``, ``Order``, ``Request`` — live in
+``walle.speakers`` so that ``walle.rungs.resolve`` and ``walle.grants.grant`` can require the
+same ``Order`` in their signatures (issue #119); they are the same objects here.
 
 The dormant rule
 ----------------
@@ -62,14 +64,12 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from enum import IntEnum
 from pathlib import Path
 
 from walle import grants, hot
 from walle.events import (
     ACTOR_KERNEL,
     Utterance,
-    check_speaker,
     make_ref,
     now_instant,
 )
@@ -77,7 +77,32 @@ from walle.events import _check_call_id as check_conversation_id  # the one id c
 from walle.paths import check_name, log_dir
 from walle.profiles import Role
 from walle.reader import Record, read_file
+from walle.speakers import Authority, Order, Request, Speaker, Tier
 from walle.writer import StreamWriter
+
+__all__ = [
+    "FILES",
+    "OFF_MESSAGE",
+    "SWITCH",
+    "SWITCH_ON",
+    "Authority",
+    "Conversation",
+    "ConversationOffError",
+    "Order",
+    "Request",
+    "Speaker",
+    "Tier",
+    "Turn",
+    "authority",
+    "enabled",
+    "files_for",
+    "floor",
+    "fold",
+    "frame",
+    "open_conversation",
+    "permit",
+    "turn",
+]
 
 # ``_check_call_id`` is private to ``walle.events``; a conversation id comes from the same
 # place a session id does (the harness), and so has the same shape. Imported rather than
@@ -111,33 +136,9 @@ def _require_on(environ: Mapping[str, str] | None) -> None:
 
 # --- tiers and files (D61, D64) -------------------------------------------------------------
 
-
-class Tier(IntEnum):
-    """D27's roles in the order the ratchet uses, lowest first, with a bottom for a speaker
-    the kernel could attach no role to."""
-
-    UNKNOWN = 0
-    STAKEHOLDER = 1
-    ADMIN = 2
-    OPERATOR = 3
-
-    @classmethod
-    def of(cls, role: Role | None) -> Tier:
-        """The tier of a role; ``None`` — no role attached — is the lowest."""
-        if role is None:
-            return cls.UNKNOWN
-        return _TIER_OF[Role(role)]
-
-    @property
-    def label(self) -> str:
-        return self.name.lower()
-
-
-_TIER_OF: dict[Role, Tier] = {
-    Role.STAKEHOLDER: Tier.STAKEHOLDER,
-    Role.ADMIN: Tier.ADMIN,
-    Role.OPERATOR: Tier.OPERATOR,
-}
+# ``Tier`` is ``walle.speakers.Tier``: D27's roles in the order the ratchet uses, lowest first,
+# with a bottom for a speaker the kernel could attach no role to. It lives beside ``Speaker``
+# so ``Speaker.tier`` and the rest of this module read the same order.
 
 FILES: dict[Tier, tuple[str, ...]] = {
     Tier.UNKNOWN: (hot.IDENTITY,),
@@ -157,34 +158,6 @@ def files_for(floor: Tier | None) -> tuple[str, ...]:
     if not isinstance(floor, Tier):
         raise TypeError(f"a floor is a Tier or None, not {type(floor).__name__}")
     return FILES[floor]
-
-
-# --- the speaker -----------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class Speaker:
-    """Who the kernel verified a message to be from: the identity, and the role it attached
-    for this message, or ``None`` when it could attach none.
-
-    ``id`` is the principal's name when the platform's id resolves to one, otherwise the
-    platform's id as given. It is never a display name and never taken from the message
-    (D61). It is one token, so it cannot carry a sentence.
-    """
-
-    id: str
-    role: Role | None = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.id, str):
-            raise TypeError(f"a speaker id is a str, not {type(self.id).__name__}")
-        check_speaker(self.id)
-        if self.role is not None:
-            object.__setattr__(self, "role", Role(self.role))
-
-    @property
-    def tier(self) -> Tier:
-        return Tier.of(self.role)
 
 
 # --- the fold (D61; constraint 3) ------------------------------------------------------------
@@ -267,29 +240,9 @@ def frame(principal: str, speaker: Speaker, floor: Tier | None) -> str:
 # --- capability follows the speaker (D61, D27) -------------------------------------------------
 
 
-@dataclass(frozen=True, slots=True)
-class Order:
-    """The principal, speaking as the operator: a call goes to their own grants."""
-
-    principal: str
-    speaker: Speaker
-
-
-@dataclass(frozen=True, slots=True)
-class Request:
-    """Anyone else: a call runs on nobody's say-so here. ``reason`` is one line for the
-    person, built from the identity and the principal's name, never from the message."""
-
-    principal: str
-    speaker: Speaker
-    reason: str
-
-
-type Authority = Order | Request
-
-
 def authority(principal: str, speaker: Speaker) -> Authority:
-    """Whether this speaker's words are orders in this profile's conversation."""
+    """Whether this speaker's words are orders in this profile's conversation. The one
+    condition for an ``Order`` is the one ``walle.speakers.Order`` enforces when built."""
     if speaker.id == principal:
         if speaker.role is Role.OPERATOR:
             return Order(principal, speaker)

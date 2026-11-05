@@ -127,6 +127,7 @@ from pydantic import ValidationError
 
 from walle import automations, envelope, executor, floors, hazards, index, missions
 from walle.events import (
+    ACTOR_BUILDER,
     ACTOR_USER,
     Assertion,
     Link,
@@ -186,8 +187,10 @@ BUILDER_SWITCH = "WALLE_BUILDER"
 SWITCH_ON = "on"
 """The one value that means on, as for every other Phase 2 switch."""
 
-ACTOR_BUILDER = "builder"
-"""Who a staged workflow comes from. A kept proposal from any other actor is not a workflow."""
+# ``ACTOR_BUILDER`` — who a staged workflow comes from; a kept proposal from any other actor is
+# not a workflow — is defined in ``walle.events`` beside the other actors and listed in
+# ``MACHINE_ACTORS`` there, so the inbox and the register know the Builder is not a person
+# (issue #119). Re-exported here for the callers that read it as ``builder.ACTOR_BUILDER``.
 
 WORKFLOW_HEADER = "walle workflow v1"
 """The first line of a staged workflow's body. The rest is the workflow as JSON. Versioned so

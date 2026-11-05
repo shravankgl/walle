@@ -35,6 +35,18 @@ afterwards — not the same command from the next call, even inside the request.
 per-call key can cover a destructive call, and neither rule file carries one, no file ever
 covers a destructive call, whatever it says.
 
+Who grants (D61, D72)
+---------------------
+``grant`` takes ``by``, the authority of the speaker whose yes this is, as
+``walle.conversation.authority`` decided it: an ``Order`` — the principal speaking as the
+operator — or a ``Request``, anyone else. A ``Request`` is ``NotGrantableError`` before any
+file is opened: nothing is granted on a request, however it was worded. The folder written is
+the ``Order``'s own principal's; there is no ``principal`` argument to pass something else, and
+an ``Order`` cannot be built for anyone but its principal as operator (``walle.speakers``), so
+the grant lands in the folder of the person who gave it, and ``by`` has no default, so a
+caller cannot leave it out (issue #119). ``check`` still takes a ``principal``: reading is
+gated by ``walle.conversation.permit``, which passes only an ``Order``'s.
+
 Fail closed (D86)
 -----------------
 A grant that cannot be resolved is no grant. A rule file with one line that does not parse
@@ -93,6 +105,7 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, Field, TypeAdapter, 
 
 from walle.events import CallId, Instant
 from walle.paths import principal_dir
+from walle.speakers import Authority, Order, Request
 
 if sys.platform == "win32":  # pragma: no cover - POSIX only in Phase 0
     raise ImportError(
@@ -435,29 +448,40 @@ def grant(
     call: Call,
     scope: Scope,
     *,
+    by: Authority,
     call_id: str,
     root: Path,
-    principal: str,
     ts: str,
     environ: Mapping[str, str] | None = None,
 ) -> Granted:
-    """Record that a person approved ``call`` at ``scope``.
+    """Record that ``by``, a person, approved ``call`` at ``scope``, in their own folder.
 
     Checks, in this order and before anything is read or written: grants are on
     (``GrantsOffError``); every argument has its type and shape (``TypeError``,
-    ``ValueError``); the scope is one ``offered`` for this call (``NotGrantableError``).
-    Then ``request`` and ``session`` go into memory; ``always`` is appended to the rule file,
-    and when that fails for any ``OSError`` it goes into memory at ``session`` scope with a
-    ``note`` saying so (D73). ``ts`` is passed in: this module reads no clock.
+    ``ValueError``); ``by`` is an ``Order``, not a ``Request`` (``NotGrantableError``); the
+    scope is one ``offered`` for this call (``NotGrantableError``). Then ``request`` and
+    ``session`` go into memory; ``always`` is appended to the rule file under the
+    ``Order``'s principal, and when that fails for any ``OSError`` it goes into memory at
+    ``session`` scope with a ``note`` saying so (D73). ``ts`` is passed in: this module reads
+    no clock.
     """
     _require_on(environ)
     _require(live, Live, "live")
     _require(call, Call, "call")
     _require(scope, Scope, "scope")
+    if not isinstance(by, Order | Request):
+        raise TypeError(
+            f"by is the speaker's authority, an Order or a Request, not {type(by).__name__}"
+        )
     key = key_for(call, call_id)
     _require(ts, str, "ts")
     given_at = _INSTANT.validate_python(ts)
-    folder = grants_dir(root, principal)
+    if isinstance(by, Request):
+        raise NotGrantableError(
+            "a grant is given by the principal speaking as the operator; this is a request, "
+            "not an order, and nothing is granted on a request (D61, D27)"
+        )
+    folder = grants_dir(root, by.principal)
     if scope not in offered(call):
         if scope is Scope.CONFIG:
             raise NotGrantableError(

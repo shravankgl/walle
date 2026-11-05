@@ -306,6 +306,17 @@ ACTOR_CURATOR = "curator"
 ACTOR_KERNEL = "kernel"
 ACTOR_MCP = "mcp"
 """The MCP server's ``remember``: the host model's words, not the person's (D97)."""
+ACTOR_BUILDER = "builder"
+"""The Builder: who a staged workflow comes from (D117). A machine, like the proposer."""
+
+MACHINE_ACTORS = frozenset(
+    {ACTOR_OBSERVER, ACTOR_PROPOSER, ACTOR_CURATOR, ACTOR_KERNEL, ACTOR_MCP, ACTOR_BUILDER}
+)
+"""Every actor that is a part of walle rather than a person, in one place (issue #119). No
+machine actor resolves an inbox item (``walle.inbox`` rule 4) or changes the register of
+automations (``walle.automations`` rule 4, D72). A new ``ACTOR_*`` is added here or it is
+not a machine, and ``tests/test_audit_approvals.py`` checks that every one defined in this
+package is defined in this module."""
 
 
 # --- errors -----------------------------------------------------------------------------
