@@ -20,6 +20,7 @@ from pydantic import ValidationError
 
 from walle.events import (
     ACTOR_CURATOR,
+    ACTOR_KERNEL,
     ACTOR_OBSERVER,
     ACTOR_USER,
     EVENT_TYPES,
@@ -29,9 +30,15 @@ from walle.events import (
     Event,
     FutureSchemaError,
     Level,
+    Link,
+    Mission,
+    Node,
     Observation,
     Proposal,
     Snapshot,
+    Step,
+    StepStatus,
+    StepVerb,
     Supersede,
     canonical_json,
     content_hash,
@@ -91,6 +98,26 @@ def _one_of_each() -> list[AnyEvent]:
             actor=ACTOR_CURATOR,
             caused_by=["d-mbp:100", "d-mbp:220"],
             note="stated vegetarian; three dessert orders",
+        ),
+        Mission(
+            ts=TS,
+            actor=ACTOR_USER,
+            title="Saturday chores",
+            nodes=[
+                Node(id="fetch-mail", title="Read the mail", egress=["gmail.googleapis.com"]),
+                Node(id="digest", title="Write the digest", token_budget=5000),
+            ],
+            links=[Link(source="fetch-mail", target="digest")],
+        ),
+        Step(
+            ts=TS,
+            actor=ACTOR_KERNEL,
+            mission="d-mbp:300",
+            verb=StepVerb.STATUS,
+            node="fetch-mail",
+            status=StepStatus.COMPLETED,
+            cost_usd=0.02,
+            tokens=900,
         ),
     ]
 

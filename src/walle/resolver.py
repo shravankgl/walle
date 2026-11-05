@@ -418,6 +418,18 @@ def staged(records: Iterable[Record]) -> tuple[Staged, ...]:
     )
 
 
+def live_events(records: Iterable[Record]) -> tuple[dict[str, AnyEvent], dict[str, bool]]:
+    """Every event by ref, and whether each is live under rule 1.
+
+    The seam another fold starts from — ``walle.missions`` folds ``mission`` and ``step``
+    events over the same liveness, so a supersede means one thing everywhere. Raises
+    ``ResolutionError`` for a supersede cycle or one ref naming two events, like ``resolve``.
+    """
+    events = _by_ref(records)
+    live, _ = _liveness(events)
+    return events, live
+
+
 def retired_refs(records: Iterable[Record]) -> frozenset[str]:
     """Every ref some live supersede targets: the events the log has dropped.
 
