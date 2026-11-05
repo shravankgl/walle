@@ -1,0 +1,32 @@
+{
+  "principal": "ines",
+  "events": 12,
+  "state_hash": "38a3055e0fb8591d46b831a76c155058339b5e818745851f219f197fea17ae36",
+  "fold": {
+    "current": [],
+    "retired": [],
+    "conflicts": [],
+    "unapplied": [],
+    "staged": []
+  },
+  "sentinels": {
+    "d-mbp:4.name": "pay-rent",
+    "d-mbp:5.type": "outcome",
+    "d-mbp:5.target": "d-mbp:1",
+    "d-mbp:5.result": "ok",
+    "d-mbp:5.note": "reminder sent",
+    "d-mbp:5.actor": "kernel",
+    "d-mbp:6.target": "d-mbp:2",
+    "d-mbp:7.verb": "retire",
+    "d-mbp:7.target": "d-mbp:2",
+    "d-mbp:8.note": "rota sent",
+    "d-mbp:9.result": "failed",
+    "d-mbp:9.note": "the rota file was missing",
+    "d-mbp:10.type": "supersede",
+    "d-mbp:10.target": "d-mbp:8",
+    "d-mbp:11.target": "d-mbp:5",
+    "d-mbp:12.actor": "ines",
+    "d-mbp:12.result": "ok",
+    "d-mbp:12.ts": "2026-10-08T09:00:00.000000+00:00"
+  }
+}
