@@ -154,6 +154,25 @@ srt --settings walle.srt.json walle-mcp --root /path/to/walle-data --principal m
   have, treat the profile as written to the `srt` documentation, not as proven. On Linux
   `srt` also needs `bwrap` and `socat`.
 
+## The ACP client
+
+`walle acp` runs an [Agent Client Protocol](https://agentclientprotocol.com) host, such as
+Codex or Gemini CLI, as a subprocess and puts the hot tier in front of the first turn, inside
+its untrusted envelope (D55, D83). Built to protocol version 1 (`schema-v1.29.1`); a host that
+names another version is refused. Each line on stdin is one turn; the host's text comes back on
+stdout.
+
+```sh
+walle acp --root /path/to/walle-data --principal maya --cwd ~/project -- codex acp
+```
+
+- The client advertises no capabilities: no file access, no terminal. A permission request from
+  the host is declined. walle is memory, not the hand on the tool.
+- With no hot tier, or a render in progress, the session runs without memory and says so on
+  stderr (D115).
+- **Tested against a fake host only** (`tests/fake_acp.py`). Neither Codex nor Gemini CLI has
+  been run against it yet; the first real run is the first thing to check.
+
 ## Documents
 
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — the system: layers, loops, event log, profiles
