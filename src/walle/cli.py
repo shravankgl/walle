@@ -13,6 +13,7 @@ from pydantic import ValidationError
 
 from walle import __version__
 from walle import acp as walle_acp
+from walle import codex as walle_codex
 from walle import context as walle_context
 from walle import curator as walle_curator
 from walle import hot as walle_hot
@@ -736,6 +737,46 @@ def observe_command(root: Path, principal: str, device: str, projects_dir: Path)
     click.echo(f"  pending: {len(report.pending)}")
     click.echo(f"  skipped lines: {len(transcripts.skips)}")
     click.echo(f"  duplicate entries: {len(transcripts.duplicates)}")
+
+
+# --- the Codex observer (issue #81) ------------------------------------------------------
+
+
+@main.command("observe-codex")
+@_ROOT
+@click.option("--principal", required=True, help="Whose log, without the p- prefix.")
+@_DEVICE
+@click.option(
+    "--sessions-dir",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="The Codex sessions folder to read. Required, with no default: walle reads only a "
+    "folder you name.",
+)
+def observe_codex_command(root: Path, principal: str, device: str, sessions_dir: Path) -> None:
+    """Append one observation per completed turn in the Codex rollouts under --sessions-dir.
+
+    Off unless WALLE_CODEX=on. Built from Codex's public source and not yet checked against
+    real files. Safe to re-run: a turn the stream already holds is not appended again (D92).
+    Only counts are printed, never transcript text.
+    """
+    if not walle_codex.enabled():
+        raise click.ClickException(walle_codex.OFF_MESSAGE)
+    try:
+        writer = StreamWriter(root, principal, device)  # an unsafe name fails before any read
+        report = walle_codex.observe_sessions(sessions_dir)
+        result = walle_codex.append_observations(report, writer)
+    except _LOG_ERRORS as exc:
+        raise click.ClickException(_without_content(exc)) from exc
+
+    click.echo(f"{principal}: observed codex sessions into {writer.stream}")
+    click.echo(f"  turns seen: {len(report.turns) + len(report.pending)}")
+    click.echo(f"  appended: {len(result.appended)}")
+    click.echo(f"  already logged: {len(result.already_logged)}")
+    click.echo(f"  pending: {len(report.pending)}")
+    click.echo(f"  skipped lines: {report.skipped_lines}")
+    click.echo(f"  skipped files: {report.skipped_files}")
+    click.echo(f"  duplicate turns: {len(report.duplicates)}")
 
 
 # --- the ACP client (task 56) ------------------------------------------------------------------
