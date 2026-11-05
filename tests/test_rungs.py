@@ -29,6 +29,7 @@ from walle import floors, grants, matching, rungs
 from walle.events import AnswerOutcome, AskKind
 from walle.grants import Call, Scope
 from walle.paths import principal_dir
+from walle.profiles import Role
 from walle.rungs import (
     Approved,
     Asked,
@@ -49,6 +50,7 @@ from walle.rungs import (
     resolve,
     to_ask,
 )
+from walle.speakers import Order, Speaker
 
 ON = {rungs.RUNGS_SWITCH: rungs.SWITCH_ON, matching.MATCHING_SWITCH: matching.SWITCH_ON}
 P = "lena"
@@ -62,7 +64,10 @@ REQUEST = "r-1"
 STATUS = Call(tool="shell", arguments="git status")
 DIFF = Call(tool="shell", arguments="git diff --stat")
 PRUNE = Call(tool="shell", arguments="rm -rf /tmp/allotment/old", destructive=True)
-EMPTY = Ledger.start()
+EMPTY = Ledger.start(P)
+ORDER = Order(P, Speaker(P, Role.OPERATOR))
+"""Every reply in this file is the owner's, speaking as the operator; who else may reply is
+``test_audit_approvals.py``'s subject (issue #119)."""
 
 
 @pytest.fixture
@@ -80,7 +85,7 @@ def _ask(
 
 
 def _resolve(ledger: Ledger, reply: str | Button, *, ts: str = T5) -> Approved | Denied | Refused:
-    return resolve(ledger, reply, ts=ts, environ=ON)
+    return resolve(ledger, reply, by=ORDER, ts=ts, environ=ON)
 
 
 def _refused(outcome: object, kind: Refusal) -> Refused:
@@ -234,6 +239,7 @@ def test_an_expired_item_is_settled_and_stays_expired() -> None:
     that went backwards, is refused, and the id cannot be asked again."""
     asked = _ask(EMPTY, STATUS)
     late = _refused(_resolve(asked.ledger, "#c-1 approve", ts=T16), Refusal.EXPIRED)
+    assert late.ledger is not None  # a rung 3 refusal always carries the ledger
     assert late.ledger.pending == ()
     assert [s.id for s in late.ledger.settled] == ["c-1"]
     _refused(_resolve(late.ledger, "#c-1 approve", ts=T5), Refusal.EXPIRED)
@@ -256,6 +262,7 @@ def test_an_expired_item_does_not_take_the_others_with_it() -> None:
     first = _ask(EMPTY, STATUS, id="c-1", ts=T0)
     second = _ask(first.ledger, DIFF, id="c-2", ts=T15)
     late = _refused(_resolve(second.ledger, "#c-1 approve", ts=T16), Refusal.EXPIRED)
+    assert late.ledger is not None
     assert [p.id for p in late.ledger.pending] == ["c-2"]
     assert isinstance(_resolve(late.ledger, "#c-2 approve", ts=T16), Approved)
 
@@ -329,7 +336,7 @@ def test_a_reply_that_merely_sounds_keen_creates_nothing(text: str) -> None:
     assert outcome.ledger == asked.ledger
     if len(text) > len("always"):
         assert text not in outcome.reason
-    still = _resolve(outcome.ledger, "#c-1 approve")
+    still = _resolve(asked.ledger, "#c-1 approve")
     assert isinstance(still, Approved)
 
 
@@ -381,7 +388,7 @@ def test_always_is_not_offered_for_a_destructive_call_and_is_refused_if_said() -
     assert [b.label for b in asked.pending.buttons()] == ["#c-1 approve", "#c-1 no"]
     refused = _refused(_resolve(asked.ledger, "#c-1 always"), Refusal.NOT_OFFERED)
     assert refused.ledger == asked.ledger
-    once = _resolve(refused.ledger, "#c-1 approve")
+    once = _resolve(asked.ledger, "#c-1 approve")
     assert isinstance(once, Approved)
     assert once.scope is Scope.REQUEST
     assert once.scope in grants.offered(PRUNE)
@@ -405,7 +412,7 @@ def test_an_approved_always_goes_into_grants_as_the_same_call(root: Path) -> Non
     live = grants.Live.start(SESSION, REQUEST)
     on = {grants.GRANTS_SWITCH: grants.SWITCH_ON}
     granted = grants.grant(
-        live, outcome.call, outcome.scope, call_id="c-1", root=root, principal=P, ts=T5, environ=on
+        live, outcome.call, outcome.scope, by=ORDER, call_id="c-1", root=root, ts=T5, environ=on
     )
     assert granted.rule is not None and not granted.degraded
     later = grants.Live.start("s-bbbb", "r-9")
@@ -464,7 +471,7 @@ def test_an_unattended_ask_is_an_inbox_approval_with_the_id_as_the_item() -> Non
     event = to_ask(asked.pending, unattended=True)
     assert event.kind is AskKind.APPROVAL
     assert event.session == SESSION and event.tool_call_id == "c-1"
-    assert event.body == asked.pending.card()
+    assert event.body == asked.pending.card(via_inbox=True)
     assert event.choices == []
     assert event.unattended is True
     assert event.ts == T0 and event.actor == "kernel"
@@ -669,7 +676,7 @@ def test_a_bad_timestamp_or_type_is_the_callers_bug() -> None:
         ask((), STATUS, id="c-1", session=SESSION, request=REQUEST, ts=T0, environ=ON)  # type: ignore[arg-type]
     asked = _ask(EMPTY, STATUS)
     with pytest.raises(ValueError):
-        resolve(asked.ledger, "#c-1 approve", ts="soon", environ=ON)
+        resolve(asked.ledger, "#c-1 approve", by=ORDER, ts="soon", environ=ON)
     with pytest.raises(TypeError):
         bounded(Envelope(()), "git status", environ=ON)  # type: ignore[arg-type]
     with pytest.raises(TypeError):
@@ -682,11 +689,12 @@ def test_a_bad_timestamp_or_type_is_the_callers_bug() -> None:
 
 def test_a_ledger_holds_only_pendings_and_settleds() -> None:
     with pytest.raises(TypeError):
-        Ledger(pending=("c-1",), settled=())  # type: ignore[arg-type]
+        Ledger(P, pending=("c-1",), settled=())  # type: ignore[arg-type]
     with pytest.raises(TypeError):
-        Ledger(pending=(), settled=("c-1",))  # type: ignore[arg-type]
+        Ledger(P, pending=(), settled=("c-1",))  # type: ignore[arg-type]
     with pytest.raises(ValueError):
         Ledger(
+            P,
             pending=(_ask(EMPTY, STATUS).pending,),
             settled=(rungs.Settled("c-1", rungs.How.APPROVED),),
         )
@@ -706,11 +714,11 @@ def test_rungs_are_off_by_default(root: Path, monkeypatch: pytest.MonkeyPatch) -
     with pytest.raises(RungsOffError):
         ask(EMPTY, STATUS, id="c-1", session=SESSION, request=REQUEST, ts=T0, environ={})
     asked = _ask(EMPTY, STATUS)
-    off = resolve(asked.ledger, "#c-1 approve", ts=T5)
+    off = resolve(asked.ledger, "#c-1 approve", by=ORDER, ts=T5)
     assert isinstance(off, Refused) and off.kind is Refusal.OFF
     assert "off" in off.reason and rungs.RUNGS_SWITCH in off.reason
     assert off.ledger == asked.ledger
-    still_off = resolve(asked.ledger, "#c-1 always", ts=T5, environ={})
+    still_off = resolve(asked.ledger, "#c-1 always", by=ORDER, ts=T5, environ={})
     assert isinstance(still_off, Refused) and still_off.kind is Refusal.OFF
     envelope = Envelope.parse("shell: git status\n")
     matching_only = {matching.MATCHING_SWITCH: matching.SWITCH_ON}
@@ -733,7 +741,7 @@ def test_while_off_nothing_is_parsed_or_matched(monkeypatch: pytest.MonkeyPatch)
 
     monkeypatch.setattr(rungs, "parse", boom)
     monkeypatch.setattr(matching, "match", boom)
-    off = resolve(asked.ledger, "#c-1 approve", ts=T5, environ={})
+    off = resolve(asked.ledger, "#c-1 approve", by=ORDER, ts=T5, environ={})
     assert isinstance(off, Refused) and off.kind is Refusal.OFF
     unbounded = bounded(Envelope.parse("shell: git status\n"), STATUS, environ={})
     assert isinstance(unbounded, Refused) and unbounded.kind is Refusal.OFF
