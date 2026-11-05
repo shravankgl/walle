@@ -23,7 +23,7 @@ The rules
    If every active automation is pinned, the refusal says so and offers none.
 4. **Only a person changes the register (D72).** Creating, updating or deleting an automation
    is a persistent-authority act, and narrowing is floored along with broadening. No machine
-   actor (``walle.inbox.MACHINE_ACTORS``) adds, retires, pins or unpins: ``add`` and the rest
+   actor (``walle.events.MACHINE_ACTORS``) adds, retires, pins or unpins: ``add`` and the rest
    refuse before writing, and the fold reports such a line rather than applying it.
 5. **Retire is how an automation leaves; a tombstone is not.** A ``supersede`` of an
    automation event is reported and changes nothing. Applied, it would remove a pinned
@@ -37,9 +37,8 @@ The rules
    calls the writes on its own, and the CLI has no command for them.
 
 Anything the fold cannot apply is reported in ``unapplied`` with a reason, never dropped.
-Events are applied in ``walle.merge``'s order — each stream in its own seq order, streams
-interleaved by time — like every other fold, so the same records in any order give the same
-register, and a retire from the laptop of an add on the phone finds it (issue #120).
+Events are applied in ref order (stream, then seq), like ``walle.missions`` and
+``walle.inbox``, so the same records in any order give the same register.
 
 Two writers, step by step (the walkthrough this file is required to carry)
 -------------------------------------------------------------------------------
@@ -65,11 +64,11 @@ exists. The lock is held for one decision, never across waiting on a person.
 
 What this does not cover: two devices that do not share a filesystem. Each takes its own
 lock, and both may add a seventh before their logs meet. Rule 2 still gives one register on
-every machine once they meet — the earlier add by its stamp is applied (``walle.merge``; at
-the same instant, the stream that sorts first), and the other is reported as past the cap.
-A retire or pin stamped *before* the add it names — a device whose clock is behind — is
-reported as naming an automation the register does not hold yet; the order does not guess.
-With one device there is one stream, and seq order is the order things happened.
+every machine once they meet — the first add in ref order is applied, and the other is
+reported as past the cap. For the same reason, a retire or pin whose add sorts *after* it in
+ref order (written on a stream that sorts first, about an add from one that sorts later) is
+reported as naming an automation the register does not hold yet. With one device there is
+one stream, and ref order is the order things happened.
 """
 
 from __future__ import annotations
@@ -85,6 +84,7 @@ from typing import Literal
 
 from walle.events import (
     ACTOR_USER,
+    MACHINE_ACTORS,
     Automation,
     AutomationVerb,
     Supersede,
@@ -92,8 +92,6 @@ from walle.events import (
     now_instant,
     parse_ref,
 )
-from walle.inbox import MACHINE_ACTORS
-from walle.merge import fold_order
 from walle.paths import automations_lock_path, log_dir
 from walle.reader import Record, read_file
 from walle.resolver import live_events
@@ -184,7 +182,7 @@ class Unapplied:
 
 @dataclass(frozen=True)
 class Register:
-    """The fold's answer: every automation in merge order of its add, and what was not applied."""
+    """The fold's answer: every automation in ref order of its add, and what was not applied."""
 
     entries: tuple[Entry, ...]
     unapplied: tuple[Unapplied, ...] = ()
@@ -199,7 +197,7 @@ class Register:
 
     @property
     def pinned(self) -> tuple[Entry, ...]:
-        """The active automations that are pinned, in merge order."""
+        """The active automations that are pinned, in ref order."""
         return tuple(e for e in self.active if e.pinned)
 
     @property
@@ -300,14 +298,14 @@ def fold_automations(records: Iterable[Record]) -> Register:
     """Fold records from any number of streams into the register as it stands.
 
     ``records`` is what ``walle.reader`` returns. The same record passed twice counts once,
-    and the order they arrive in does not matter: events are applied in merge order. A live
+    and the order they arrive in does not matter: events are applied in ref order. A live
     supersede of an automation event is reported, and the event it names still counts (rule
     5); ``live_events`` is still what decides whether that supersede is itself live.
     """
     events, live = live_events(records)
     register = Register(entries=())
     unapplied: list[Unapplied] = []
-    for ref in fold_order(events):
+    for ref in sorted(events, key=parse_ref):
         event = events[ref]
         if isinstance(event, Supersede):
             target = events.get(event.target)
@@ -334,7 +332,7 @@ def fold_automations(records: Iterable[Record]) -> Register:
 
 
 def active(root: Path, principal: str) -> tuple[Entry, ...]:
-    """Every active automation, in merge order of its add, from the log as it is now. Works
+    """Every active automation, in ref order of its add, from the log as it is now. Works
     while the register is off: reading is not acting. A principal with no log raises
     ``FileNotFoundError``."""
     log = log_dir(Path(root), principal)
