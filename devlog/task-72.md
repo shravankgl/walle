@@ -65,8 +65,8 @@ there.
   `CapEff`, `CapPrm` and `CapBnd` all zero; `mount` fails; `chown` on a writable `/tmp` file
   fails (only the missing `CAP_CHOWN` refuses that one); `NoNewPrivs: 1`; `lo` the only
   interface and a connection out fails; `memory.max`, `cpu.max` and `pids.max` read back as
-  declared (cgroup v1 paths as fallback); a sixty-fork storm against a cap of twenty shows a
-  non-zero `max` in `pids.events`, read after `wait` so the measurement itself can fork; a
+  declared (cgroup v1 paths as fallback); a sixty-fork storm against a cap of twenty dies
+  before its last line, with the fork named in stderr (see the second commit, below); a
   `sleep 60` under a 3 s timeout is killed, removed, and absent from `docker ps`; a container
   left under the label by the CLI directly, as a crashed parent would leave one, is found and
   removed by `reap`. One positive test — a write inside the workspace reaches the host — so the
@@ -116,13 +116,35 @@ landed, one test was right and the code wrong (the trailing-newline image, above
 test-helper mistakes (a workspace made twice in one test).
 
 ```
-uv run pytest               2158 passed, 29 skipped in 73.48s
+uv run pytest               2158 passed, 29 skipped in 75.24s
 uv run ruff check           All checks passed!
-uv run ruff format --check  137 files already formatted
+uv run ruff format --check  138 files already formatted
 uv run pyright              0 errors, 0 warnings, 0 informations
 ```
 
 The 29 skips are the 10 from before plus the 19 escape tests.
+
+**Second commit, after CI ran on the first:** the `check` job failed at `uv run pytest` while
+the three other steps passed, and the same commit was green here. I cannot read the CI log from
+this environment (the Actions log endpoints are outside the agent's GitHub scope), so the cause
+is inferred, not observed: GitHub's `ubuntu-latest` runners ship a Docker daemon, so the escape
+tests most likely *ran* there rather than skipping — which the issue did not expect, and which
+this VM cannot reproduce. Re-reading them as a stranger for anything that only breaks inside a
+real container found one real bug and one race:
+
+- **The fork-storm test could not have passed in any container.** It ran sixty `sleep &` against
+  a cap of twenty and then `wait; cat pids.events`. But busybox `ash` ends a non-interactive
+  script on a failed fork (`forkshell` → `ash_msg_and_raise_perror("can't fork")` → `exitshell`
+  when not interactive), so the `cat` never ran and the exit was 2, not 0. The test now makes the
+  shell the witness: the storm's last line, `echo storm-complete`, must *not* be reached, the
+  exit must be non-zero, and stderr must name the fork. Without the cap all sixty would start
+  and the script would finish, so the test still fails open if the cap is missing.
+- **The two hang tests gave the fake 0.5 s** to start Python and write its record before the
+  kill. On a cold CI runner that is a race; now 3 s.
+
+If CI is red again after this commit, the log is the next thing to read, and it needs someone
+who can — the owner, or a reviewer agent whose scope includes Actions logs. The escape tests
+have still not been run by me, anywhere.
 
 **Two-runner walkthrough:** the executor touches no log, lock or derived file. The shared thing
 is the daemon. Writers A and B each `run` a job: each makes its own 16-hex token, so the two
@@ -138,8 +160,9 @@ fixed before commit:
 - Exit 125 from `docker run` was being reported as the command's exit code. It is the client's
   own failure and the command never started; now a `Refusal`.
 - The fork-storm test measured with `ps | wc -l` *while* the PID cap was full, so `ps` itself
-  could not fork and the test would have crashed on empty output. Now reads `pids.events` after
-  `wait`.
+  could not fork and the test would have crashed on empty output. First rewritten to read
+  `pids.events` after `wait`; then, after CI, rewritten again (second commit, above) because
+  `ash` does not survive a failed fork at all.
 - `grep -rl … /` would have matched the test's own command line in `/proc/*/cmdline`; now greps
   the container's folders, not `/proc`.
 - `chown 1234 /etc/passwd` was refused by the read-only root, not by the dropped capability, so
@@ -189,10 +212,14 @@ which is the skip-or-fail rule, and `test_the_escape_tests_fail_rather_than_skip
 required`, which proves it from outside.
 
 **Noticed, not done:**
-- **CI may have a daemon.** GitHub's `ubuntu-latest` runners ship Docker, so the escape tests
-  may run there rather than skip, contrary to the issue's expectation. If they run and pass,
-  that is extra evidence; if they fail, the PR is red for a real reason. Either way the owner's
-  Mac run is still the one the issue asks for.
+- **CI has a daemon, most likely.** GitHub's `ubuntu-latest` runners ship Docker, so the escape
+  tests run there rather than skip, contrary to the issue's expectation (see the second commit).
+  If they pass there, that is extra evidence from a Linux kernel; the owner's Mac run is still
+  the one the issue asks for. If the owner would rather CI never start a container, a marker
+  and a `-m "not escape"` in `ci.yml` is a one-line change — but `ci.yml` is not this task's.
+- **The author agent cannot read CI logs.** Its GitHub scope has no Actions log tool, and the
+  REST log endpoint needs a token. A red `check` is then a guess from the diff. Worth a
+  `check-logs` subcommand in the `walle-github` skill, or the Actions toolset in the scope.
 - **`--user`** (above): the file ownership story for a Linux host is open.
 - **A `-v`/`--volume` for the srt profile's reads** (D99) is not here; this executor mounts one
   folder. A Builder step that needs a read-only view of a second path needs a second mount

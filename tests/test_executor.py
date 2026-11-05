@@ -280,7 +280,7 @@ def test_a_hang_is_killed_at_the_timeout_and_the_container_removed_by_name(
     tmp_path: Path,
 ) -> None:
     docker, record = _fake(tmp_path, "hang")
-    outcome = run(_job(tmp_path, timeout_s=0.5), environ=ON, docker=docker, token=TOKEN)
+    outcome = run(_job(tmp_path, timeout_s=3), environ=ON, docker=docker, token=TOKEN)
     assert isinstance(outcome, Outcome)
     assert outcome.timed_out is True and outcome.exit_code is None
     assert outcome.removed is True
@@ -293,7 +293,7 @@ def test_when_the_container_cannot_be_removed_the_outcome_says_so(tmp_path: Path
     """A status message that lies — "cleaned up" over a container still running — is what
     the stranger pass hunts. ``removed`` is ``False`` and the daemon's words are kept."""
     docker, _ = _fake(tmp_path, "hang-stuck")
-    outcome = run(_job(tmp_path, timeout_s=0.5), environ=ON, docker=docker, token=TOKEN)
+    outcome = run(_job(tmp_path, timeout_s=3), environ=ON, docker=docker, token=TOKEN)
     assert isinstance(outcome, Outcome)
     assert outcome.timed_out is True and outcome.removed is False
     assert "cannot remove" in outcome.stderr

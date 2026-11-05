@@ -21,7 +21,7 @@ What is attempted, and what must hold, each in its own test:
   gain a privilege                 ``NoNewPrivs`` is set on the process
   reach the network                the only interface is ``lo``
   outgrow the caps                 the cgroup reports the declared memory, CPU and PID limits,
-                                   and a fork storm is cut off at the PID cap
+                                   and a fork storm dies at the PID cap before it completes
   outlive the timeout              a command that sleeps past the timeout is killed and its
                                    container is gone afterwards
   survive the parent               a container left behind under the label, as a crashed
@@ -255,19 +255,20 @@ def test_the_pid_cap_is_the_one_declared(workspace: Path) -> None:
 
 
 def test_a_fork_storm_is_cut_off_at_the_pid_cap(workspace: Path) -> None:
-    """Sixty forks against a cap of twenty. The cgroup counts every fork it refused in
-    ``pids.events``; the count is read after ``wait``, when the storm is over and a fork for
-    ``cat`` is possible again."""
+    """Sixty forks against a cap of twenty. The shell is the witness: busybox ``ash`` ends a
+    non-interactive script on a failed fork, so a storm the cap cuts off never reaches its
+    last line, and the error names the fork. Without the cap all sixty would start and the
+    script would finish with ``storm-complete`` and exit 0."""
     outcome = _sh(
         workspace,
-        "for i in $(seq 1 60); do sleep 3 & done 2>/dev/null; wait; "
-        "cat /sys/fs/cgroup/pids.events 2>/dev/null || cat /sys/fs/cgroup/pids/pids.events",
+        "for i in $(seq 1 60); do sleep 3 & done; echo storm-complete",
         pids=20,
         timeout_s=60,
     )
-    assert outcome.exit_code == 0, outcome.stderr
-    refused = dict(line.split() for line in outcome.stdout.strip().splitlines())
-    assert int(refused["max"]) > 0, outcome.stdout
+    assert outcome.exit_code != 0, outcome.stdout
+    assert "storm-complete" not in outcome.stdout
+    words = outcome.stderr.lower()
+    assert "fork" in words or "resource temporarily unavailable" in words, outcome.stderr
 
 
 # --- outlive the timeout ----------------------------------------------------------------------
