@@ -18,17 +18,13 @@ it.** The task is to make that a shape of the code rather than a check in it.
     no `current()`, no context variable, no `DEFAULT_*`, and the module reads the environment for
     exactly one thing, the switch — a test checks this by AST.
   - `Profile(context)`: everything a run may touch of its own principal. Its constructor takes a
-    `Context` and nothing else (checked by signature). `path(relative)` refuses, with
-    `CrossPrincipalError`, anything absolute, empty, or climbing out by name, then walks the path
-    one component at a time following every symlink by hand (the walk `floors.py` uses), and
-    refuses anywhere the walk stands that is not inside the profile's real folder or an ancestor
-    passed through on the way down an absolute link: a link to another principal's file, a link
-    to their folder, one's own `hot/` replaced by a link, a dangling link whose target would be
-    *created* in another folder, a link loop (unresolvable, so refused), and the profile folder
-    itself replaced by a link. `open` is `open` on `path`. `records()` is the index of this one
-    folder, and it passes `log/` and every stream file through `path` first, so a stream that is
-    a link into another folder is refused before the index reads a byte. `resolution()` is the
-    fold of `records()`. The role is on the context and `path` does not read it.
+    `Context` and nothing else (checked by signature). *As shipped in round 1:* `path(relative)`
+    walked links with a walker of its own and allowed standing on an ancestor. *After round 2
+    (below):* `resolve(relative)` decides once where a name lands, using `walle.floors`' walk,
+    and every decision and every open is made on that landing. `records()` is the index of this
+    one folder, and it resolves `log/` and every stream file first, so a stream that is a link
+    into another folder is refused before the index reads a byte. `resolution()` is the fold of
+    `records()`. The role is on the context and `resolve` does not read it.
   - `Role`: D27's three, `operator`, `stakeholder`, `admin`. Not stored: the kernel attaches a
     role to a context per message (D61, ARCHITECTURE §7), and this module keeps no roster.
   - `add_profile(context, principal)` and `delete_profile(context, target)`: the admin's two
@@ -55,7 +51,7 @@ it.** The task is to make that a shape of the code rather than a check in it.
 - `src/walle/cli.py`: `walle profiles add|delete|publish`. `add` and `delete` take `--as <who>`
   and `--role`; `publish` takes `--principal`, `--kind` and a source path. Each refuses while off
   (exit 1, says how to turn it on, touches nothing). No `read`, `show` or `cat` command exists.
-- `tests/test_profiles.py`, 59 tests (one of them eleven spellings by name, every role). Every root is a `tmp_path`; the principals are a made-up
+- `tests/test_profiles.py`, 59 tests in round 1, 81 after round 2 (below). Every root is a `tmp_path`; the principals are a made-up
   Ada and Sam; the canary is a string that reads as not real.
 
 **Why:**
@@ -196,13 +192,8 @@ the PR's head commit and sets `agent-review`; this entry is what it and Shravan 
   lives, and inventing a file for it would be a new decision (and, under hard constraint 2, a
   new append-only format). The role rides on the `Context`, attached per message by whoever
   builds it (D61). The only thing a role unlocks here is adding or ending a profile.
-- **Passing through an ancestor is allowed; standing anywhere else is not.** An absolute symlink
-  inside Ada's folder to another place inside Ada's folder walks down from `/` through the root
-  and `principals/`. Those are ancestors of the profile folder, read as directory lookups only,
-  and ARCHITECTURE §7 already has them as passable-not-listable. A sibling principal, `shared/`,
-  `kernel/` or anywhere outside the root is refused wherever the walk stands, not only where it
-  lands — `../p-sam/../p-ada/log` reaches Ada's own log and is still refused, because it passed
-  through Sam's.
+- **(Round 1) Passing through an ancestor is allowed; standing anywhere else is not.** Withdrawn
+  in round 2: the ancestor allowance was the hole the review found. See *Round 2*.
 - **The issue against D32 rule 2.** D32 allows cross-folder reads "only inside a declared
   workflow whose manifest lists the paths". The owner's rule is stricter: none. A stricter rule
   is inside "only", so this is a narrowing, not a conflict, and nothing was flagged. If a later
@@ -222,11 +213,9 @@ the PR's head commit and sets `agent-review`; this entry is what it and Shravan 
 argument. Then `_remove_tree` and `test_an_admin_deletes_a_profile_without_opening_a_file`.
 
 **Noticed, not done:**
-- **Check-then-use remains a race for `Profile.open`.** `path` checks the name, then `open`
-  opens it; a link swapped in between is followed, because a link that stays inside the folder
-  is allowed by name. `publish` closes this for its own open with `O_NOFOLLOW` because a
-  capability is never a link, but `open` cannot without refusing in-folder links. D110's OS user
-  per principal is the real fix: a kernel refusal needs no check to race.
+- **(Round 1) Check-then-use remains a race for `Profile.open`.** Closed in round 2: `open`
+  now opens the resolved components relative to the folder's descriptor, following no link.
+  What remains is only D110's: a kernel refusal needs no check at all.
 - **Hard links are invisible to a path walk.** A hard link inside Ada's folder to Sam's stream
   is one inode under two names; `lstat` sees a regular file. Linux's `protected_hardlinks` stops
   this across users once D110 lands; in a single-user install nothing here can tell. Noted so
@@ -239,6 +228,7 @@ argument. Then `_remove_tree` and `test_an_admin_deletes_a_profile_without_openi
   listings a moment apart; a stream added between them is indexed without the link check. Fail-
   open on a race, fail-closed otherwise. A `Profile`-aware `index.update` that takes the checked
   paths would close it; that is a change to the resolution path and belongs to its own task.
+  (Still open after round 2: the index reads by path, and changing that is the same task.)
 - **The curator still takes `(root, principal)`.** `test_nothing_in_the_curator_takes_two_principals`
   pins the shape by signature; the stronger version, where `curate` takes a `Profile`, is the
   same mechanical task as the one above.
@@ -247,3 +237,96 @@ argument. Then `_remove_tree` and `test_an_admin_deletes_a_profile_without_openi
 
 **Cost:** author run on Hyperagent, Fable 5.1; the dollar figure is on the Hyperagent side and
 not visible from here. Reviewer cost to be added by the reviewer.
+
+---
+
+## Round 2: agent-review on `42931e5` — 2 high, 2 low, all fixed on the branch
+
+The reviewer (Gemini, direct diff read) found four things; the two high ones were the same
+class of bug, and it was the third review in this repo to find it: **the path that was checked
+was not the path that was used.** Round 1 checked a name, then acted on the name. This round
+makes the module do one thing: resolve once, decide everything on the resolved, case-folded
+location, and act on that same location through descriptors that follow no link.
+
+**The findings, each with the test that failed before the fix:**
+
+1. *High — a link to an ancestor passed `path`.* `up -> <root>/principals` was allowed because
+   an ancestor was a permitted place to *stand*, and the landing was only required not to be the
+   folder itself. Listing it shows every principal's name. Now every link met must sit strictly
+   inside the folder **and** itself land strictly inside it (checked with the same walk), and
+   the final landing must be strictly inside. `..` segments in a name are refused outright
+   rather than normalised: a profile path never needs one.
+   `test_a_link_to_an_ancestor_of_the_profile_folder_is_refused` (`..`, `../..`, `/`, `.`, the
+   folder's own absolute path, and the review's `up/p-ada/log` which climbs back down).
+2. *High — `publish` judged the shape of the name, not the file.* `skills -> hot` inside Ada's
+   folder passed `path` (it stays inside) and `_data_shaped("skills/learned.md")` (it reads as
+   a skill), and `hot/learned.md` went to `shared/`. `HOT/` and `KEYS/` did the same on a
+   case-folding filesystem because the place check was case-sensitive. And `mkdir` of the kind
+   folder happened before the `O_NOFOLLOW` open could fail, so "raised before anything is
+   written" was untrue. Now `_data_shaped` takes the **resolved, case-folded** components; the
+   source is opened on those components before any write; the first write is the kind folder.
+   `test_an_in_folder_link_cannot_publish_data_under_a_capability_name`,
+   `test_data_places_are_matched_without_regard_to_case` (seven spellings, portable: the fold is
+   applied on every filesystem, so the test does not need APFS to show it),
+   `test_nothing_is_written_before_every_check_passes` (six refusals; the tree is byte-identical
+   after each).
+3. *Low — `audit_shared` reported clean when `shared/` itself was a link.* It now reports `.`
+   as a stray with the reason, for a link to a folder and for a dangling one.
+   `test_the_audit_names_a_shared_folder_that_is_itself_a_link`.
+4. *Low — `_real_folder` did not refuse a linked `principals/`* while `add_profile` and
+   `delete_profile` did. It does now; every entry gives the same refusal.
+   `test_a_principals_folder_that_is_a_link_is_refused_by_every_entry`.
+
+**The class, not the instances:**
+- `Profile.resolve(relative) -> Resolved`: the one decision. `Resolved.parts` is the landing
+  below the real folder as spelled; `Resolved.folded` is the same lower-cased, for every rule
+  that compares names. `path` returns `Resolved.real`, never the name given.
+- The walk is `walle.floors._walk`, imported, not a third walker. Round 1's `_walk` is gone.
+  The import is of a private name, said so in a comment; making it public is a one-line change
+  to `floors.py` that belongs to whoever next touches that module.
+- `_open_below(folder, parts, flags)`: opens the folder `O_NOFOLLOW|O_DIRECTORY`, each
+  component below it likewise relative to the one before, and the last with the caller's flags
+  plus `O_NOFOLLOW`. No link is followed at open time. `ELOOP`/`ENOTDIR` here means the layout
+  changed after the decision, and is `CrossPrincipalError`. `Profile.open` and both ends of
+  `publish` go through it; `publish`'s destination is made and entered relative to the root's
+  descriptor the same way, created `O_EXCL`.
+- `test_every_hop_kind_is_decided_on_where_it_lands`: one table, both doors. Eight kinds of hop
+  (absolute, relative, chain of three, ancestor, case variant, folder link absolute, folder link
+  relative, dangling into another folder) made inside Ada's `skills/`, each pushed through
+  `path` and `publish`. A landing in Sam's folder or above Ada's is `CrossPrincipalError` from
+  both; a landing on Ada's own data passes `path` and is `SharedDataError` from `publish`; the
+  tree is byte-identical after every case and `shared/` never appears.
+- `test_open_follows_no_link_at_open_time`: `notes/` swapped for a link to Sam's `notes/`
+  between the decision and the open. `CrossPrincipalError`, not Sam's bytes.
+- `test_the_path_given_out_is_the_resolved_one`.
+
+**Stranger pass, round 2:** on the rewrite. Found and fixed: the source descriptor leaked if
+creating the destination raised (now closed on any failure between the two opens); the kind
+folder itself was reported by the audit as "the profile folder itself" once `_data_shaped`
+took components (the kind folder is skipped; its contents are judged). Looked for: every
+descriptor `_open_below` opens on the way is closed in `finally`, success or not, and only the
+final one is returned; `open` with a text mode gets an explicit encoding; the audit still
+follows no link.
+
+**Round 1 claims this round withdraws:** "passing through an ancestor is allowed" (the hole);
+"the path returned is the one asked for, not its resolution" (the opposite is now true, and is
+the point); the round-1 `_walk` and its "trail" rule.
+
+**Still open after this round:** `records()` resolves each stream and then `index.update`
+lists `log/` again by path; a stream added in between is indexed unchecked. Hard links remain
+invisible to any path walk. Both are D110's to close at the kernel, or an index that takes
+checked paths, which is a change to the resolution path and its own task.
+
+**Checks, round 2** (on the branch with `main` at `73b9cdd` merged in):
+
+```
+uv run pytest               3127 passed, 31 skipped in 122.58s
+uv run ruff check           All checks passed!
+uv run ruff format --check  174 files already formatted
+uv run pyright              0 errors, 0 warnings, 0 informations
+```
+
+**Branch hygiene:** before this round the branch held only this task's commit and the
+`update-branch` merge from the previous round; nothing from another author. `main` had moved by
+one commit (#108, grants) with no file in common; merged locally, checks run on the merge, then
+`update-branch` after the push.

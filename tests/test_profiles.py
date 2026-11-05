@@ -807,18 +807,18 @@ def test_a_source_swapped_for_a_link_after_the_check_is_not_copied(
     root = _household(tmp_path)
     mine = _plant(root, A, "skills/water.md", b"x")
     _plant(root, B, "skills/shut.md", CANARY)
-    real_path = Profile.path
+    real_resolve = Profile.resolve
 
-    def swap_after_check(self: Profile, relative: Any) -> Path:
-        checked = real_path(self, relative)
+    def swap_after_check(self: Profile, relative: Any) -> Any:
+        checked = real_resolve(self, relative)
         mine.unlink()
         mine.symlink_to(principal_dir(root, B) / "skills" / "shut.md")
         return checked
 
-    monkeypatch.setattr(Profile, "path", swap_after_check)
-    with pytest.raises(OSError):
+    monkeypatch.setattr(Profile, "resolve", swap_after_check)
+    with pytest.raises(CrossPrincipalError):
         publish(bind(root, A), "skills/water.md", "skills", environ=ON)
-    assert not (root / "shared" / "skills" / "water.md").exists()
+    assert not (root / "shared").exists()
 
 
 def test_a_spawned_thread_is_not_a_daemon_unless_asked(tmp_path: Path) -> None:
@@ -835,3 +835,247 @@ def test_a_spawned_thread_is_not_a_daemon_unless_asked(tmp_path: Path) -> None:
     assert thread.daemon is False
     release.set()
     thread.join(5)
+
+
+# --- the second review round: decide on the resolved path, act on the same path -----------------
+
+
+def test_a_link_to_an_ancestor_of_the_profile_folder_is_refused(tmp_path: Path) -> None:
+    """The review's reproduction: ``up -> <root>/principals`` passed the first version, because
+    an ancestor was allowed as a place to *stand* and the landing was never required to be
+    strictly inside. Listing it would have shown every principal's name."""
+    root = _household(tmp_path)
+    ada = principal_dir(root, A)
+    (ada / "up").symlink_to(root / "principals")
+    (ada / "up2").symlink_to(root)
+    (ada / "slash").symlink_to(Path("/"))
+    (ada / "dots").symlink_to(Path(".."))
+    (ada / "dotdots").symlink_to(Path("..") / "..")
+    (ada / "self").symlink_to(Path("."))
+    (ada / "selfabs").symlink_to(ada)
+    profile = Profile(bind(root, A))
+    for name in ("up", "up2", "slash", "dots", "dotdots", "self", "selfabs", "up/p-ada/log"):
+        with pytest.raises(CrossPrincipalError):
+            profile.path(name)
+        with pytest.raises(CrossPrincipalError):
+            profile.open(name)
+
+
+def test_the_path_given_out_is_the_resolved_one(tmp_path: Path) -> None:
+    """What is checked is what is used: ``path`` returns where the name lands, not the name."""
+    root = _household(tmp_path)
+    ada = principal_dir(root, A)
+    (ada / "notes").mkdir()
+    (ada / "notes" / "mine").symlink_to(ada / "log")
+    profile = Profile(bind(root, A))
+    assert profile.path("notes/mine") == (ada / "log").resolve()
+    assert profile.path(f"notes/mine/d-{D}.jsonl") == (ada / "log" / f"d-{D}.jsonl").resolve()
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "HOT/learned.md",
+        "Hot/learned.md",
+        "KEYS/api_key",
+        "Grants/x.json",
+        "LOG/d-mbp.jsonl",
+        "Index.SQLITE",
+        "skills/Notes.JSONL",
+    ],
+)
+def test_data_places_are_matched_without_regard_to_case(tmp_path: Path, source: str) -> None:
+    """APFS and NTFS fold case: ``HOT/`` is ``hot/`` there. The check folds it everywhere, so
+    the answer does not depend on the filesystem the test runs on."""
+    root = _household(tmp_path)
+    _plant(root, A, source, b"not a capability")
+    with pytest.raises(SharedDataError):
+        publish(bind(root, A), source, "skills", environ=ON)
+    assert not (root / "shared").exists()
+
+
+def test_an_in_folder_link_cannot_publish_data_under_a_capability_name(tmp_path: Path) -> None:
+    """The review's second reproduction: ``skills -> hot`` stays inside the folder, so the
+    first version checked the shape of ``skills/learned.md`` and copied ``hot/learned.md``."""
+    root = _household(tmp_path)
+    ada = principal_dir(root, A)
+    _plant(root, A, "hot/learned.md", CANARY)
+    _plant(root, A, "keys/api_key", CANARY)
+    _plant(root, A, "index.sqlite", CANARY)
+    (ada / "skills").symlink_to(ada / "hot")
+    (ada / "mcp").symlink_to(Path("keys"))
+    (ada / "hooks").mkdir()
+    (ada / "hooks" / "link.md").symlink_to(Path("..") / "hot" / "learned.md")
+    (ada / "hooks" / "idx").symlink_to(ada / "index.sqlite")
+    for source, kind in (
+        ("skills/learned.md", "skills"),
+        ("mcp/api_key", "mcp"),
+        ("hooks/link.md", "hooks"),
+        ("hooks/idx", "hooks"),
+    ):
+        with pytest.raises(SharedDataError):
+            publish(bind(root, A), source, kind, environ=ON)  # type: ignore[arg-type]
+    assert not (root / "shared").exists(), "nothing is written before every check has passed"
+
+
+def test_nothing_is_written_before_every_check_passes(tmp_path: Path) -> None:
+    """Every refusal ``publish`` can give, and after each the root is byte-identical: no
+    ``shared/`` folder, no empty kind folder, no partial file."""
+    root = _household(tmp_path)
+    ada = principal_dir(root, A)
+    _plant(root, A, "skills/water.md", b"x")
+    _plant(root, A, "hot/learned.md", CANARY)
+    _plant(root, B, "skills/shut.md", CANARY)
+    (ada / "skills" / "theirs.md").symlink_to(principal_dir(root, B) / "skills" / "shut.md")
+    (ada / "skills" / "data.md").symlink_to(Path("..") / "hot" / "learned.md")
+    (ada / "skills" / "gone.md").symlink_to(ada / "skills" / "nowhere.md")
+    (ada / "skills" / "folder").mkdir()
+    before = _tree(root)
+    cases: list[tuple[str, type[Exception]]] = [
+        ("skills/theirs.md", CrossPrincipalError),
+        ("skills/data.md", SharedDataError),
+        ("skills/gone.md", FileNotFoundError),
+        ("skills/folder", SharedDataError),
+        ("skills/missing.md", FileNotFoundError),
+        ("skills/water.md", SharedDataError),  # wrong kind, below
+    ]
+    for source, error in cases:
+        kind = "log" if source == "skills/water.md" else "skills"
+        with pytest.raises(error):
+            publish(bind(root, A), source, kind, environ=ON)  # type: ignore[arg-type]
+        assert _tree(root) == before, source
+
+
+def test_the_audit_names_a_shared_folder_that_is_itself_a_link(tmp_path: Path) -> None:
+    root = _household(tmp_path)
+    _plant(root, B, "skills/shut.md", CANARY)
+    (root / "shared").symlink_to(principal_dir(root, B))
+    strays = audit_shared(root)
+    assert [s.path for s in strays] == ["."]
+    assert "link" in strays[0].reason
+    assert CANARY.decode() not in strays[0].reason
+    (root / "shared").unlink()
+    (root / "shared").symlink_to(root / "nowhere")
+    assert [s.path for s in audit_shared(root)] == ["."]
+
+
+def test_a_principals_folder_that_is_a_link_is_refused_by_every_entry(tmp_path: Path) -> None:
+    """``add_profile`` and ``delete_profile`` refused a linked ``principals/``; ``_real_folder``
+    did not. Now every entry does."""
+    root = tmp_path / "root"
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / f"p-{A}" / "log").mkdir(parents=True)
+    root.mkdir()
+    (root / "principals").symlink_to(elsewhere)
+    profile = Profile(bind(root, A))
+    with pytest.raises(CrossPrincipalError):
+        profile.path("log")
+    with pytest.raises(CrossPrincipalError):
+        profile.records()
+    with pytest.raises(CrossPrincipalError):
+        publish(bind(root, A), "skills/x.md", "skills", environ=ON)
+    with pytest.raises(CrossPrincipalError):
+        add_profile(bind(root, A, role=Role.ADMIN), "kim", environ=ON)
+    with pytest.raises(CrossPrincipalError):
+        delete_profile(bind(root, A, role=Role.ADMIN), A, environ=ON)
+
+
+HOP_KINDS = (
+    "absolute",
+    "relative",
+    "chain",
+    "ancestor",
+    "case",
+    "folder-absolute",
+    "folder-relative",
+    "dangling-into",
+)
+
+
+def _hop(root: Path, kind: str, *, target_file: Path, own_data: Path) -> tuple[str, bool]:
+    """Make one link of ``kind`` inside Ada's ``skills/`` and return the source to name and
+    whether it stays inside Ada's folder (so ``path`` allows it and only the shape refuses)."""
+    ada = principal_dir(root, A)
+    skills = ada / "skills"
+    skills.mkdir(exist_ok=True)
+    rel_to_target = Path(os.path.relpath(target_file, skills))
+    if kind == "absolute":
+        (skills / "a.md").symlink_to(target_file)
+        return "skills/a.md", False
+    if kind == "relative":
+        (skills / "r.md").symlink_to(rel_to_target)
+        return "skills/r.md", False
+    if kind == "chain":
+        (skills / "c1.md").symlink_to(Path("c2.md"))
+        (skills / "c2.md").symlink_to(ada / "c3.md")
+        (ada / "c3.md").symlink_to(target_file)
+        return "skills/c1.md", False
+    if kind == "ancestor":
+        (skills / "anc").symlink_to(Path("..") / "..")
+        return f"skills/anc/p-{B}/skills/shut.md", False
+    if kind == "case":
+        return str(Path(*[p.upper() for p in own_data.relative_to(ada).parts])), True
+    if kind == "folder-absolute":
+        (skills / "f").symlink_to(target_file.parent)
+        return f"skills/f/{target_file.name}", False
+    if kind == "folder-relative":
+        (skills / "g").symlink_to(Path(os.path.relpath(own_data.parent, skills)))
+        return f"skills/g/{own_data.name}", True
+    if kind == "dangling-into":
+        (skills / "d.md").symlink_to(target_file.parent / "not-yet.md")
+        return "skills/d.md", False
+    raise AssertionError(kind)
+
+
+@pytest.mark.parametrize("kind", HOP_KINDS)
+def test_every_hop_kind_is_decided_on_where_it_lands(tmp_path: Path, kind: str) -> None:
+    """One table, both doors. Each kind of hop is made inside Ada's folder; ``path`` and
+    ``publish`` must answer by the landing, never by the name: a landing in Sam's folder or
+    above Ada's is ``CrossPrincipalError`` from both; a landing on Ada's own data passes
+    ``path`` and is ``SharedDataError`` from ``publish``. Nothing is ever written."""
+    root = _household(tmp_path)
+    sam_file = _plant(root, B, "skills/shut.md", CANARY)
+    own_data = _plant(root, A, "hot/learned.md", CANARY)
+    source, inside = _hop(root, kind, target_file=sam_file, own_data=own_data)
+    before = _tree(root)
+    profile = Profile(bind(root, A))
+    if inside:
+        landed = profile.path(source)
+        # Compared case-folded: on a case-sensitive filesystem the ``case`` kind names a file
+        # that does not exist, and the landing is the name as given.
+        assert landed.as_posix().lower() == own_data.resolve().as_posix().lower()
+        with pytest.raises(SharedDataError):
+            publish(bind(root, A), source, "skills", environ=ON)
+    else:
+        with pytest.raises(CrossPrincipalError):
+            profile.path(source)
+        with pytest.raises(CrossPrincipalError):
+            publish(bind(root, A), source, "skills", environ=ON)
+    assert _tree(root) == before
+    assert not (root / "shared").exists()
+
+
+def test_open_follows_no_link_at_open_time(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Resolution decides; the open walks the resolved components relative to the folder's
+    descriptor and refuses a link at any of them. A folder swapped for a link between the two
+    is ``CrossPrincipalError``, not a read of what it points at."""
+    root = _household(tmp_path)
+    ada = principal_dir(root, A)
+    _plant(root, A, "notes/a.md", b"mine")
+    _plant(root, B, "notes/a.md", CANARY)
+    profile = Profile(bind(root, A))
+    with profile.open("notes/a.md") as f:
+        assert f.read() == b"mine"
+    real_resolve = Profile.resolve
+
+    def swap_after(self: Profile, relative: Any) -> Any:
+        resolved = real_resolve(self, relative)
+        import shutil
+
+        shutil.rmtree(ada / "notes")
+        (ada / "notes").symlink_to(principal_dir(root, B) / "notes")
+        return resolved
+
+    monkeypatch.setattr(Profile, "resolve", swap_after)
+    with pytest.raises(CrossPrincipalError):
+        profile.open("notes/a.md")

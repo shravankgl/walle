@@ -20,17 +20,33 @@ The profile (D32, hard constraint 6)
 ------------------------------------
 A ``Profile`` is everything a run may touch of its own principal, and it is built from a
 ``Context`` and nothing else. Every path it gives out is inside ``principals/p-<name>/``.
-``path`` and ``open`` take a folder-relative name and refuse, with ``CrossPrincipalError``:
 
-- a path that is absolute, empty, or climbs out through ``..``, by name, before anything is
-  read;
-- a path that reaches another folder **through a link**: every symlink met on the way is
-  followed one hop at a time, as ``walle.floors`` does, and a hop that leaves the profile's
-  real folder is refused where it is met — a link to another principal's file, a link to their
-  folder, a folder of one's own replaced by a link, a dangling link whose target would be
-  *created* in another folder, and the profile folder itself replaced by a link;
-- a path that cannot be resolved — a link loop, a name that cannot be read — because where it
-  lands is then unknown (D86: fail closed).
+The rule that holds it together, after two review rounds found gaps between the path that
+was checked and the path that was used: **resolve once, decide on the resolved path, act on
+that same path.** ``resolve`` takes a folder-relative name and returns where it lands, as
+components below the profile's real folder, both as spelled and case-folded. Every decision
+after — is it inside, is it data, what to open — is made on those components. It refuses,
+with ``CrossPrincipalError``, before anything is opened:
+
+- a name that is absolute, empty, ``.``, or has any ``..`` segment (a profile path never
+  needs one, so none is allowed rather than some being normalised away);
+- a name whose walk — ``walle.floors``' link walk, the one this project already has, not a
+  second one — meets a link that is not strictly inside the folder, or a link whose own
+  landing is not strictly inside it (a link to ``..`` that the rest of the name climbs back
+  down from), or that lands anywhere not **strictly** inside the folder: the folder itself,
+  an ancestor (``principals/``, the root, ``/``), a sibling principal, ``shared/``, or the
+  target a dangling link would *create* elsewhere;
+- a walk that cannot finish — a loop, a name that cannot be read — because where it lands is
+  then unknown (D86: fail closed);
+- a profile folder that is itself a link, or a ``principals/`` that is: the same refusal
+  ``add_profile`` and ``delete_profile`` give.
+
+``path`` returns the resolved landing, never the name. ``open`` opens the resolved
+components one by one relative to the folder's own descriptor, each ``O_NOFOLLOW``, so no
+link is followed at open time at all: the decision followed the links, and the act follows
+none. A link that has appeared since is the layout having changed under the decision, and is
+refused rather than followed. Names are compared case-folded throughout (``HOT/`` is ``hot/``
+on APFS and NTFS, and so it is here, on every filesystem).
 
 The role is on the context and ``path`` does not look at it. There is no ``read_as``, no
 ``open_for``, no parameter that names a second principal on anything that reads. An admin's
@@ -60,15 +76,20 @@ the link into whatever it points at.
 Sharing (D32 rule 1, D33)
 -------------------------
 ``publish`` copies one capability file from the publisher's **own** folder into
-``shared/<kind>/``. The source is resolved through ``Profile.path``, so the only files that
-can be published are the publisher's, whatever their role: that is how "only the folder's
-owner can share" is a shape rather than a check. ``shared/`` holds the *how*, never the
-*what* (D33): the kinds are ``skills``, ``mcp`` and ``hooks``, and a source that is data by
-place (``log/``, ``hot/``, ``grants/``, ``keys/``, the index) or by shape (``.jsonl``,
-``.sqlite``, ``.lock``) is ``SharedDataError``. A name already in ``shared/`` is never
+``shared/<kind>/``. The source goes through ``Profile.resolve``, so the only files that can
+be published are the publisher's, whatever their role: that is how "only the folder's owner
+can share" is a shape rather than a check. ``shared/`` holds the *how*, never the *what*
+(D33): the kinds are ``skills``, ``mcp`` and ``hooks``, and a source whose **resolved,
+case-folded** location is data by place (``log/``, ``hot/``, ``grants/``, ``keys/``, the
+index) or by shape (``.jsonl``, ``.sqlite``, ``.lock``) is ``SharedDataError`` — so
+``skills -> hot`` and ``HOT/`` are both refused, because the question is where the bytes are,
+not what the name says. Every check, the source open included, comes before the first write;
+the first write is the kind folder, made and entered relative to the root's descriptor with
+no link followed, and the file is created exclusively. A name already in ``shared/`` is never
 replaced (hard constraint 2): a new version is a new file. ``Shared`` knows only capability
 paths — it has no notion of a log, a stream or a memory under ``shared/`` — and
-``audit_shared`` lists anything there that is not a capability, by name only.
+``audit_shared`` lists anything there that is not a capability, by name only, ``shared/``
+itself included when it is a link.
 
 Publication is a person's act. ``walle.floors`` already refuses the *agent* every write to
 ``shared/`` in every mode (D72); this is the human path those floors leave open, and it is
@@ -86,6 +107,7 @@ isolation.
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import os
 import shutil
@@ -98,6 +120,7 @@ from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, Literal
 
 from walle import index
+from walle.floors import _walk as walk_links  # the one link walk; see the module docstring
 from walle.paths import (
     HOT_DIRNAME,
     INDEX_FILENAME,
@@ -292,51 +315,6 @@ def spawn(
 # --- the profile (D32, hard constraint 6) --------------------------------------------------------
 
 
-def _walk(start: str, parts: list[str]) -> list[str] | None:
-    """Resolve ``parts`` from the real folder ``start`` one component at a time, following
-    each symlink by hand as ``walle.floors._walk`` does. Returns the **trail**: where the walk
-    stood after every component and after every link, ending where the path lands — through a
-    dangling link, the name it would create. ``None`` when the answer is not knowable: a loop,
-    a name that cannot be read, a NUL."""
-    trail: list[str] = []
-    current = start
-    hops = 0
-    pending = list(parts)
-    while pending:
-        part = pending.pop(0)
-        if part in ("", "."):
-            continue
-        if part == "..":
-            current = os.path.dirname(current)
-            trail.append(current)
-            continue
-        candidate = os.path.join(current, part)
-        try:
-            is_link = stat.S_ISLNK(os.lstat(candidate).st_mode)
-        except FileNotFoundError:
-            is_link = False
-        except (OSError, ValueError):
-            return None
-        if not is_link:
-            current = candidate
-            trail.append(current)
-            continue
-        if hops >= HOP_LIMIT:
-            return None
-        hops += 1
-        try:
-            target = os.readlink(candidate)
-        except (OSError, ValueError):
-            return None
-        if os.path.isabs(target):
-            current = os.sep
-        pending = [p for p in target.split(os.sep) if p] + pending
-        trail.append(current)
-    if not trail:
-        trail.append(current)
-    return trail
-
-
 def _inside(path: str, folder: str) -> bool:
     """Whether ``path`` is ``folder`` or under it, compared as ``walle.floors`` compares:
     whole segments, without regard to case."""
@@ -344,6 +322,89 @@ def _inside(path: str, folder: str) -> bool:
         return True
     base = folder.rstrip(os.sep) + os.sep
     return path[: len(base)].lower() == base.lower()
+
+
+def _strictly_inside(path: str, folder: str) -> bool:
+    return _inside(path, folder) and path.lower() != folder.lower()
+
+
+_DIR_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0)
+"""How a folder is opened before it is entered: never through a link."""
+
+_CHANGED = (errno.ELOOP, errno.ENOTDIR)
+"""What ``open`` with ``O_NOFOLLOW`` reports when a link now stands where a resolved component
+was: the layout changed between the decision and the act, and the act is refused."""
+
+
+@dataclass(frozen=True, slots=True)
+class Resolved:
+    """Where a profile-relative name lands, decided once and used for every decision after.
+
+    ``parts`` are the landing's components below the profile's real folder, as spelled on
+    disk; ``folded`` is the same, lower-cased, for every rule that compares names (the
+    filesystems walle ships on fold case, so ``HOT/`` is ``hot/`` there). ``real`` is the
+    landing as an absolute path. Nothing has been opened.
+    """
+
+    given: str
+    folder: str
+    parts: tuple[str, ...]
+
+    @property
+    def real(self) -> str:
+        return os.path.join(self.folder, *self.parts)
+
+    @property
+    def folded(self) -> tuple[str, ...]:
+        return tuple(p.lower() for p in self.parts)
+
+
+def _open_below(folder: str, parts: tuple[str, ...], flags: int, *, mkdirs: bool = False) -> int:
+    """Open ``folder/parts`` following **no** link at any component: the folder is opened
+    ``O_NOFOLLOW|O_DIRECTORY``, each component below it likewise relative to the one before,
+    and the last with ``flags | O_NOFOLLOW``. The caller decided on resolved components, so
+    every one of them is a real folder or file; a link found here is the layout having
+    changed since, and is ``CrossPrincipalError``. With ``mkdirs`` the folders on the way are
+    made, relative to their parent's descriptor, when missing. Returns the final descriptor."""
+    try:
+        fd = os.open(folder, _DIR_FLAGS)
+    except OSError as exc:
+        if exc.errno in _CHANGED:
+            raise CrossPrincipalError(f"{folder}: a link now stands where the folder was") from None
+        raise
+    try:
+        for part in parts[:-1]:
+            if mkdirs:
+                with contextlib.suppress(FileExistsError):
+                    os.mkdir(part, 0o755, dir_fd=fd)
+            try:
+                child = os.open(part, _DIR_FLAGS, dir_fd=fd)
+            except OSError as exc:
+                if exc.errno in _CHANGED:
+                    raise CrossPrincipalError(
+                        f"{part!r} under {folder}: a link now stands where a folder was; refused"
+                    ) from None
+                raise
+            os.close(fd)
+            fd = child
+        try:
+            return os.open(parts[-1], flags | os.O_NOFOLLOW, 0o644, dir_fd=fd)
+        except OSError as exc:
+            if exc.errno in _CHANGED:
+                raise CrossPrincipalError(
+                    f"{parts[-1]!r} under {folder}: a link now stands where a file was; refused"
+                ) from None
+            raise
+    finally:
+        os.close(fd)
+
+
+_MODES: dict[str, int] = {
+    "r": os.O_RDONLY,
+    "w": os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+    "a": os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+    "x": os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+}
 
 
 class Profile:
@@ -381,9 +442,13 @@ class Profile:
         return hot_dir(self.context.root, self.context.principal)
 
     def _real_folder(self) -> str:
-        """The profile folder's real path. The folder itself must not be a link: a profile
-        whose folder points elsewhere has nothing of its own to read."""
+        """The profile folder's real path. Neither it nor ``principals/`` may be a link: a
+        profile whose folder points elsewhere has nothing of its own to read, and a linked
+        ``principals/`` moves every profile at once (the same refusal ``add_profile`` and
+        ``delete_profile`` give)."""
         folder = self.folder
+        if folder.parent.is_symlink():
+            raise CrossPrincipalError(f"{folder.parent}: principals/ is a link; refused")
         if folder.is_symlink():
             raise CrossPrincipalError(
                 f"{self.principal!r}: the profile folder is a link, so its paths would land "
@@ -397,63 +462,81 @@ class Profile:
             ) from None
         return os.path.join(parent, folder.name)
 
-    def path(self, relative: str | os.PathLike[str]) -> Path:
-        """A path inside this profile's folder, checked by name and then through every link it
-        passes. ``CrossPrincipalError`` for anything else; nothing is read beyond the names.
+    def resolve(self, relative: str | os.PathLike[str]) -> Resolved:
+        """Where ``relative`` lands inside this profile's folder, decided once.
 
-        The path returned is the one asked for, under the folder, not its resolution: a link
-        that stays inside the folder is fine to use by its own name.
+        Refused with ``CrossPrincipalError``, before anything is opened: a name that is
+        absolute, empty, ``.``, or has a ``..`` segment (a profile path never needs one);
+        then, walking the name with ``walle.floors``' link walk, any link met that is not
+        itself inside the folder, a landing that is not **strictly** inside the folder — the
+        folder itself, an ancestor, a sibling principal, ``shared/``, anywhere else — and a
+        walk that cannot finish (a loop, a name that cannot be read).
         """
         given = os.fspath(relative)
-        if not given.strip() or given.strip() == ".":
-            raise CrossPrincipalError(f"{self.principal!r}: a profile path names a file or folder")
-        if os.path.isabs(given) or "\x00" in given:
+        segments = [p for p in given.split(os.sep) if p not in ("", ".")]
+        if not segments or os.path.isabs(given) or "\x00" in given:
             raise CrossPrincipalError(
-                f"{self.principal!r}: {given!r} is not a path inside the profile folder"
+                f"{self.principal!r}: {given!r} is not a name inside the profile folder"
             )
-        folder = os.fspath(self.folder)
-        by_name = os.path.normpath(os.path.join(folder, given))
-        if not _inside(by_name, folder) or by_name == folder:
+        if ".." in segments:
             raise CrossPrincipalError(
-                f"{self.principal!r}: {given!r} leaves the profile folder; refused"
+                f"{self.principal!r}: {given!r} climbs with '..'; a profile path never needs to"
             )
         real_folder = self._real_folder()
-        trail = _walk(real_folder, given.split(os.sep))
-        if trail is None:
+        walked = walk_links(os.path.join(real_folder, *segments))
+        if walked is None:
             raise CrossPrincipalError(
                 f"{self.principal!r}: {given!r} cannot be resolved (a link loop, or a link "
                 "that cannot be read), so where it lands is unknown; refused"
             )
-        for stood in trail:
-            # Standing inside the folder is the point; standing on an ancestor is passing
-            # through on the way down an absolute link, and reads nothing of anyone's.
-            # Anywhere else — a sibling principal, shared/, outside the root — is refused.
-            if not (_inside(stood, real_folder) or _inside(real_folder, stood)):
+        hops, landing = walked
+        for hop in hops:
+            # The link must sit inside the folder, and so must what it points at: a link to
+            # an ancestor that the rest of the name climbs back down from would otherwise
+            # pass by its landing while standing, for a moment, above the folder.
+            hop_lands = walk_links(hop)
+            if (
+                not _strictly_inside(hop, real_folder)
+                or hop_lands is None
+                or not _strictly_inside(hop_lands[1], real_folder)
+            ):
                 raise CrossPrincipalError(
-                    f"{self.principal!r}: {given!r} leaves the profile folder through a link; "
-                    "refused"
+                    f"{self.principal!r}: {given!r} passes through a link that leaves the "
+                    "profile folder; refused"
                 )
-        if trail[-1] == real_folder:
+        if not _strictly_inside(landing, real_folder):
             raise CrossPrincipalError(
-                f"{self.principal!r}: {given!r} resolves to the profile folder itself; refused"
+                f"{self.principal!r}: {given!r} lands outside the profile folder; refused"
             )
-        return Path(by_name)
+        below = landing[len(real_folder) :].strip(os.sep)
+        return Resolved(given, real_folder, tuple(below.split(os.sep)))
+
+    def path(self, relative: str | os.PathLike[str]) -> Path:
+        """Where ``relative`` lands, as a path: the resolved one, so what is checked is what
+        is used. ``CrossPrincipalError`` as ``resolve`` gives."""
+        return Path(self.resolve(relative).real)
 
     def open(self, relative: str | os.PathLike[str], mode: str = "rb") -> IO[Any]:
-        """``open`` on ``self.path(relative)``. The check happens first; the open is the
-        standard one."""
-        return open(self.path(relative), mode)
+        """Open where ``relative`` lands, following no link at open time: the resolved
+        components are opened one by one relative to the folder's descriptor, each
+        ``O_NOFOLLOW``. Modes are ``r``, ``w``, ``a``, ``x``, binary or text."""
+        kind, text = mode.replace("b", ""), "b" not in mode
+        if kind not in _MODES:
+            raise ValueError(f"mode {mode!r} is not one of r, w, a, x (with or without b)")
+        resolved = self.resolve(relative)
+        fd = _open_below(resolved.folder, resolved.parts, _MODES[kind])
+        return open(fd, mode if not text else kind, encoding="utf-8" if text else None)
 
     def records(self) -> tuple[Record, ...]:
         """This folder's log, indexed and up to date: the only input fusion gets (D28).
 
-        ``log/`` and every stream file in it go through ``path`` first, so a stream that is a
-        link into another folder is refused before the index reads a byte of it.
+        ``log/`` and every stream file in it are resolved first, so a stream that is a link
+        into another folder is refused before the index reads a byte of it.
         """
         log = self.path(LOG_DIRNAME)
         if log.is_dir():
             for entry in sorted(os.listdir(log)):
-                self.path(os.path.join(LOG_DIRNAME, entry))
+                self.resolve(os.path.join(LOG_DIRNAME, entry))
         return index.update(self.context.root, self.context.principal).records
 
     def resolution(self) -> Resolution:
@@ -505,10 +588,6 @@ class Deleted:
     files: int
     links: int
     folders: int
-
-
-_DIR_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0)
-"""How a folder is opened before it is entered: never through a link."""
 
 
 def _remove_tree(fd: int) -> tuple[int, int, int]:
@@ -611,16 +690,18 @@ class Shared:
         return self.capability_dir(kind) / name
 
 
-def _data_shaped(relative: Path) -> str | None:
-    """Why a profile-relative source is data, or ``None`` when it may be a capability."""
-    parts = relative.parts
-    if parts and parts[0] in DATA_PLACES:
-        return f"{parts[0]}/ holds data, never a capability"
-    if relative.name in (INDEX_FILENAME, INDEX_LOCK_FILENAME):
+def _data_shaped(folded: tuple[str, ...]) -> str | None:
+    """Why a resolved, case-folded profile-relative location is data, or ``None`` when it may
+    be a capability. Decided on where a name lands, never on how it was spelled."""
+    if not folded:
+        return "the profile folder itself"
+    if folded[0] in DATA_PLACES:
+        return f"{folded[0]}/ holds data, never a capability"
+    if folded[-1] in (INDEX_FILENAME, INDEX_LOCK_FILENAME):
         return "the index is derived data"
-    suffixes = "".join(relative.suffixes[-2:]).lower()
+    name = folded[-1]
     for suffix in DATA_SUFFIXES:
-        if suffixes.endswith(suffix):
+        if name.endswith(suffix):
             return f"a {suffix} file is a log, an index or a lock, not a capability"
     return None
 
@@ -646,22 +727,22 @@ def publish(
     switch. Any role may publish; what makes it the owner's act is that the source is
     resolved inside the publisher's profile and nowhere else (D32 rule 1).
 
-    ``SharedDataError`` for a kind that is not a capability or a source that is data (D33);
-    ``CrossPrincipalError`` for a source outside the folder, by name or through a link;
-    ``FileExistsError`` when ``shared/<kind>/<name>`` is already there (hard constraint 2).
-    All raised before anything is written.
+    ``SharedDataError`` for a kind that is not a capability, or a source whose resolved,
+    case-folded location is data or is not one regular file (D33); ``CrossPrincipalError``
+    for a source that lands outside the folder, by name or through a link, or for a
+    ``shared/`` that is a link; ``FileExistsError`` when ``shared/<kind>/<name>`` is already
+    there (hard constraint 2); ``FileNotFoundError`` for a source that is not there. All of
+    these, and the open of the source, come before the first write.
     """
     _require_on(environ)
     profile = Profile(context)
     wanted = _require_kind(kind)
-    path = profile.path(source)
-    relative = path.relative_to(profile.folder)
-    if (why := _data_shaped(relative)) is not None:
-        raise SharedDataError(f"{relative}: {why} (D33)")
-    if not path.is_file():
-        raise SharedDataError(f"{relative}: a capability is one regular file")
+    resolved = profile.resolve(source)
+    where = "/".join(resolved.parts)
+    if (why := _data_shaped(resolved.folded)) is not None:
+        raise SharedDataError(f"{where}: {why} (D33)")
     shared = Shared(profile.context.root)
-    destination = shared.capability_path(wanted, path.name)
+    destination = shared.capability_path(wanted, resolved.parts[-1])
     for folder in (shared.folder, destination.parent):
         if folder.is_symlink():
             raise CrossPrincipalError(
@@ -673,15 +754,27 @@ def publish(
             f"{destination}: already published; a new version is a new file name, nothing in "
             "shared/ is replaced"
         )
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    # The source is opened without following a final link: ``path`` checked the name, and
-    # this makes the open agree with the check even if the name changed in between.
-    src_fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    with open(src_fd, "rb") as src, open(destination, "xb") as out:
+    # The source is opened on its resolved components, following no link, before any write.
+    src_fd = _open_below(resolved.folder, resolved.parts, os.O_RDONLY)
+    try:
+        if not stat.S_ISREG(os.fstat(src_fd).st_mode):
+            raise SharedDataError(f"{where}: a capability is one regular file")
+        # First write: the kind folder, then the file, both relative to the root's descriptor
+        # and following no link; the file is created exclusively.
+        out_fd = _open_below(
+            os.fspath(shared.root),
+            (SHARED_DIRNAME, wanted, resolved.parts[-1]),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            mkdirs=True,
+        )
+    except BaseException:
+        os.close(src_fd)
+        raise
+    with open(src_fd, "rb") as src, open(out_fd, "wb") as out:
         shutil.copyfileobj(src, out)
         out.flush()
         os.fsync(out.fileno())
-    return Published(profile.principal, wanted, path, destination)
+    return Published(profile.principal, wanted, Path(resolved.real), destination)
 
 
 @dataclass(frozen=True)
@@ -698,6 +791,8 @@ def audit_shared(root: Path | str) -> tuple[Stray, ...]:
     capability kind, a link anywhere (it could lead into a profile), and a data-shaped file
     anywhere. Reads names only. Empty when ``shared/`` is clean or absent."""
     shared = Shared(root).folder
+    if shared.is_symlink():
+        return (Stray(".", "shared/ itself is a link; it must be a folder of its own"),)
     if not shared.is_dir():
         return ()
     strays: list[Stray] = []
@@ -712,6 +807,8 @@ def audit_shared(root: Path | str) -> tuple[Stray, ...]:
             continue
         if path.is_symlink():
             strays.append(Stray(relative.as_posix(), "a link; shared/ holds files only"))
-        elif (why := _data_shaped(Path(*relative.parts[1:]))) is not None:
+        elif len(relative.parts) == 1:
+            continue  # the kind folder itself
+        elif (why := _data_shaped(tuple(p.lower() for p in relative.parts[1:]))) is not None:
             strays.append(Stray(relative.as_posix(), why))
     return tuple(strays)
