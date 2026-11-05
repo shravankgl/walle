@@ -1,0 +1,12 @@
+{"actor":"ines","caused_by":[],"name":"water-plants","seq":1,"title":"Remind me to water the plants on Sunday","ts":"2026-09-01T09:00:00.000000+00:00","type":"automation","v":1,"verb":"add"}
+{"actor":"ines","caused_by":[],"name":"bin-night","seq":2,"title":"Tell me on Tuesday evening which bins go out","ts":"2026-09-01T10:00:00.000000+00:00","type":"automation","v":1,"verb":"add"}
+{"actor":"ines","caused_by":[],"name":"school-run","seq":3,"title":"Text the school-run rota every Monday","ts":"2026-09-01T11:00:00.000000+00:00","type":"automation","v":1,"verb":"add"}
+{"actor":"ines","caused_by":[],"name":"pay-rent","seq":4,"title":"Remind me the rent is due","ts":"2026-10-01T09:00:00.000000+00:00","type":"automation","v":1,"verb":"add"}
+{"actor":"kernel","caused_by":[],"note":"reminder sent","result":"ok","seq":5,"target":"d-mbp:1","ts":"2026-09-28T09:00:00.000000+00:00","type":"outcome","v":1}
+{"actor":"kernel","caused_by":[],"result":"ok","seq":6,"target":"d-mbp:2","ts":"2026-09-05T09:00:00.000000+00:00","type":"outcome","v":1}
+{"actor":"ines","caused_by":[],"note":"the council collects on a new day","seq":7,"target":"d-mbp:2","ts":"2026-09-12T09:00:00.000000+00:00","type":"automation","v":1,"verb":"retire"}
+{"actor":"kernel","caused_by":[],"note":"rota sent","result":"ok","seq":8,"target":"d-mbp:3","ts":"2026-09-27T09:00:00.000000+00:00","type":"outcome","v":1}
+{"actor":"kernel","caused_by":[],"note":"the rota file was missing","result":"failed","seq":9,"target":"d-mbp:3","ts":"2026-09-29T09:00:00.000000+00:00","type":"outcome","v":1}
+{"actor":"ines","caused_by":[],"reason":"the rota never arrived","seq":10,"target":"d-mbp:8","ts":"2026-09-30T09:00:00.000000+00:00","type":"supersede","v":1}
+{"actor":"kernel","caused_by":[],"note":"names an outcome, not an add","result":"ok","seq":11,"target":"d-mbp:5","ts":"2026-10-02T09:00:00.000000+00:00","type":"outcome","v":1}
+{"actor":"ines","caused_by":[],"note":"paid on time","result":"ok","seq":12,"target":"d-mbp:4","ts":"2026-10-08T09:00:00.000000+00:00","type":"outcome","v":1}
