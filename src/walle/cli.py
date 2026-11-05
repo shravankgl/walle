@@ -14,6 +14,7 @@ from walle import __version__
 from walle import context as walle_context
 from walle import hot as walle_hot
 from walle import index as walle_index
+from walle import models as walle_models
 from walle import observer as walle_observer
 from walle import proposer as walle_proposer
 from walle import staging as walle_staging
@@ -476,6 +477,17 @@ def context_command(root: Path, principal: str, device: str) -> None:
 # --- the proposer (tasks 16-18) ---------------------------------------------------------
 
 
+def _model_name(_ctx: click.Context, _param: click.Parameter, value: str) -> str:
+    """``--model``: ``fake`` or ``provider:model``. Only the name is checked here; the client
+    is built when a run needs one, so ``--score`` reads the shadow log with no provider."""
+    if value != "fake":
+        try:
+            walle_models.ProviderModel(value)
+        except ValueError as exc:
+            raise click.BadParameter(f"{exc} (e.g. `ollama:llama3.1:8b`, D87)") from None
+    return value
+
+
 @main.command("propose")
 @_ROOT
 @click.option("--principal", required=True, help="Whose log to read, without the p- prefix.")
@@ -483,9 +495,11 @@ def context_command(root: Path, principal: str, device: str) -> None:
 @click.option(
     "--model",
     required=True,
-    type=click.Choice(sorted(walle_proposer.MODELS)),
-    help="Only `fake` exists yet: deterministic, offline, proposes the person's own lasting "
-    "statements. A provider adapter is a later task.",
+    callback=_model_name,
+    help="`fake` (deterministic, offline), or provider:model through aisuite: "
+    "`ollama:<model>` for the local tier, `openrouter:<author>/<model>:free`, "
+    "`openai:<model>`. The provider's key comes from its own environment variable. "
+    "A failed call is not retried.",
 )
 @click.option(
     "--score",
@@ -508,9 +522,13 @@ def propose_command(root: Path, principal: str, device: str, model: str, score: 
                 f"{result.missed} would have dropped a kept item), {result.pending} still staged."
             )
             return
-        report = walle_proposer.propose(root, principal, device, walle_proposer.MODELS[model]())
-    except walle_proposer.ModelReplyError as exc:
-        raise click.ClickException(f"nothing written: {exc}") from exc
+        report = walle_proposer.propose(root, principal, device, walle_models.resolve(model))
+    except (
+        walle_models.ModelUnavailable,
+        walle_proposer.ModelReplyError,
+        walle_proposer.ModelCallError,
+    ) as exc:
+        raise click.ClickException(f"nothing written: {exc}") from None
     except _LOG_ERRORS as exc:
         raise click.ClickException(_describe(exc)) from exc
 
