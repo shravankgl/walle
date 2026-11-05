@@ -47,6 +47,7 @@ ALONE: dict[str, tuple[str, ...]] = {
     "account-password": (hazards.SECRET,),
     "door-code": (hazards.SECRET,),
     "passphrase": (hazards.SECRET,),
+    "joined-passphrase": (hazards.SECRET,),
     "card-security-code": (hazards.SECRET,),
     "code-on-next-line": (hazards.SECRET,),
     "neighbour-contact": (hazards.CONTACT,),
@@ -186,9 +187,38 @@ def test_forged_turn_is_its_own_kind_and_boundary_is_the_markers() -> None:
         "pin: 0427",
         "My password is hunter2",
         "The code for the\ngarden gate is 4821, for the childminder.",
+        # Issue #59: the words of a passphrase joined by hyphens, dots or underscores are
+        # still its words. No digit, no quote, no space between them.
+        "My passphrase is correct-horse-battery-staple",
     ],
 )
 def test_a_named_secret_with_a_value_given_is_flagged(text: str) -> None:
+    assert hazards.SECRET in hazards.flag(text), text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # The exact string from issue #59, then the same value with each joiner the issue
+        # names, after a passphrase and after a password, with a colon, and mixed.
+        "My passphrase is correct-horse-battery-staple",
+        "My passphrase is correct.horse.battery.staple",
+        "My passphrase is correct_horse_battery_staple",
+        "My password is correct-horse-battery-staple",
+        "My password is correct.horse.battery.staple",
+        "My password is correct_horse_battery_staple",
+        "password: correct-horse-battery-staple",
+        "passphrase=correct-horse-battery-staple",
+        "The passphrase for the backup drive is correct-horse_battery.staple, keep it safe.",
+        "user: My router passphrase is Correct-Horse-Battery-Staple.\nassistant: Noted.",
+        "My passphrase is correct-horse-battery-staple. Keep it with the other notes.",
+        "The door code is one-two-three-four",
+    ],
+)
+def test_a_secret_whose_words_are_joined_is_still_given(text: str) -> None:
+    """The secret detector alone catches it: a joined passphrase has no digit for the
+    code-token rule and no space for the words rule, and must not lean on anything else."""
+    assert hazards.DETECTORS[hazards.SECRET](text), text
     assert hazards.SECRET in hazards.flag(text), text
 
 
@@ -207,6 +237,14 @@ def test_a_named_secret_with_a_value_given_is_flagged(text: str) -> None:
         "What is the pin\nassistant: I do not know it.",
         "The password is the same as before.",
         "My password's fine, it's in the manager and I've not changed it.",
+        # Issue #59: a hyphenated word that describes the secret is not its value. English
+        # joins two words this way all the time; a value is three or more.
+        "the passphrase is long-winded and kept in the drawer",
+        "The passphrase is long-winded.",
+        "My password is well-known to the whole family, I should change it.",
+        "The wifi password is re-used on the printer, which is bad.",
+        "My e-mail password is in the manager.",
+        "The passphrase is on the router's label, next to the serial no.",
     ],
 )
 def test_a_secret_named_but_not_given_is_not_flagged(text: str) -> None:
