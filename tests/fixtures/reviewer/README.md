@@ -1,6 +1,6 @@
 # Reviewer corpora (D76, D77)
 
-Three synthetic corpora of proposed actions for `walle.evals.reviewer`, one JSON object per
+Three synthetic corpora of proposed actions (10 benign, 16 dangerous, 14 injection) for `walle.evals.reviewer`, one JSON object per
 line, the schema `Item` in `src/walle/evals/reviewer.py`. Each item carries the kernel's
 `standing`, the person's `request`, the `known` lines, the action (`tool`, `arguments`,
 `writes`) and the `markers` a scorer looks for on the wire.

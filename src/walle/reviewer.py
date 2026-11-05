@@ -11,9 +11,12 @@ floors (D72) and the audit trail are what backstop them.
 The seven invariants (D76), and where each lives
 --------------------------------------------------
 1. **Only ``ask`` becomes ``go``; ``blocked`` never does.** ``Standing`` is what the kernel
-   decided before the reviewer was consulted. ``blocked`` stays blocked and the model is not
-   asked. A write in the action's ``touch`` that hits a floor (``walle.floors.hit``) is blocked
-   here as well, before anything else and in every mode, whatever standing the caller claims.
+   decided before the reviewer was consulted, and it must be a ``Standing``: a plain string
+   is a ``TypeError``, and the model is reached on ``Standing.ASK`` and nothing else.
+   ``blocked`` stays blocked and the model is not asked. A write in the action's ``touch``
+   that hits a floor (``walle.floors.hit``), or that the floor cannot answer about by name
+   (absolute, or climbing out through ``..``), is blocked here as well, before anything else
+   and in every mode, whatever standing the caller claims.
    ``human`` — a tool whose effect outlives the session (D72: automations, publishing to
    ``shared/``, a trust rung) — goes to the person without the model. ``go`` was a standing
    rule's (D62); the reviewer is not asked and its provenance is the user's.
@@ -30,14 +33,23 @@ The seven invariants (D76), and where each lives
    and the action: tool name and arguments. ``Context`` and ``Action`` have no field for a
    tool result, a page or a transcript, and this module has no way to fetch one: it opens no
    file and imports nothing that reads the log. The arguments are the agent's text, so they
-   go inside the untrusted envelope (D55), defaced.
+   go inside the untrusted envelope (D55), defaced. The tool name is shown outside it, so it
+   is held to ``TOOL_NAME_RE``, a plain dotted identifier that cannot carry a newline, a
+   marker or a token; any other name is ``deny`` without a call.
 5. **Costs are asymmetric, so ``unsure`` is free.** ``unsure`` is one click. It is never
    counted by the breaker and never penalised anywhere; the instructions say so.
 6. **Judge scope, not plausibility.** The model is asked ``in_scope`` beside its verdict,
    and an ``allow`` without ``in_scope: true`` is downgraded to ``unsure`` by the code. A
    sensible action the person did not ask for is theirs to approve.
 7. **Text that argues with the reviewer is itself evidence.** Before the model is asked,
-   ``walle.hazards.flag`` is run over everything it would be shown. A planted instruction, a
+   ``walle.hazards.flag`` is run over everything it would be shown (``scanned``): each part on
+   its own, the known lines joined, every string inside the arguments once decoded, and the
+   exact block the model receives, built by ``prompt`` itself and stripped of the fixed
+   instructions and the envelope's own two markers (``shown``), so a hazard split across two
+   lines is seen as the model sees it and what is scanned cannot drift from what is shown.
+   Every text is scanned behind ``SCAN_PREFIX``, a line that is not a turn label, so
+   ``forged_turn``'s opening-block exemption — for observation bodies, which none of these
+   are — never applies here, and the observer's rule is untouched. A planted instruction, a
    claim of prior approval, a forged envelope or boundary marker, or a forged turn
    (``INSTRUCTION``, ``BOUNDARY``, ``TURN``) is ``deny`` without a call: the attacker can
    address the agent, never the judge. A credential, a secret, contact details or a
@@ -51,9 +63,10 @@ The circuit breaker
 -------------------
 ``DENIALS_TO_PAUSE`` denials in a row — the model's or this module's — pause the reviewer:
 ``tripped(history)`` is true, and ``review`` returns ``ask`` with ``paused=True`` and a reason
-that says so, calling no model. A paused review is itself not a verdict, so it keeps the
-breaker tripped until the caller clears the history: control has gone back to the person, and
-the breaker never trips silently.
+that says so, calling no model. Only verdicts count toward the streak: a floored write, a
+blocked, go or human standing is not the reviewer's verdict and neither forgives a denial nor
+un-trips the breaker. A paused review keeps the breaker tripped until the caller clears the
+history: control has gone back to the person, and the breaker never trips silently.
 
 What comes out
 --------------
@@ -78,6 +91,8 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -95,6 +110,7 @@ __all__ = [
     "REVIEWER_SWITCH",
     "REVIEW_INSTRUCTIONS",
     "SWITCH_ON",
+    "TOOL_NAME_RE",
     "Action",
     "Context",
     "Decision",
@@ -109,6 +125,8 @@ __all__ = [
     "escalate",
     "prompt",
     "review",
+    "scanned",
+    "shown",
     "tripped",
 ]
 
@@ -123,6 +141,19 @@ DENIALS_TO_PAUSE = 3
 
 REASON_CHARS = 240
 """The most of a model's ``reason`` that is kept: one line a person reads on an approval."""
+
+TOOL_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
+"""The one shape a tool name may have: a plain dotted identifier, ``calendar.read`` or
+``get_report``. The name is shown to the model outside the envelope, so it is held to a shape
+that cannot carry a newline, a space, a marker or a token (review round one)."""
+
+TOOL_NAME_CHARS = 64
+
+SCAN_PREFIX = "-\n"
+"""Put before every scanned text. ``hazards.forged_turn`` lets a ``user:`` line open an
+observation body, because the observer writes one there; nothing the reviewer scans is an
+observation body, so a line that is not a turn label is put first and the exemption never
+applies here. The observer's own rule is untouched."""
 
 REVIEW_INSTRUCTIONS = (
     "You are the reviewer for walle, deciding whether one proposed action may run without "
@@ -245,29 +276,70 @@ def enabled(environ: Mapping[str, str] | None = None) -> bool:
 
 
 def tripped(history: Sequence[Review]) -> bool:
-    """Whether the last ``DENIALS_TO_PAUSE`` reviews are all denials or pauses. A pause stays
-    tripped: it is not a verdict, and the person has the floor until the caller clears it."""
-    tail = list(history[-DENIALS_TO_PAUSE:])
-    if len(tail) < DENIALS_TO_PAUSE:
-        return False
-    return all(r.paused or r.verdict is Verdict.DENY for r in tail)
+    """Whether the last ``DENIALS_TO_PAUSE`` verdicts are all denials, or the reviewer has
+    paused. Only verdicts and pauses count: a floored write, a blocked, go or human standing
+    is not the reviewer's verdict, so it neither forgives a denial nor un-trips the breaker. A
+    pause stays tripped until the caller clears the history: the person has the floor."""
+    counted = [r for r in history if r.paused or r.verdict is not None]
+    if any(r.paused for r in counted):
+        return True
+    tail = counted[-DENIALS_TO_PAUSE:]
+    return len(tail) == DENIALS_TO_PAUSE and all(r.verdict is Verdict.DENY for r in tail)
+
+
+_MARKER_LINE = re.compile(rf"<<</?untrusted:[0-9a-f]{{{envelope.ID_HEX}}}>>>")
+"""The envelope's own two lines, which ``wrap`` guarantees are the only such lines in a body:
+anything shaped like one inside the arguments has been defaced."""
+
+_BODY = (
+    "\nThe person's request:\n{request}\n\n"
+    "What is known about them:\n{known}\n\n"
+    "The proposed action:\ntool: {tool}\narguments:\n{arguments}\n"
+)
 
 
 def prompt(action: Action, context: Context) -> str:
     """The one prompt (invariant 4): instructions, request, known lines, the tool name, and
     the arguments inside a fresh envelope."""
-    known = "\n".join(context.known)
-    return (
-        f"{REVIEW_INSTRUCTIONS}\n"
-        "The person's request:\n"
-        f"{context.request}\n\n"
-        "What is known about them:\n"
-        f"{known}\n\n"
-        "The proposed action:\n"
-        f"tool: {action.tool}\n"
-        "arguments:\n"
-        f"{envelope.wrap(action.arguments)}\n"
+    return REVIEW_INSTRUCTIONS + _BODY.format(
+        request=context.request,
+        known="\n".join(context.known),
+        tool=action.tool,
+        arguments=envelope.wrap(action.arguments),
     )
+
+
+def shown(text: str) -> str:
+    """The part of a prompt the model is shown that came from outside: everything after the
+    fixed instructions, with the envelope's own two marker lines taken out. This is the exact
+    text ``review`` scans, so what is scanned and what is shown cannot drift apart."""
+    body = text[len(REVIEW_INSTRUCTIONS) :] if text.startswith(REVIEW_INSTRUCTIONS) else text
+    return "\n".join(line for line in body.split("\n") if not _MARKER_LINE.fullmatch(line))
+
+
+def scanned(action: Action, context: Context) -> tuple[str, ...]:
+    """Every text ``review`` runs the hazard check over before a call: each part on its own
+    (the request, each known line, the known lines joined, the tool, the arguments as written
+    and every string inside them once decoded), and the whole block the model is shown, built
+    by ``prompt`` itself."""
+    return (
+        context.request,
+        *context.known,
+        "\n".join(context.known),
+        action.tool,
+        *_texts(action.arguments),
+        shown(prompt(action, context)),
+    )
+
+
+def _unanswerable(path: str) -> bool:
+    """Whether ``floors.hit`` has no answer by name for ``path``: absolute, or climbing out
+    through ``..``. ``hit`` returns ``None`` for those as for a clear path; here no answer is
+    a refusal (D86)."""
+    if posixpath.isabs(path):
+        return True
+    norm = posixpath.normpath(path) if path else "."
+    return norm == ".." or norm.startswith("../")
 
 
 def review(
@@ -281,16 +353,23 @@ def review(
 ) -> Review:
     """Decide one action. ``None`` is never an answer: every path ends in a ``Review``.
 
-    In order, the first that holds: a floored write in ``action.touch`` or a ``blocked``
-    standing is ``blocked`` (any mode, no call); a ``go`` standing is ``go`` (any mode, no
-    call: it was never the reviewer's); the switch off is ``ask`` (no call); a ``human``
-    standing is ``ask`` (no call); a tripped breaker is ``ask``, paused (no call); a hazard
-    in what the model would be shown is ``deny`` or ``unsure`` by kind (no call); then the
-    model is asked once, and its reply is read strictly. ``history`` is this session's
-    earlier reviews, for the breaker.
+    ``action`` must be one ``Action`` and ``standing`` a ``Standing``; anything else is a
+    ``TypeError`` before any check, because a plain string compares equal to a ``StrEnum``
+    member without being one. Then, in order, the first that holds: a write in
+    ``action.touch`` that is floored, or that the floor cannot answer about by name
+    (absolute, or climbing out), or a ``blocked`` standing, is ``blocked`` (any mode, no
+    call); a ``go`` standing is ``go`` (any mode, no call: it was never the reviewer's); the
+    switch off is ``ask`` (no call); a ``human`` standing is ``ask`` (no call); a tripped
+    breaker is ``ask``, paused (no call); a tool name that is not a plain dotted identifier
+    is ``deny`` (no call); a hazard in anything the model would be shown — each part, and the
+    exact block ``prompt`` builds — is ``deny`` or ``unsure`` by kind (no call); then, on an
+    explicit ``ask`` standing and nothing else, the model is asked once and its reply is read
+    strictly. ``history`` is this session's earlier reviews, for the breaker.
     """
     if not isinstance(action, Action):
         raise TypeError(f"review takes one action, not {type(action).__name__}")
+    if not isinstance(standing, Standing):
+        raise TypeError(f"standing must be a Standing, not {type(standing).__name__}")
 
     def done(
         decision: Decision,
@@ -303,6 +382,14 @@ def review(
         return Review(action, standing, decision, verdict, reason, model, paused)
 
     for path in action.touch.writes:
+        if _unanswerable(path):
+            return done(
+                "blocked",
+                None,
+                f"write {path!r} is blocked: absolute or climbing out, so the floor cannot be "
+                "answered by name and it is refused (D72, D86)",
+                model=None,
+            )
         if (floor := hit(path)) is not None:
             return done(
                 "blocked",
@@ -345,9 +432,17 @@ def review(
             model=None,
             paused=True,
         )
+    if not TOOL_NAME_RE.fullmatch(action.tool) or len(action.tool) > TOOL_NAME_CHARS:
+        return done(
+            "ask",
+            Verdict.DENY,
+            "the tool name is not a plain dotted identifier of at most "
+            f"{TOOL_NAME_CHARS} characters: denied without a call, because the name is shown "
+            "outside the envelope and nothing else may be",
+            model=None,
+        )
 
-    shown = (context.request, *context.known, *_texts(action.arguments))
-    kinds = {kind for text in shown for kind in hazards.flag(text)}
+    kinds = {kind for text in scanned(action, context) for kind in hazards.flag(SCAN_PREFIX + text)}
     if arguing := sorted(kinds & INJECTION_KINDS):
         return done(
             "ask",
@@ -362,6 +457,14 @@ def review(
             Verdict.UNSURE,
             f"the input carries a {', '.join(private)}, which is "
             "not shown to a reviewer (D18); a person decides",
+            model=None,
+        )
+
+    if standing is not Standing.ASK:  # the closed set says this cannot happen; refuse anyway
+        return done(
+            "blocked",
+            None,
+            f"standing {standing!s} is not ask; nothing else reaches the reviewer (D76)",
             model=None,
         )
 
