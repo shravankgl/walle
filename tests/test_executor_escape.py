@@ -22,7 +22,8 @@ What is attempted, and what must hold, each in its own test:
   gain a privilege                 ``NoNewPrivs`` is set on the process
   reach the network                the only interface is ``lo``
   outgrow the caps                 the cgroup reports the declared memory, CPU and PID limits,
-                                   and a fork storm dies at the PID cap before it completes
+                                   and a fork storm has refused forks counted in pids.events
+                                   and a pids.peak no higher than the cap
   outlive the timeout              a command that sleeps past the timeout is killed and its
                                    container is gone afterwards
   survive the parent               a container left behind under the label, as a crashed
@@ -261,20 +262,32 @@ def test_the_pid_cap_is_the_one_declared(workspace: Path) -> None:
 
 
 def test_a_fork_storm_is_cut_off_at_the_pid_cap(workspace: Path) -> None:
-    """Sixty forks against a cap of twenty. The shell is the witness: busybox ``ash`` ends a
-    non-interactive script on a failed fork, so a storm the cap cuts off never reaches its
-    last line, and the error names the fork. Without the cap all sixty would start and the
-    script would finish with ``storm-complete`` and exit 0."""
+    """Sixty forks against a cap of twenty, in a subshell, so the outer shell survives to read
+    the counters. busybox ``ash`` aborts a non-interactive shell on its first failed fork
+    (``sh: can't fork: Resource temporarily unavailable``, exit 2), so the subshell dies before
+    its ``wait``; the ``sleep 4`` afterwards lets the forks that did start drain, so ``cat`` can
+    fork again. The cgroup is the witness: ``pids.events`` counts every refused fork under
+    ``max`` (the first Mac run measured ``max 1`` at a cap of 20 and ``max 0`` at 200), and
+    ``pids.peak``, where the kernel has it, never exceeds the cap. The outer shell must exit 0:
+    a non-zero exit here is the harness failing, not the boundary holding."""
     outcome = _sh(
         workspace,
-        "for i in $(seq 1 60); do sleep 3 & done; echo storm-complete",
+        "( for i in $(seq 1 60); do sleep 3 & done; wait ) 2>/dev/null; sub=$?; sleep 4; "
+        "echo sub-exit=$sub; "
+        "cat /sys/fs/cgroup/pids.events 2>/dev/null || cat /sys/fs/cgroup/pids/pids.events; "
+        "if cat /sys/fs/cgroup/pids.peak 2>/dev/null; then echo peak-present; fi",
         pids=20,
         timeout_s=60,
     )
-    assert outcome.exit_code != 0, outcome.stdout
-    assert "storm-complete" not in outcome.stdout
-    words = outcome.stderr.lower()
-    assert "fork" in words or "resource temporarily unavailable" in words, outcome.stderr
+    assert outcome.exit_code == 0, outcome.stderr
+    lines = outcome.stdout.strip().splitlines()
+    assert lines[0].startswith("sub-exit="), outcome.stdout
+    assert lines[0] != "sub-exit=0", "the subshell should have died on a failed fork"
+    events = dict(line.split() for line in lines[1:] if line.startswith("max "))
+    assert int(events["max"]) > 0, outcome.stdout
+    if "peak-present" in lines:
+        peak = int(lines[lines.index("peak-present") - 1])
+        assert peak <= 20, outcome.stdout
 
 
 # --- outlive the timeout ----------------------------------------------------------------------

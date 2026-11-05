@@ -5,13 +5,12 @@ task (R8). Nothing in this build calls it: there is still no runner, and the swi
 is the executor a runner will hand a step to once `admit` (task 68) has let it through, and the
 exact shape of the container it gets.
 
-**The escape attempts have not run on the Mac.** This VM has no `docker` client and no daemon,
-so every test in `tests/test_executor_escape.py` skipped here, with that reason. They did run on
-GitHub's Linux runner, which turned out to have a daemon (see *Fourth commit*): on the third
-commit 17 of 19 passed there and 2 failed for one reason, now fixed. That is a Linux kernel
-under Docker Engine, not the owner's machine under OrbStack; the issue asks for the Mac run
-before this merges — see *Verify* for the one command. Nothing below claims the boundary holds
-on the Mac.
+**The escape attempts have run once on the Mac, at the first commit: 18 of 19 passed** (see
+*First Mac run*). This VM has no `docker` client and no daemon, so every test in
+`tests/test_executor_escape.py` skipped here, with that reason. They also run on GitHub's Linux
+runner, which turned out to have a daemon (see *Fourth commit*). The one Mac failure was the
+test's fault, fixed in the fifth commit; the Mac has not yet run the head that carries the
+fixes, and the issue asks for that run before this merges — see *Verify* for the one command.
 
 **Shipped:**
 - `src/walle/executor.py`, new, about 370 lines, half of them docstring. Imports `os`, `re`,
@@ -68,8 +67,9 @@ on the Mac.
   `CapEff`, `CapPrm` and `CapBnd` all zero; `mount` fails; `chown` on a writable `/tmp` file
   fails (only the missing `CAP_CHOWN` refuses that one); `NoNewPrivs: 1`; `lo` the only
   interface and a connection out fails; `memory.max`, `cpu.max` and `pids.max` read back as
-  declared (cgroup v1 paths as fallback); a sixty-fork storm against a cap of twenty dies
-  before its last line, with the fork named in stderr (see the second commit, below); a
+  declared (cgroup v1 paths as fallback); a sixty-fork storm against a cap of twenty, run in a
+  subshell, leaves a refused count above zero in `pids.events` and a `pids.peak` no higher than
+  the cap (see the fifth commit, below); a
   `sleep 60` under a 3 s timeout is killed, removed, and absent from `docker ps`; a container
   left under the label by the CLI directly, as a crashed parent would leave one, is found and
   removed by `reap`. One positive test — a write inside the workspace reaches the host — so the
@@ -219,6 +219,38 @@ uv run ruff format --check  138 files already formatted
 uv run pyright              0 errors, 0 warnings, 0 informations
 ```
 
+**First Mac run, by the owner, and the fifth commit.** OrbStack, Docker 29.8.2, at head
+`14109d85` (the first commit, before the four fixes above): **18 passed, 1 failed, no containers
+left behind.** The failure was `test_a_fork_storm_is_cut_off_at_the_pid_cap`, exit 2 with empty
+stderr — the first commit's version, which ran the storm in the main shell and then `wait; cat
+pids.events`. The owner's diagnosis, confirmed by hand at `--pids-limit 20`: busybox `ash`
+aborts on its first failed fork (`sh: can't fork: Resource temporarily unavailable`), so the
+script exits 2 before the `cat`, and the `2>/dev/null` hid the message. Running the storm in a
+subshell gives sub-exit 2, `pids.max=20`, `max 1` in `pids.events`, `pids.peak=20`; a control at
+`--pids-limit 200` gives `max 0`. A test bug, not a boundary failure: the cap held.
+
+So the 17 of 19 on CI and the 18 of 19 on the Mac are consistent — CI's two were the
+root-without-`CAP_DAC_OVERRIDE` pair, and its fork-storm test was already the second commit's
+rewrite; the Mac ran the first commit's. The fifth commit rewrites the test the owner's way and
+touches nothing in `executor.py`: the storm runs in a subshell `( … ; wait ) 2>/dev/null`, so the
+outer shell survives; `sleep 4` lets the forks that did start drain so `cat` can fork; then the
+outer shell prints the subshell's exit, `pids.events`, and `pids.peak` when the kernel has it.
+Asserted: the outer shell exits 0 (strict — a non-zero exit is the harness failing, not the
+boundary holding), the subshell did not exit 0, `max` in `pids.events` is above 0, and
+`pids.peak` is at most 20 when present. The second commit's "the shell is the witness" reading
+was true but weaker: it proved the shell died, not that the cgroup refused anything.
+
+```
+uv run pytest               2161 passed, 29 skipped
+uv run ruff check           All checks passed!
+uv run ruff format --check  138 files already formatted
+uv run pyright              0 errors, 0 warnings, 0 informations
+```
+
+The Mac has not run the current head. Commits two to five are what it will see new: the
+subshell fork storm, removal judged by the listing, and `--user <workspace owner>` — the last
+being the one to watch under OrbStack's ownership remap.
+
 **Two-runner walkthrough:** the executor touches no log, lock or derived file. The shared thing
 is the daemon. Writers A and B each `run` a job: each makes its own 16-hex token, so the two
 containers have different names and labels and neither `rm -f` can hit the other's. `reap()`
@@ -234,8 +266,9 @@ fixed before commit:
   own failure and the command never started; now a `Refusal`.
 - The fork-storm test measured with `ps | wc -l` *while* the PID cap was full, so `ps` itself
   could not fork and the test would have crashed on empty output. First rewritten to read
-  `pids.events` after `wait`; then, after CI, rewritten again (second commit, above) because
-  `ash` does not survive a failed fork at all.
+  `pids.events` after `wait`; then, after CI, rewritten again (second commit) because `ash`
+  does not survive a failed fork at all; then, after the Mac run, rewritten a third time (fifth
+  commit) to run the storm in a subshell and read the counters from the surviving outer shell.
 - `grep -rl … /` would have matched the test's own command line in `/proc/*/cmdline`; now greps
   the container's folders, not `/proc`.
 - `chown 1234 /etc/passwd` was refused by the read-only root, not by the dropped capability, so
