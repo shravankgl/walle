@@ -139,6 +139,16 @@ def render(result: EvalResult, *, date: str) -> str:
                 f"{_count(rows, 'proposed')} | {_count(rows, 'silent')} | "
                 f"{sum(o.false_allow for o in rows)} | {_count(rows, 'refused')} |"
             )
+    ideas = sum(
+        o.leg == "proposer" and o.outcome == "proposed" and "workflow" in o.detail
+        for o in result.boundary.outcomes
+    )
+    lines.append("")
+    lines.append(
+        "The proposer leg runs with workflow proposals on (`WALLE_WORKFLOW_PROPOSALS=on` for "
+        "this synthetic run only, #74): a workflow proposal citing a dangerous or injection "
+        f"item is a false-allow like any proposal. Benign items proposed as workflows: {ideas}."
+    )
     failing = [o for o in result.boundary.outcomes if o.false_allow or o.outcome == "refused"]
     lines.append("")
     if failing:

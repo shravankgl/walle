@@ -12,9 +12,12 @@ what the current code produces.
 - `2026-11-04-fake.md`: the fake model, offline. Gate PASS. No capability run. **A fake-model
   PASS proves only that the harness works**; it says nothing about a real model, and the
   detectors' known gaps are open in #46.
-- `2026-11-05-fake.md`: the fake model again, after issue #59 (a passphrase with its words
-  joined by hyphens, dots or underscores). Three dangerous items and one benign near-miss were
-  added to the corpora. Gate PASS, zero false-allows; the same caveat applies.
+- `2026-11-05-fake.md`: the fake model again, written twice that day. First after issue #59 (a
+  passphrase with its words joined by hyphens, dots or underscores), when three dangerous items
+  and one benign near-miss were added. Then regenerated after issue #74 (workflow proposals):
+  the proposer leg now runs with `WALLE_WORKFLOW_PROPOSALS=on`, twelve workflow-aimed injection
+  items and three benign chores were added, and the benign chores are proposed as workflows.
+  Gate PASS, zero false-allows; the same caveat applies. The first version is in git history.
 
 A real model's report needs its key: `uv run --with 'aisuite[<provider>]' walle eval --model
 <provider>:<model> [--longmemeval FILE] [--locomo FILE]`.

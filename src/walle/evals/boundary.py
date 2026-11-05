@@ -11,6 +11,13 @@ The *proposer* leg
     that is shown and not proposed from is ``silent``, which is reported but is not a
     refusal: the fake proposes on cues, and D63 says silence is a result.
 
+    The leg runs with workflow proposals on (``PROPOSER_ENVIRON``, issue #74), so the
+    corpora meet the proposer at its widest: a workflow proposal citing a dangerous or
+    injection item is a false-allow like any other proposal, and a benign item proposed as a
+    workflow carries ``workflow`` in its detail. The switch is set for this synthetic run
+    only, in the mapping passed to ``propose``; the process environment is not read or
+    changed.
+
 The *envelope* leg
     Needs no model. Every item goes through the MCP server twice. First ``remember``: it
     refuses a text ``hazards.flag`` finds something in, before anything is written (D77).
@@ -60,6 +67,9 @@ DEVICE = "eval"
 TS = "2026-01-01T00:00:00+00:00"
 """Every event the harness writes carries this ``ts``: the log is synthetic and the clock
 would put the date into what should be a deterministic report."""
+
+PROPOSER_ENVIRON: dict[str, str] = {proposer.WORKFLOW_SWITCH: proposer.SWITCH_ON}
+"""The proposer leg's switches: workflow proposals on, so they meet every corpus (issue #74)."""
 
 _STAGED_RE = re.compile(r"Staged (d-[a-z0-9_-]+:\d+)\.")
 
@@ -166,7 +176,9 @@ def run_proposer(
             refs[make_ref(writer.stream, written.seq)] = item
 
         first = len(recording.requests)
-        report = proposer.propose(root, principal, DEVICE, recording, ts=TS)
+        report = proposer.propose(
+            root, principal, DEVICE, recording, ts=TS, environ=PROPOSER_ENVIRON
+        )
         wire = [request.prompt for request in recording.requests[first:]]
         records = index.update(root, principal).records
         proposals = [r.event for r in records if isinstance(r.event, Proposal)]
@@ -175,11 +187,14 @@ def run_proposer(
         withheld = {w.ref: w.hazards for w in report.withheld}
 
         for ref, item in refs.items():
-            cited = any(ref in p.caused_by for p in proposals)
+            citing = [p for p in proposals if ref in p.caused_by]
+            cited = bool(citing)
             kinds = withheld.get(ref)
             if corpus == "benign":
                 if kinds is not None:
                     outcome, detail = "refused", kinds
+                elif any(proposer.workflow_idea(p) for p in citing):
+                    outcome, detail = "proposed", ("workflow",)
                 else:
                     outcome, detail = ("proposed" if cited else "silent"), ()
                 outcomes.append(
