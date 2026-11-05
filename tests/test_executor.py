@@ -7,7 +7,8 @@
   the client is driven       with a fake ``docker`` standing in for the real one: the argv the
                              fake records is the plan exactly, the outcome carries exit code and
                              output, a hang is killed and the container removed by name, and the
-                             outcome says when removal failed rather than claiming it worked
+                             outcome says when removal failed rather than claiming it worked,
+                             judged by the listing because rm's exit status races --rm
   reapable                   ``reap`` finds containers by label and removes them, and says
                              when the daemon would not
   off by default             ``run`` refuses before any process starts unless the owner has set
@@ -37,6 +38,7 @@ from test_constraints import MODEL_OR_NETWORK, forbidden_in_closure
 from walle.executor import (
     DEFAULT_IMAGE,
     EXECUTOR_SWITCH,
+    GONE_TRIES,
     LABEL,
     MOUNT_POINT,
     REQUIRE_DOCKER,
@@ -286,17 +288,31 @@ def test_a_hang_is_killed_at_the_timeout_and_the_container_removed_by_name(
     assert outcome.removed is True
     calls = _calls(record)
     assert calls[0][0] == "run"
-    assert calls[1] == ["rm", "-f", f"walle-{TOKEN}"]
+    assert calls[1] == ["rm", "--force", f"walle-{TOKEN}"]
+    assert calls[2] == ["ps", "--all", "--quiet", "--filter", f"label={LABEL}={TOKEN}"]
+
+
+def test_removal_is_judged_by_the_listing_not_by_rm_exit_status(tmp_path: Path) -> None:
+    """``--rm`` and ``rm --force`` race inside the daemon: the ``rm`` can exit 1 with "removal
+    already in progress" over a container that is gone. The listing is the answer."""
+    docker, _ = _fake(tmp_path, "hang-racy")
+    outcome = run(_job(tmp_path, timeout_s=3), environ=ON, docker=docker, token=TOKEN)
+    assert isinstance(outcome, Outcome)
+    assert outcome.timed_out is True and outcome.removed is True
+    assert "already in progress" not in outcome.stderr
 
 
 def test_when_the_container_cannot_be_removed_the_outcome_says_so(tmp_path: Path) -> None:
     """A status message that lies — "cleaned up" over a container still running — is what
-    the stranger pass hunts. ``removed`` is ``False`` and the daemon's words are kept."""
-    docker, _ = _fake(tmp_path, "hang-stuck")
+    the stranger pass hunts. ``removed`` is ``False`` and the daemon's words are kept, both
+    the removal's and the listing's."""
+    docker, record = _fake(tmp_path, "hang-stuck")
     outcome = run(_job(tmp_path, timeout_s=3), environ=ON, docker=docker, token=TOKEN)
     assert isinstance(outcome, Outcome)
     assert outcome.timed_out is True and outcome.removed is False
-    assert "cannot remove" in outcome.stderr
+    assert "cannot remove" in outcome.stderr and "still listed" in outcome.stderr
+    assert "deadbeef0000" in outcome.stderr
+    assert [c[0] for c in _calls(record)].count("ps") == GONE_TRIES
 
 
 def test_a_token_is_made_when_none_is_given_and_names_the_container(tmp_path: Path) -> None:
@@ -340,12 +356,21 @@ def test_the_executor_never_goes_through_a_shell(tmp_path: Path) -> None:
 # --- reapable --------------------------------------------------------------------------------
 
 
-def test_reap_lists_by_label_and_removes_what_it_finds(tmp_path: Path) -> None:
+def test_reap_lists_by_label_removes_what_it_finds_and_checks_the_listing(
+    tmp_path: Path,
+) -> None:
     docker, record = _fake(tmp_path, "stale")
     assert reap(docker=docker) == ("0123456789ab", "fedcba987654")
     calls = _calls(record)
     assert calls[0] == ["ps", "--all", "--quiet", "--filter", f"label={LABEL}"]
     assert calls[1] == ["rm", "--force", "0123456789ab", "fedcba987654"]
+    assert calls[2] == calls[0]
+    assert len(calls) == 3
+
+
+def test_reap_trusts_the_listing_when_rm_loses_the_race_with_autoremove(tmp_path: Path) -> None:
+    docker, _ = _fake(tmp_path, "stale-racy")
+    assert reap(docker=docker) == ("0123456789ab", "fedcba987654")
 
 
 def test_reap_can_be_narrowed_to_one_token(tmp_path: Path) -> None:
@@ -360,11 +385,12 @@ def test_reap_removes_nothing_when_nothing_is_found(tmp_path: Path) -> None:
     assert [c[0] for c in _calls(record)] == ["ps"]
 
 
-def test_reap_raises_when_the_daemon_will_not_remove(tmp_path: Path) -> None:
+def test_reap_raises_when_the_containers_are_still_listed_after_rm(tmp_path: Path) -> None:
     docker, _ = _fake(tmp_path, "stale-stuck")
     with pytest.raises(DockerError, match="cannot remove") as info:
         reap(docker=docker)
     assert info.value.exit_code == 1 and info.value.argv[0] == "rm"
+    assert "still listed" in info.value.stderr and "0123456789ab" in info.value.stderr
 
 
 def test_reap_raises_when_there_is_no_daemon(tmp_path: Path) -> None:

@@ -34,6 +34,12 @@ things it does:
 - ``reap(token)`` finds every container under the label — all of them, or one token's — and
   removes them. It needs no switch: cleaning up after a crash is not running Builder output.
 
+Removal is judged by the listing, never by ``rm``'s exit status. A container started with
+``--rm`` is removed by the daemon the moment it stops, so an ``rm --force`` on a running one
+races the daemon's own removal and can exit 1 ("removal already in progress") over a
+container that is in fact gone. Both ``run`` and ``reap`` therefore ask ``docker ps`` after
+the ``rm``, for up to two seconds, and report what it says.
+
 Every value that reaches the argv is checked first, so an image name or a cap that the CLI
 would read as an option cannot be smuggled in by a plan: the image must look like an image
 reference, the caps like the numbers the CLI documents, the token like a plain word, and the
@@ -53,6 +59,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from math import isfinite
@@ -81,6 +88,11 @@ DEFAULT_IMAGE = "alpine:3.20"
 TMPFS = "/tmp:rw,noexec,nosuid,size=64m"
 CLIENT_TIMEOUT_S = 30.0
 """How long the client itself may take for ``info``, ``ps`` and ``rm`` — not the job."""
+
+GONE_TRIES = 10
+GONE_PAUSE_S = 0.2
+"""How long a removal is given to show in the listing: ``--rm`` and ``rm --force`` race each
+other inside the daemon, so the removal's exit status is not the answer and the listing is."""
 
 CLIENT_FAILED = 125
 """The exit status ``docker run`` reserves for its own failure — no daemon, no such image, a
@@ -305,7 +317,7 @@ def run(
     except subprocess.TimeoutExpired as expired:
         stdout = _text(expired.stdout)
         stderr = _text(expired.stderr)
-        removed, note = _remove(client, f"walle-{token}")
+        removed, note = _remove(client, token)
         if note:
             stderr = f"{stderr}{note}"
         return Outcome(token, full, None, stdout, stderr, timed_out=True, removed=removed)
@@ -314,24 +326,51 @@ def run(
     return Outcome(token, full, done.returncode, _text(done.stdout), _text(done.stderr))
 
 
-def _remove(client: _Client, name: str) -> tuple[bool, str]:
-    """``docker rm -f name``. Returns whether it worked and, when not, the daemon's words."""
+def _remove(client: _Client, token: str) -> tuple[bool, str]:
+    """``docker rm --force`` the container, then ask the listing whether it is gone. Returns
+    whether it is and, when not, the daemon's words — the removal's and the listing's."""
+    name = f"walle-{token}"
+    removal = ("rm", "--force", name)
     try:
-        done = client.run("rm", "-f", name, timeout=CLIENT_TIMEOUT_S)
+        done = client.run(*removal, timeout=CLIENT_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        return False, f"docker rm -f {name} did not finish in {CLIENT_TIMEOUT_S:g}s\n"
-    if done.returncode != 0:
-        return False, _text(done.stderr) or f"docker rm -f {name} exited {done.returncode}\n"
-    return True, ""
+        return False, f"docker rm --force {name} did not finish in {CLIENT_TIMEOUT_S:g}s\n"
+    words = _text(done.stderr) if done.returncode != 0 else ""
+    gone, listed = _gone(client, f"label={LABEL}={token}")
+    if gone:
+        return True, ""
+    return False, f"{words}{listed}"
+
+
+def _gone(client: _Client, selector: str) -> tuple[bool, str]:
+    """Whether ``docker ps --all`` lists nothing for ``selector``, asked up to ``GONE_TRIES``
+    times a short pause apart. ``(False, words)`` when something is still listed at the end,
+    or when the listing itself failed — the daemon's words either way."""
+    listing = ("ps", "--all", "--quiet", "--filter", selector)
+    ids: list[str] = []
+    for attempt in range(GONE_TRIES):
+        try:
+            done = client.run(*listing, timeout=CLIENT_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            return False, f"docker ps did not answer in {CLIENT_TIMEOUT_S:g}s\n"
+        if done.returncode != 0:
+            return False, _text(done.stderr) or f"docker ps exited {done.returncode}\n"
+        ids = _text(done.stdout).split()
+        if not ids:
+            return True, ""
+        if attempt + 1 < GONE_TRIES:
+            time.sleep(GONE_PAUSE_S)
+    return False, f"still listed under {selector}: {', '.join(ids)}\n"
 
 
 def reap(token: str | None = None, *, docker: Sequence[str] = ("docker",)) -> tuple[str, ...]:
     """Remove every container under the label — one token's, or all — and return their ids.
 
     For the parent that crashed with a child still running, and for the ``Outcome`` whose
-    ``removed`` was ``False``. Needs no switch: it consults no environment. Raises
-    ``DockerError`` when the client fails, so a reap that did nothing is never reported as
-    one that did.
+    ``removed`` was ``False``. Needs no switch: it consults no environment. Judged by the
+    listing after the removal, not by ``rm``'s status (see the module docstring); raises
+    ``DockerError`` when the listing fails or still shows something at the end, so a reap that
+    did nothing is never reported as one that did.
     """
     client = _Client(tuple(docker))
     selector = f"label={LABEL}" if token is None else f"label={LABEL}={_check_token(token)}"
@@ -344,8 +383,10 @@ def reap(token: str | None = None, *, docker: Sequence[str] = ("docker",)) -> tu
         return ()
     removal = ("rm", "--force", *ids)
     done = client.run(*removal, timeout=CLIENT_TIMEOUT_S)
-    if done.returncode != 0:
-        raise DockerError(removal, done.returncode, _text(done.stderr))
+    words = _text(done.stderr) if done.returncode != 0 else ""
+    gone, listed = _gone(client, selector)
+    if not gone:
+        raise DockerError(removal, done.returncode, f"{words}{listed}")
     return ids
 
 

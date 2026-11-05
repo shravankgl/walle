@@ -35,14 +35,16 @@ there.
   - `enabled(environ)`: `WALLE_CONTAINER_EXECUTOR` is exactly `on`. Same rule as missions.
   - `run(job, *, environ, docker, token)`: refuses before any process starts unless `enabled`,
     and when the client cannot be found; runs the plan with the job's timeout; on a timeout the
-    client is killed, and because killing the client does not stop the container, `docker rm -f
-    walle-<token>` follows, and `Outcome.removed` says whether that worked — `False` with the
-    daemon's words in `stderr`, never a silent "cleaned up". Exit 125 is the client failing on
+    client is killed, and because killing the client does not stop the container, `docker rm
+    --force walle-<token>` follows, and `Outcome.removed` says whether that worked — judged by
+    the listing afterwards, `False` with the daemon's words in `stderr`, never a silent "cleaned
+    up". Exit 125 is the client failing on
     its own account (no daemon, no such image) and the command never ran, so that is a
     `Refusal` carrying the stderr, not an exit code attributed to the command.
   - `reap(token=None, *, docker)`: `docker ps --all --quiet --filter label=walle.executor[=token]`,
-    then `docker rm --force` of what it lists. Needs no switch; raises `DockerError` when the
-    daemon refuses, so a reap that did nothing is never reported as one that did.
+    then `docker rm --force` of what it lists, then the listing again. Needs no switch; raises
+    `DockerError` when something is still listed, so a reap that did nothing is never reported
+    as one that did.
   - `unavailable(docker)`: `docker info --format {{.ServerVersion}}`; the client's own words
     when it fails, `None` when a daemon answers. The escape tests' skip-or-fail reads it.
 - `tests/fake_docker.py`: a fake client, like `tests/fake_acp.py`, run through `sys.executable`.
@@ -142,6 +144,34 @@ real container found one real bug and one race:
 - **The two hang tests gave the fake 0.5 s** to start Python and write its record before the
   kill. On a cold CI runner that is a race; now 3 s.
 
+**Third commit, after CI was red again on the second** (`pytest` 88–104 s against 75 s here,
+every other step green, and the merge with `main` at `e29426c` green here too, so the difference
+is the machine, not the tree). Still inferred, still unread. One more pass over `run` and `reap`
+for what only a real daemon does found a race I should have known:
+
+- **`rm --force` on a container started with `--rm` races the daemon's own removal.** The
+  container stops, AutoRemove starts, and `rm --force` can exit 1 with "removal of container …
+  is already in progress" — over a container that is gone. `run`'s timeout path read that exit
+  status as `removed=False`, and `reap` raised `DockerError`, in both cases over containers no
+  longer there: the escape tests `test_a_command_past_the_timeout_…` and
+  `test_a_container_left_behind_…` would fail on any real daemon, with the executor telling the
+  truth about a false alarm. Removal is now judged by the listing: after `rm --force`, `docker
+  ps --all --quiet --filter label=…` is asked up to ten times 0.2 s apart (a container shows as
+  "Removal In Progress" for a moment), and `removed` is `True` only when it lists nothing. When
+  it still lists something, `stderr` carries both the removal's words and the listing's ids.
+  `reap` does the same and raises only if something remains. `tests/fake_docker.py` gained the
+  record as its memory (a `ps` after an `rm` lists nothing) and two racy modes; three tests pin
+  the new rule (`test_removal_is_judged_by_the_listing_not_by_rm_exit_status`,
+  `test_reap_trusts_the_listing_when_rm_loses_the_race_with_autoremove`, and the stuck case
+  asserting all ten listings were asked).
+
+```
+uv run pytest               2160 passed, 29 skipped in 80.22s
+uv run ruff check           All checks passed!
+uv run ruff format --check  138 files already formatted
+uv run pyright              0 errors, 0 warnings, 0 informations
+```
+
 If CI is red again after this commit, the log is the next thing to read, and it needs someone
 who can — the owner, or a reviewer agent whose scope includes Actions logs. The escape tests
 have still not been run by me, anywhere.
@@ -201,6 +231,9 @@ a decode that could raise on a stray byte (`errors="replace"` throughout).
 - **Skip-or-fail is a fixture, not a module-level skip,** so with `WALLE_REQUIRE_DOCKER=1` each
   test *fails* by name rather than the module erroring at collection, and the summary line is
   unmistakable.
+- **Removal is judged by `docker ps`, not by `rm`'s exit status** (third commit). The
+  alternative — parse "already in progress" and "No such container" out of `rm`'s stderr — is
+  matching on the daemon's prose, which changes. The listing is the fact.
 - **The orphan for the reap test is made with the CLI directly**, not through `run`, because
   `run` waits for its container and a crashed parent does not.
 - **Not flagged:** D99 amends D68 but agrees with the issue; `--read-only` extends the issue's
