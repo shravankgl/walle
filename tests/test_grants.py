@@ -42,9 +42,14 @@ from walle.grants import (
     offered,
 )
 from walle.paths import principal_dir
+from walle.profiles import Role
+from walle.speakers import Order, Speaker
 
 ON = {grants.GRANTS_SWITCH: grants.SWITCH_ON}
 P = "lena"
+ORDER = Order(P, Speaker(P, Role.OPERATOR))
+"""Every grant in this file is the owner's, speaking as the operator; who else may grant is
+``test_audit_approvals.py``'s subject (issue #119)."""
 TS = "2026-11-05T10:00:00+00:00"
 LIVE = Live(session="s-aaaa", request="r-1")
 LS = Call(tool="shell", arguments="ls -la ~/allotment")
@@ -73,7 +78,7 @@ def _config(root: Path, *rules: dict[str, object]) -> Path:
 def _grant(
     live: Live, call: Call, scope: Scope, root: Path, *, call_id: str = "c-1", ts: str = TS
 ) -> Granted:
-    return grant(live, call, scope, call_id=call_id, root=root, principal=P, ts=ts, environ=ON)
+    return grant(live, call, scope, by=ORDER, call_id=call_id, root=root, ts=ts, environ=ON)
 
 
 def _check(live: Live, call: Call, root: Path, *, call_id: str = "c-1") -> Allowed | Refused:
@@ -616,7 +621,7 @@ def test_a_scope_given_as_a_string_is_a_type_error(root: Path) -> None:
     """``"always"`` is not ``Scope.ALWAYS``: a plain string could come from anywhere, and a
     permission call takes the type or nothing."""
     with pytest.raises(TypeError):
-        grant(LIVE, LS, "always", call_id="c-1", root=root, principal=P, ts=TS, environ=ON)  # type: ignore[arg-type]
+        grant(LIVE, LS, "always", by=ORDER, call_id="c-1", root=root, ts=TS, environ=ON)  # type: ignore[arg-type]
     assert not _grants_dir(root).exists()
 
 
@@ -662,17 +667,11 @@ def test_a_bad_timestamp_is_refused_before_anything_is_written(root: Path) -> No
 
 
 def test_a_bad_principal_is_refused_before_anything(tmp_path: Path) -> None:
+    """A speaker id may be a shape a principal's name may not (``Lena``): the folder's name
+    is checked by ``grants_dir`` before anything is read or written."""
+    bad = Order("Lena", Speaker("Lena", Role.OPERATOR))
     with pytest.raises(ValueError):
-        grant(
-            LIVE,
-            LS,
-            Scope.ALWAYS,
-            call_id="c-1",
-            root=tmp_path,
-            principal="../x",
-            ts=TS,
-            environ=ON,
-        )
+        grant(LIVE, LS, Scope.ALWAYS, by=bad, call_id="c-1", root=tmp_path, ts=TS, environ=ON)
     with pytest.raises(ValueError):
         check(LIVE, LS, call_id="c-1", root=tmp_path, principal="Lena", environ=ON)
     assert list(tmp_path.iterdir()) == []
@@ -689,9 +688,9 @@ def test_grants_are_off_by_default(root: Path, monkeypatch: pytest.MonkeyPatch) 
     assert not grants.enabled({})
     _config(root, {"tool": LS.tool, "arguments": LS.arguments})
     with pytest.raises(GrantsOffError, match=grants.GRANTS_SWITCH):
-        grant(LIVE, LS, Scope.ALWAYS, call_id="c-1", root=root, principal=P, ts=TS)
+        grant(LIVE, LS, Scope.ALWAYS, by=ORDER, call_id="c-1", root=root, ts=TS)
     with pytest.raises(GrantsOffError):
-        grant(LIVE, LS, Scope.REQUEST, call_id="c-1", root=root, principal=P, ts=TS, environ={})
+        grant(LIVE, LS, Scope.REQUEST, by=ORDER, call_id="c-1", root=root, ts=TS, environ={})
     assert not (_grants_dir(root) / grants.ALWAYS_FILE).exists()
     in_memory = Live(
         session=LIVE.session,

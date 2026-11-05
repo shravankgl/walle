@@ -536,9 +536,9 @@ def test_the_principal_s_own_call_goes_through_their_own_grants(tmp_path: Path) 
         live,
         call,
         grants.Scope.REQUEST,
+        by=ada.authority,  # the turn's own Order: grants takes the speaker, not a name
         call_id="c-1",
         root=root,
-        principal=P,
         ts=TS,
         environ=environ,
     ).live
@@ -557,9 +557,9 @@ def test_what_a_call_may_do_follows_the_speaker_not_the_conversation(tmp_path: P
         grants.Live.start("s-1", "r-1"),
         call,
         grants.Scope.SESSION,
+        by=ada.authority,
         call_id="c-1",
         root=root,
-        principal=P,
         ts=TS,
         environ=environ,
     ).live
