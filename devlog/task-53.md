@@ -119,6 +119,10 @@ Neither takes `staging.lock`, so a count never waits on a review.
 - **No per-actor split** (proposer versus curator versus `remember`). The issue asks for kept,
   edited and dropped; a split is a later question, and it would need a decision on whether
   `remember` proposals count toward the gate at all (see below).
+- **The `stats` command sits at the end of `cli.py`, after the evals line.** Main gained the
+  `acp` command (#66) in the slot after `observe` where `stats` first went, and the PR
+  conflicted. Moving `stats` below the evals keeps the two additions apart, so main merges in
+  cleanly. The code is unchanged; all four checks pass on the merged tree.
 
 **What to read first:** `count` in `src/walle/stats.py` and the table at the top of
 `tests/test_stats.py`. If a row in that table looks wrong to you, the metric is wrong.

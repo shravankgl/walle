@@ -730,6 +730,11 @@ def observe_command(root: Path, principal: str, device: str, projects_dir: Path)
     click.echo(f"  duplicate entries: {len(transcripts.duplicates)}")
 
 
+# --- the evals (tasks 19-21) ---------------------------------------------------------------
+
+main.add_command(walle_evals.eval_command)
+
+
 # --- the acceptance rate (issue #53) -----------------------------------------------------
 
 
@@ -765,8 +770,3 @@ def stats_command(root: Path, principal: str) -> None:
         click.echo(f"acceptance: {counts.accepted} of {counts.decided} decided ({rate}%).")
     else:
         click.echo("acceptance: nothing decided yet.")
-
-
-# --- the evals (tasks 19-21) ---------------------------------------------------------------
-
-main.add_command(walle_evals.eval_command)
