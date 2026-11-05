@@ -43,12 +43,18 @@ details is a refusal with no call — the kind named, the text never quoted (D18
 goes inside a fresh untrusted envelope (D55). The reply must be a JSON object with exactly
 ``title`` and ``steps``, each step exactly ``id``, ``title``, ``command``, ``reads`` and
 ``writes``; a step id is a node id; a command is a non-empty list of strings with no NUL; a
-path is relative and stays inside the workspace. A step may not ask for network (``egress``),
-an image or anything else: the container has no network, and the image is the executor's
-default until an image is a decision. The draft is then scanned as the person will read it,
-string by string and as the staged body whole, and a draft that argues or carries a secret is
-refused, not staged. A model failure is a refusal that names the exception's class and never
-its message, which is where a provider's text — or a key — comes back.
+path is relative and stays inside the workspace. Nesting past the recursion limit is "not
+JSON" like a fence, not an exception; a string that cannot be written as UTF-8 is refused
+here rather than by the event model inside ``stage``; a title holds no line break of any
+kind; the words of a command, the paths of a step, each path and the whole staged body are
+bounded, so one reply cannot put megabytes into the log (#116). A refusal names what is
+missing and counts what is unexpected; the model's words are never quoted. A step may not
+ask for network (``egress``), an image or anything else: the container has no network, and
+the image is the executor's default until an image is a decision. The draft is then scanned
+as the person will read it, string by string and as the staged body whole, and a draft that
+argues or carries a secret is refused, not staged. A model failure is a refusal that names
+the exception's class and never its message, which is where a provider's text — or a key —
+comes back.
 
 The dormant rule
 ----------------
@@ -135,6 +141,23 @@ TITLE_CHARS = 110
 
 ARG_CHARS = 4000
 """The longest one argument may be: a script, not a payload."""
+
+COMMAND_PARTS = 64
+"""The most words one command may have (#116)."""
+
+PATH_COUNT = 64
+"""The most paths one step may declare in ``reads`` or in ``writes`` (#116)."""
+
+PATH_CHARS = 255
+"""The longest one declared path may be (#116)."""
+
+BODY_CHARS = 60_000
+"""The longest staged body: ``MAX_STEPS`` steps of a few full-length arguments each. A reply
+that renders longer is refused whole, so one reply cannot put megabytes into the log (#116).
+The per-field bounds above make this hard to reach honestly; it is the backstop."""
+
+_LINE_BREAKS = frozenset("\n\r\x0b\x0c\x1c\x1d\x1e\x1f\x85\u2028\u2029")
+"""Everything ``str.splitlines`` breaks on. A one-line field (D81) holds none of them."""
 
 SCAN_PREFIX = "-\n"
 """Put in front of every scanned text so ``hazards.forged_turn``'s opening-block exemption,
@@ -385,23 +408,64 @@ def _parse_reply(reply: object) -> tuple[str, tuple[WorkflowStep, ...]] | str:
         return "empty"
     try:
         data = json.loads(reply)
-    except ValueError:
+    except (ValueError, RecursionError):  # nesting past the limit fails closed like a fence
         return "not JSON"
+    if not _utf8(data):
+        return "holds text that cannot be written as UTF-8"
     return _read(data, _REPLY_KEYS)
+
+
+def _utf8(data: object) -> bool:
+    """Whether every string in a decoded reply, keys included, can be written as UTF-8. A lone
+    surrogate arrives legally through a JSON escape (``"\\udc80"``) and would otherwise be
+    refused by the event model inside ``stage``, after ``build`` had said yes (#116)."""
+    stack = [data]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            try:
+                item.encode("utf-8")
+            except UnicodeEncodeError:
+                return False
+        elif isinstance(item, dict):
+            stack.extend(item.keys())
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return True
+
+
+def _keys(found: set[object], expected: frozenset[str], where: str = "") -> str | None:
+    """``None`` when ``found`` is exactly ``expected``, else the difference: missing keys are
+    named, since they are this module's words; unexpected ones are counted, since they are
+    the model's (#116)."""
+    if found == expected:
+        return None
+    missing, extra = sorted(expected - found), len(found - expected)
+    return f"{where}keys missing {missing}, {extra} unexpected"
+
+
+def _one_line(value: object, limit: int) -> str | None:
+    """Why ``value`` is not one non-empty line of at most ``limit`` characters, or ``None``.
+    Every line break ``str.splitlines`` knows counts, not only ``\\n`` (#116, D81)."""
+    if not isinstance(value, str) or not value.strip():
+        return "title is not one line of text"
+    if any(char in _LINE_BREAKS for char in value):
+        return "title holds a line break"
+    if len(value) > limit:
+        return f"title is longer than {limit} characters"
+    return None
 
 
 def _read(data: object, keys: frozenset[str]) -> tuple[str, tuple[WorkflowStep, ...]] | str:
     if not isinstance(data, dict):
         return f"a {type(data).__name__}, not an object"
-    found = set(data)
-    if found != keys:
-        missing, extra = sorted(keys - found), sorted(found - keys)
-        return f"keys missing {missing}, unexpected {extra}"
+    if (why := _keys(set(data), keys)) is not None:
+        return why
     title = data["title"]
-    if not isinstance(title, str) or not title.strip() or "\n" in title:
-        return "title is not one line of text"
-    if len(title) > TITLE_CHARS:
-        return f"title is longer than {TITLE_CHARS} characters"
+    if (why := _one_line(title, TITLE_CHARS)) is not None:
+        return why
+    assert isinstance(title, str)
     raw = data["steps"]
     if not isinstance(raw, list) or not raw:
         return "steps is not a non-empty list"
@@ -416,21 +480,24 @@ def _read(data: object, keys: frozenset[str]) -> tuple[str, tuple[WorkflowStep, 
     ids = [s.id for s in steps]
     if len(set(ids)) != len(ids):
         return "two steps share an id"
+    if len(render("d-x:1", title, steps)) > BODY_CHARS:
+        return f"the staged body would be longer than {BODY_CHARS} characters"
     return title, tuple(steps)
 
 
 def _read_step(item: object) -> WorkflowStep | str:
     if not isinstance(item, dict):
         return "not an object"
-    found = set(item)
-    if found != _STEP_KEYS:
-        missing, extra = sorted(_STEP_KEYS - found), sorted(found - _STEP_KEYS)
-        return f"keys missing {missing}, unexpected {extra}"
+    if (why := _keys(set(item), _STEP_KEYS)) is not None:
+        return why
     step_id, title, command = item["id"], item["title"], item["command"]
-    if not isinstance(title, str) or not title.strip() or "\n" in title:
-        return "title is not one line of text"
+    if (why := _one_line(title, TITLE_CHARS)) is not None:
+        return why
+    assert isinstance(title, str)
     if not isinstance(command, list) or not command:
         return "command is not a non-empty list"
+    if len(command) > COMMAND_PARTS:
+        return f"command has more than {COMMAND_PARTS} words"
     for arg in command:
         if not isinstance(arg, str):
             return "command holds something that is not a string"
@@ -443,6 +510,8 @@ def _read_step(item: object) -> WorkflowStep | str:
         value = item[key]
         if not isinstance(value, list) or not all(isinstance(p, str) for p in value):
             return f"{key} is not a list of strings"
+        if len(value) > PATH_COUNT:
+            return f"{key} names more than {PATH_COUNT} paths"
         for path in value:
             if (why := _inside(path)) is not None:
                 return f"{key}: {why}"
@@ -457,10 +526,12 @@ def _read_step(item: object) -> WorkflowStep | str:
 def _inside(path: str) -> str | None:
     """``None`` when ``path`` names something inside the workspace, or why not. Whether it is
     a path by name at all — relative, not climbing out, no NUL — is the floor's one answer
-    (``walle.floors.segments``, issue #118); the shell's ``~`` and a backslash are refused
-    here because a command, not a filesystem, would read them."""
+    (``walle.floors.segments``, issue #118); the length cap, the shell's ``~`` and a backslash
+    are refused here because a command, not a filesystem, would read them."""
     if not path or path.strip() != path:
         return "a path is empty or padded"
+    if len(path) > PATH_CHARS:
+        return f"a path is longer than {PATH_CHARS} characters"
     if path.startswith("~") or "\\" in path:
         return "a path is not relative to the workspace"
     parts = segments(path)
@@ -507,7 +578,7 @@ def parse_workflow(body: str) -> tuple[str, str, tuple[WorkflowStep, ...]] | str
         return f"the first line is not {WORKFLOW_HEADER!r}"
     try:
         data: Any = json.loads(rest)
-    except ValueError:
+    except (ValueError, RecursionError):  # nesting past the limit fails closed like a fence
         return "not JSON after the first line"
     read = _read(data, _BODY_KEYS)
     if isinstance(read, str):

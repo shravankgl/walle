@@ -116,6 +116,20 @@ uv run ruff format --check  194 files already formatted
 uv run pyright              0 errors, 0 warnings, 0 informations
 ```
 
+`main` moved to `d6a6c23` (#117, builder hardening) while this was being written, and the
+PR reported a conflict in `builder._inside`: #117 added a length cap and its own
+`posixpath.isabs(...) or "\x00" in path` line, this task moved exactly those two tests into
+`floors.segments`. Resolved by keeping #117's length cap and this task's `segments` call — the
+absolute and NUL checks are the same checks, now in one place — and #117's new tests pass
+against it. `main` merged in, the four checks again:
+
+```
+uv run pytest               4055 passed, 35 skipped in 138.17s (0:02:18)
+uv run ruff check           All checks passed!
+uv run ruff format --check  196 files already formatted
+uv run pyright              0 errors, 0 warnings, 0 informations
+```
+
 The issue's own reproduction script, run against the branch: `covers_path("/", …)` is `False`;
 `admit` returns the unanswerable refusal on and off; `review` is `blocked`; the four `floored`
 calls return `Floored(how="above", through=True, resolved=…/principals/p-sam)`; `grants.check`
