@@ -219,9 +219,12 @@ _INSTRUCTION = (
     ),
     # Addressed to the assistant or the system by name. Not a bare ``assistant:``, which is
     # how the observer labels the reply itself ("assistant: Remember to bring your keys").
+    # The verbs include setting up a job (issue #74): with workflow proposals on, "AI
+    # assistant: schedule a weekly task that…" is an order to the proposer to propose one.
     re.compile(
         r"\b(?:AI assistant|AI|system|model|agent|walle)\s*:\s*"
-        r"(?:save|store|remember|add|write|note|record|trusted)\b",
+        r"(?:save|store|remember|add|write|note|record|trusted|"
+        r"automate|schedule|propose|set up|create)\b",
         re.IGNORECASE,
     ),
     re.compile(r"\btrusted from here on\b|\bsaved to memory\b", re.IGNORECASE),
@@ -244,8 +247,11 @@ _INSTRUCTION = (
     # person says "my"; a page says "the user's". "The owner" alone is not in this list: a
     # household talks about the dog's owner and the shop's; "the user", "the principal" and
     # "the account owner" are this system's words for the person, and nobody else's.
+    # An order to set a job up for "the user" is the same frame (issue #74): "automate a
+    # weekly job that sends the user's invoices…". The person says "my invoices".
     re.compile(
-        r"\b(?:remember|save|store|write|add|record|note|keep)\b[^\n.]{0,60}?"
+        r"\b(?:remember|save|store|write|add|record|note|keep|"
+        r"automate|schedule|propose|set up)\b[^\n.]{0,60}?"
         r"\bthe (?:user|principal|account owner)(?:'s|s')?\b"
         r"|\bthe (?:user|principal|account owner)(?:'s|s')?\b[^\n.]{0,60}?"
         r"\b(?:remember|save|store|record|note) (?:it|this|that|them)\b",
