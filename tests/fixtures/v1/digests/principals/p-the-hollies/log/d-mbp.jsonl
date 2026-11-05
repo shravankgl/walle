@@ -1,0 +1,6 @@
+{"actor":"kernel","body":"Synthetic: the boiler service is booked for Thursday.","caused_by":[],"observed_at":"2026-10-03T18:00:00.000000+00:00","seq":1,"source":"synthetic","source_version":"0","ts":"2026-10-03T18:00:00.000000+00:00","type":"observation","v":1}
+{"actor":"kernel","body":"This week: the boiler service is on Thursday.","caused_by":[],"model":"fake-composer","seq":2,"slot":"2026-10-05T09:00:00.000000+00:00","ts":"2026-10-05T09:00:03.000000+00:00","type":"digest","v":1}
+{"actor":"kernel","caused_by":[],"seq":3,"slot":"2026-10-12T09:00:00.000000+00:00","ts":"2026-10-12T09:00:02.000000+00:00","type":"digest","v":1}
+{"actor":"kernel","body":"Synthetic: the bins moved to Wednesdays.","caused_by":[],"observed_at":"2026-10-21T08:30:00.000000+00:00","seq":4,"source":"synthetic","source_version":"0","ts":"2026-10-21T08:30:00.000000+00:00","type":"observation","v":1}
+{"actor":"kernel","body":"Since 12 October: the bins moved to Wednesdays.","caused_by":[],"model":"fake-composer","seq":5,"slot":"2026-11-02T09:00:00.000000+00:00","ts":"2026-11-02T09:00:04.000000+00:00","type":"digest","v":1}
+{"actor":"the-hollies","caused_by":[],"reason":"synthetic: the boiler date was wrong","seq":6,"target":"d-mbp:2","ts":"2026-11-02T10:00:00.000000+00:00","type":"supersede","v":1}

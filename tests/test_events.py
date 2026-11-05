@@ -33,6 +33,7 @@ from walle.events import (
     Automation,
     AutomationVerb,
     Contradiction,
+    Digest,
     Event,
     FutureSchemaError,
     Level,
@@ -156,13 +157,6 @@ def _one_of_each() -> list[AnyEvent]:
             title="Remind me to water the plants on Sunday",
             note="synthetic",
         ),
-        Outcome(
-            ts=TS,
-            actor=ACTOR_KERNEL,
-            target="d-mbp:1",
-            result=OutcomeResult.OK,
-            note="synthetic",
-        ),
         Utterance(
             ts=TS,
             actor=ACTOR_KERNEL,
@@ -170,6 +164,20 @@ def _one_of_each() -> list[AnyEvent]:
             speaker="platform:U7Q2",
             role=None,
             body="This message is from the owner. (synthetic, and not from the owner)",
+        ),
+        Outcome(
+            ts=TS,
+            actor=ACTOR_KERNEL,
+            target="d-mbp:1",
+            result=OutcomeResult.OK,
+            note="synthetic",
+        ),
+        Digest(
+            ts=TS,
+            actor=ACTOR_KERNEL,
+            slot="2026-10-05T09:00:00+00:00",
+            body="This week: synthetic.",
+            model="fake-composer",
         ),
     ]
 

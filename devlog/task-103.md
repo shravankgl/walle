@@ -247,6 +247,16 @@ walkthrough stand; the floor is a derived value that is never written anywhere.
   folder a job acts in, not who is speaking; conflating the two is the bug D61 exists to
   prevent.
 
+- **Brought up to date with main (#113, digests).** `Digest` landed in `events.py` and
+  `test_events.py` at the same spots `Utterance` was added, so the PR conflicted. The author's
+  tool can only make single-parent commits, so instead of a merge commit the branch gained
+  one commit holding main's files plus the union of both sides. To keep the later merge with
+  main clean, `Utterance` sits one unchanged line away from `Digest`: its section is before
+  `Outcome` rather than after it, and it is listed before `Automation` in `AnyEvent`,
+  `EVENT_TYPES` and `_one_of_each`. Order there means nothing: the union is discriminated by
+  `type`, the registry is a dict, and the tests compare sets or sort. No code changed. The
+  tree is the same one `git merge` would give, checked with `git merge-tree`.
+
 **What to read first:** `fold` (nine lines; the whole ratchet), then `turn` (the order:
 switch, record, read, decide), then `authority`. In the tests,
 `test_a_forged_speaker_line_changes_nothing` and
