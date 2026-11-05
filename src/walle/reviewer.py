@@ -25,9 +25,10 @@ The seven invariants (D76), and where each lives
 3. **Fail closed.** The only path to ``go`` is a JSON object with exactly the keys ``verdict``,
    ``in_scope`` and ``reason``, ``verdict`` equal to ``allow`` and ``in_scope`` equal to
    ``true``. Anything else — not JSON, a list, a fence, a missing or extra key, a spelling,
-   an unknown verdict, a timeout, a provider error, any exception at all — is ``unsure`` and
-   goes to the person. The reply is described in the reason, never quoted. The exception's
-   class is named, never its message, which is where a provider's text would come back.
+   an unknown verdict, nesting past the recursion limit, a timeout, a provider error, any
+   exception at all — is ``unsure`` and goes to the person. The reply is described in the
+   reason, never quoted. The exception's class is named, never its message, which is where a
+   provider's text would come back.
 4. **The reviewer never reads untrusted content.** Its input is ``REVIEW_INSTRUCTIONS``, the
    person's own ``request``, the ``known`` lines the caller took from the hot tier (D54),
    and the action: tool name and arguments. ``Context`` and ``Action`` have no field for a
@@ -503,7 +504,7 @@ def _texts(arguments: str) -> tuple[str, ...]:
     found = [arguments]
     try:
         data = json.loads(arguments)
-    except ValueError:
+    except (ValueError, RecursionError):  # nested past the limit is not JSON we can look inside
         return (arguments,)
     stack = [data]
     while stack:
@@ -526,7 +527,7 @@ def _parse(reply: str) -> tuple[Verdict, bool, str] | str:
         return "empty"
     try:
         data = json.loads(reply)
-    except ValueError:
+    except (ValueError, RecursionError):  # nesting past the limit fails closed like a fence
         return "not JSON"
     if not isinstance(data, dict):
         return f"a {type(data).__name__}, not an object"
