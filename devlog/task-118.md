@@ -119,12 +119,16 @@ uv run pyright              0 errors, 0 warnings, 0 informations
 `main` moved to `d6a6c23` (#117, builder hardening) while this was being written, and the
 PR reported a conflict in `builder._inside`: #117 added a length cap and its own
 `posixpath.isabs(...) or "\x00" in path` line, this task moved exactly those two tests into
-`floors.segments`. Resolved by keeping #117's length cap and this task's `segments` call — the
-absolute and NUL checks are the same checks, now in one place — and #117's new tests pass
-against it. `main` merged in, the four checks again:
+`floors.segments`. Resolved by keeping #117's length cap and this task's `segments` call, and #117's new tests
+pass against it. The `posixpath.isabs(...) or "\x00" in path` line stays as #117 left it:
+`segments` makes the same two tests one line later, so the line is redundant, but changing
+it puts this task's hunk directly against #117's insertion and git calls that a conflict,
+and the only tool this agent may push with makes single-parent commits — no merge commit, no
+force. Keeping the line is what lets the branch merge; it is listed under *Noticed*. `main`
+merged in, the four checks again:
 
 ```
-uv run pytest               4055 passed, 35 skipped in 138.17s (0:02:18)
+uv run pytest               4055 passed, 35 skipped in 128.32s (0:02:08)
 uv run ruff check           All checks passed!
 uv run ruff format --check  196 files already formatted
 uv run pyright              0 errors, 0 warnings, 0 informations
@@ -233,6 +237,9 @@ are the contract.
   now `_require_principals` keeps that (`FileNotFoundError → ()`). But a `principals/` that is
   a regular file is reported through the link sentence ("or its folder cannot be resolved"
   was added so the sentence is not false). A broken root deserves its own words.
+- `builder._inside` keeps its own `posixpath.isabs`/NUL line in front of `segments` (above):
+  one redundant line, there only so the branch merges with #117 without a merge commit. Drop
+  it, and `import posixpath`, in the next builder task.
 - `profiles._open_below` maps `ENOTDIR` to "a link now stands where a folder was", which is
   also what a plain file there produces. Worth a `NotADirectoryError` branch of its own.
 - `Context.__post_init__` resolves the root with `Path.resolve()`, following links in the root
