@@ -43,7 +43,7 @@ The switch is still off.
   reports with `tokens` and `cost_usd`, the token budget crossed on the third, and the abort step
   exactly as `abort_step` writes it. 21 sentinels, including `cost_budget_usd` on two nodes and the
   abort's `note`. Like `chores`, its `.jsonl` is force-added past the `principals/` ignore rule.
-- `tests/test_manifest.py`, 73 tests: the two verify criteria, the matching rules, the gate's
+- `tests/test_manifest.py`, 85 tests: the two verify criteria, the matching rules, the gate's
   order, the budget edge cases, the abort step, the dormant rule, purity, and the new fixture's
   breach and DAG pinned by hash.
 - `tests/test_missions.py`: one line. The import allowlist for `missions.py` gains `walle.manifest`.
@@ -90,11 +90,21 @@ it *before* the spend it answered, so the later `running` won — exactly task 6
 Both now build what they claim to.
 
 ```
-uv run pytest               2062 passed, 10 skipped in 66.41s
+uv run pytest               2074 passed, 10 skipped in 66.66s
 uv run ruff check           All checks passed!
 uv run ruff format --check  132 files already formatted
 uv run pyright              0 errors, 0 warnings, 0 informations
 ```
+
+**Second commit, on the owner's request (PR #79 review, low finding):** `Step.cost_usd` and
+`Node.cost_budget_usd` now carry `allow_inf_nan=False`. Measured before fixing: NaN was already
+refused by `ge` / `gt` (pydantic's comparison fails on NaN), but **infinity passed both** — an
+`inf` spend is a breach that reads as "$inf", and an `inf` budget is a node that never breaches.
+Token fields are `int`, which pydantic refuses a non-finite float for; pinned anyway so a type
+change cannot open the gap quietly. `test_a_nan_or_infinite_cost_cannot_reach_the_budget_check`
+(six values, at construction and on load) and `..._token_count_...`; three of the twelve cases
+failed before the fix. No shipped log carries a non-finite number (JSON has no spelling for one
+that the writer emits), so nothing on disk becomes unreadable.
 
 **Two-runner walkthrough:** the gate and the fold open nothing, so the walkthrough is about what
 each writer *concludes*. Writers A and B run the same mission on two devices and both have node

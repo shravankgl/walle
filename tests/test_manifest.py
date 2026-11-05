@@ -378,6 +378,33 @@ def test_the_cost_reason_shows_the_figures_and_never_rounds_them_into_equality(
     assert words in Breach(node="a", kind="cost_usd", spent=spent, budget=budget).reason
 
 
+NOT_A_NUMBER = [float("nan"), float("inf"), float("-inf"), "nan", "inf", "Infinity"]
+
+
+@pytest.mark.parametrize("value", NOT_A_NUMBER, ids=repr)
+def test_a_nan_or_infinite_cost_cannot_reach_the_budget_check(value: Any) -> None:
+    """``NaN > budget`` is false and ``inf`` as a budget never breaches, so neither may become
+    an event: refused at construction and on load (PR #79 review, low finding)."""
+    with pytest.raises(ValidationError):
+        _status("d-tab:1", "pick-recipes", StepStatus.RUNNING, cost_usd=value)
+    with pytest.raises(ValidationError):
+        _node("a", cost_budget_usd=value)
+    line = json.loads(_status("d-tab:1", "pick-recipes", StepStatus.RUNNING).model_dump_json())
+    line["cost_usd"] = value
+    with pytest.raises(ValidationError):
+        parse_event(line)
+
+
+@pytest.mark.parametrize("value", NOT_A_NUMBER, ids=repr)
+def test_a_nan_or_infinite_token_count_cannot_reach_the_budget_check(value: Any) -> None:
+    """Tokens are ``int``; pydantic refuses a non-finite float for an int. Pinned so a later
+    change of the field's type cannot open the gap quietly."""
+    with pytest.raises(ValidationError):
+        _status("d-tab:1", "pick-recipes", StepStatus.RUNNING, tokens=value)
+    with pytest.raises(ValidationError):
+        _node("a", token_budget=value)
+
+
 def test_spending_exactly_the_budget_is_not_a_breach() -> None:
     state = _one(_spend((1000, 0.05), (1000, 0.05)))
     assert state.spent == (0.1, 2000)
