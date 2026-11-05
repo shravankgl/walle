@@ -1,0 +1,242 @@
+[
+ {
+  "question_id": "synth_0001",
+  "question_type": "single-session-user",
+  "question": "Which allotment plot number did I take on at the community garden?",
+  "answer": "Plot 14",
+  "question_date": "2023/06/02 (Fri) 09:00",
+  "haystack_dates": [
+   "2023/05/20 (Sat) 02:21",
+   "2023/05/27 (Sat) 10:05"
+  ],
+  "haystack_session_ids": [
+   "synth_s_a1",
+   "synth_s_a2"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "I took on allotment plot number 14 at the community garden this spring."
+    },
+    {
+     "role": "assistant",
+     "content": "Plot 14 it is. Do you want reminders for watering days?"
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Can you suggest a quick lentil soup for a weeknight?"
+    },
+    {
+     "role": "assistant",
+     "content": "A red lentil soup with cumin takes about twenty five minutes."
+    }
+   ]
+  ],
+  "answer_session_ids": [
+   "synth_s_a1"
+  ]
+ },
+ {
+  "question_id": "synth_0002",
+  "question_type": "single-session-assistant",
+  "question": "What bread flour ratio did you recommend for the sourdough starter?",
+  "answer": "Equal parts flour and water by weight",
+  "question_date": "2023/06/03 (Sat) 09:00",
+  "haystack_dates": [
+   "2023/05/21 (Sun) 08:00",
+   "2023/05/28 (Sun) 08:30"
+  ],
+  "haystack_session_ids": [
+   "synth_s_b1",
+   "synth_s_b2"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "How do I keep a sourdough starter alive?"
+    },
+    {
+     "role": "assistant",
+     "content": "For the sourdough starter I recommend a bread flour ratio of equal parts flour and water by weight, fed daily."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "What is a good film for a rainy Sunday?"
+    },
+    {
+     "role": "assistant",
+     "content": "Something gentle and long; a classic musical suits a rainy afternoon."
+    }
+   ]
+  ],
+  "answer_session_ids": [
+   "synth_s_b1"
+  ]
+ },
+ {
+  "question_id": "synth_0003",
+  "question_type": "multi-session",
+  "question": "How many evening pottery classes have I mentioned attending so far?",
+  "answer": "Three",
+  "question_date": "2023/06/10 (Sat) 18:00",
+  "haystack_dates": [
+   "2023/05/22 (Mon) 19:30",
+   "2023/05/29 (Mon) 19:40",
+   "2023/06/05 (Mon) 19:35"
+  ],
+  "haystack_session_ids": [
+   "synth_s_c1",
+   "synth_s_c2",
+   "synth_s_c3"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "Back from my first evening pottery class, I have mentioned attending so I can keep count."
+    },
+    {
+     "role": "assistant",
+     "content": "Noted: first evening pottery class attended."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Second evening pottery class done, the wheel is still winning."
+    },
+    {
+     "role": "assistant",
+     "content": "Two down. The wheel usually gives in around week four."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Third evening pottery class tonight, I made a bowl that stands up."
+    },
+    {
+     "role": "assistant",
+     "content": "A standing bowl after three classes is good going."
+    }
+   ]
+  ],
+  "answer_session_ids": [
+   "synth_s_c1",
+   "synth_s_c2",
+   "synth_s_c3"
+  ]
+ },
+ {
+  "question_id": "synth_0004",
+  "question_type": "knowledge-update",
+  "question": "Which bus route do I currently take to the library?",
+  "answer": "The 42",
+  "question_date": "2023/06/12 (Mon) 08:00",
+  "haystack_dates": [
+   "2023/05/23 (Tue) 07:50",
+   "2023/06/06 (Tue) 07:55"
+  ],
+  "haystack_session_ids": [
+   "synth_s_d1",
+   "synth_s_d2"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "I take the 17 bus route to the library on Tuesdays."
+    },
+    {
+     "role": "assistant",
+     "content": "The 17 to the library, Tuesdays. Noted."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Update: the bus route I currently take to the library is the 42, the 17 was cut."
+    },
+    {
+     "role": "assistant",
+     "content": "Updated: the 42 to the library now, the 17 is gone."
+    }
+   ]
+  ],
+  "answer_session_ids": [
+   "synth_s_d2"
+  ]
+ },
+ {
+  "question_id": "synth_0005",
+  "question_type": "temporal-reasoning",
+  "question": "How many weeks before the school fete did I book the bouncy castle?",
+  "answer": "Four weeks",
+  "question_date": "2023/07/01 (Sat) 12:00",
+  "haystack_dates": [
+   "2023/05/24 (Wed) 16:00",
+   "2023/06/07 (Wed) 16:10"
+  ],
+  "haystack_session_ids": [
+   "synth_s_e1",
+   "synth_s_e2"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "I booked the bouncy castle for the school fete today, the fete is on the 21st of June."
+    },
+    {
+     "role": "assistant",
+     "content": "Booked, four weeks before the fete on the 21st of June."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Remind me to collect the raffle prizes on the 14th."
+    },
+    {
+     "role": "assistant",
+     "content": "I will remind you on the 14th about the raffle prizes."
+    }
+   ]
+  ],
+  "answer_session_ids": [
+   "synth_s_e1"
+  ]
+ },
+ {
+  "question_id": "synth_0006_abs",
+  "question_type": "single-session-user",
+  "question": "What colour did I paint the garden shed?",
+  "answer": "The user never mentioned painting the shed.",
+  "question_date": "2023/06/15 (Thu) 10:00",
+  "haystack_dates": [
+   "2023/05/25 (Thu) 11:00"
+  ],
+  "haystack_session_ids": [
+   "synth_s_f1"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "The garden shed roof leaks when it rains hard."
+    },
+    {
+     "role": "assistant",
+     "content": "A roll of felt and a dry weekend should fix the shed roof."
+    }
+   ]
+  ],
+  "answer_session_ids": []
+ }
+]
