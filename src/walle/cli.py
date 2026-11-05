@@ -20,6 +20,7 @@ from walle import hot as walle_hot
 from walle import index as walle_index
 from walle import models as walle_models
 from walle import observer as walle_observer
+from walle import osusers as walle_osusers
 from walle import profiles as walle_profiles
 from walle import proposer as walle_proposer
 from walle import staging as walle_staging
@@ -994,3 +995,71 @@ def profiles_publish_command(root: Path, principal: str, kind: str, source: str)
     except _PROFILE_ERRORS as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"{done.principal}: published {done.source.name} to {done.path}")
+
+
+# --- OS user permissions (issue #105, D110) ------------------------------------------------------
+
+
+def _owner_spec(
+    _ctx: click.Context, _param: click.Parameter, value: tuple[str, ...]
+) -> dict[str, walle_osusers.Owner]:
+    owners: dict[str, walle_osusers.Owner] = {}
+    for spec in value:
+        principal, sep, owner = spec.partition("=")
+        if not sep or not principal or not owner:
+            raise click.BadParameter(f"{spec!r} is not <principal>=<user>[:<group>]")
+        try:
+            owners[principal] = walle_osusers.Owner.parse(owner)
+        except ValueError as exc:
+            raise click.BadParameter(str(exc)) from exc
+    return owners
+
+
+@profiles_group.command("owners")
+@_ROOT
+@click.option(
+    "--owner",
+    "owners",
+    multiple=True,
+    required=True,
+    callback=_owner_spec,
+    metavar="PRINCIPAL=USER[:GROUP]",
+    help="A principal and the OS user (and group) that must own its folder. One per principal.",
+)
+@click.option(
+    "--shared-group",
+    default=None,
+    help="The household group that shared/ belongs to; shared/ is judged only when given.",
+)
+def profiles_owners_command(
+    root: Path, owners: dict[str, walle_osusers.Owner], shared_group: str | None
+) -> None:
+    """Check, read-only, that each profile folder is owned by its own OS user (D110).
+
+    Reports every folder or file with the wrong owner, group or mode, by name. Opens no file
+    and changes nothing: making users and handing folders to them is the owner's own step.
+    Exit 0 when clean, 1 when there is a finding or a folder could not be listed.
+    """
+    if not walle_osusers.enabled():
+        raise click.ClickException(walle_osusers.OFF_MESSAGE)
+    try:
+        shared = walle_osusers.group_id(shared_group) if shared_group else None
+        report = walle_osusers.check(root, owners, shared=shared)
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    for finding in report.findings:
+        click.echo(
+            f"{finding.path}: {finding.problem} — expected {finding.expected}, "
+            f"found {finding.actual}"
+        )
+    for folder in report.unlisted:
+        click.echo(f"{folder}: not listed (permission denied); its contents were not checked")
+    if report.clean:
+        click.echo(f"clean: {_plural(report.checked, 'item')} checked, as D110 wants them")
+        return
+    click.echo(
+        f"{_plural(len(report.findings), 'finding')}, "
+        f"{_plural(len(report.unlisted), 'folder')} not listed, "
+        f"{_plural(report.checked, 'item')} checked"
+    )
+    raise SystemExit(1)

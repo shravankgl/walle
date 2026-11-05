@@ -36,6 +36,7 @@ from pathlib import Path
 # directory. Found by an independent reviewer after two author-blind passes missed it.
 _NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
 
+PRINCIPALS_DIRNAME = "principals"
 PRINCIPAL_PREFIX = "p-"
 DEVICE_PREFIX = "d-"
 LOG_DIRNAME = "log"
@@ -69,7 +70,9 @@ def stream_id(device: str) -> str:
 
 def principal_dir(root: Path, principal: str) -> Path:
     """``<root>/principals/p-<principal>``."""
-    return root / "principals" / f"{PRINCIPAL_PREFIX}{check_name(principal, kind='principal')}"
+    return (
+        root / PRINCIPALS_DIRNAME / f"{PRINCIPAL_PREFIX}{check_name(principal, kind='principal')}"
+    )
 
 
 def log_dir(root: Path, principal: str) -> Path:
