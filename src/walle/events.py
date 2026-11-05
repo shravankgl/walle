@@ -29,6 +29,10 @@ D49/D60  ``proposal`` is an item in the staging queue: a belief someone would li
          waiting for a human yes. It is never folded into what walle believes.
 D111     An event whose ``v`` is newer than this build halts loading by name. Reading it
          "best effort" would mean silently misinterpreting a field we do not know about.
+D67/D75  ``mission`` is a DAG of steps in ``node_link_data`` shape, each node carrying its
+         manifest (``reads``, ``writes``, ``egress``) and a ``token_budget``; ``step`` is a
+         delta against one mission: a node's status, or one of the intervention verbs. The
+         resolved DAG is a fold in ``walle.missions``, never a mutation of the mission event.
 """
 
 from __future__ import annotations
@@ -36,6 +40,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Iterable
 from datetime import UTC, date, datetime
 from enum import StrEnum
 from typing import Annotated, Any, ClassVar, Literal
@@ -176,6 +181,39 @@ def now_instant() -> str:
 # --- enums ------------------------------------------------------------------------------
 
 
+class StepStatus(StrEnum):
+    """Where one node of a mission stands (D67).
+
+    ``pending`` is the state every node starts in and the one a human or the kernel sets a
+    node back to when it is re-dispatched after a crash (D91). ``completed`` is the only
+    state that satisfies a successor: a step is ready when every predecessor is completed,
+    not failed and not merely started. A closed set, like ``Level``: adding a member is a
+    version bump with an upcaster (D88).
+    """
+
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class StepVerb(StrEnum):
+    """What a ``step`` event does to its mission (D67).
+
+    ``status`` is the node-status delta the kernel writes as work happens. The other four
+    are the intervention verbs for a mission that runs forty minutes with nobody watching:
+    ``pause`` and ``resume`` hold and release the whole mission, ``inject`` adds a node with
+    its links, ``reassign`` hands a node to someone else. Each is an event, so each is
+    undone by a ``supersede`` of it and never by an edit (D8).
+    """
+
+    STATUS = "status"
+    PAUSE = "pause"
+    RESUME = "resume"
+    INJECT = "inject"
+    REASSIGN = "reassign"
+
+
 class Level(StrEnum):
     """How an assertion was reached (D94).
 
@@ -301,11 +339,11 @@ class Event(BaseModel):
         return data
 
 
-# --- the five types task 2 covers, and task 9's proposal --------------------------------
+# --- the five types task 2 covers, task 9's proposal, and Phase 2's mission and step ------
 #
-# §5.2's taxonomy also has utterance, capability, mission, trust, feedback and outcome.
-# They belong to phases that do not exist yet; adding them now would be guessing at their
-# fields with nothing to check the guess against.
+# §5.2's taxonomy also has utterance, capability, trust, feedback and outcome. They belong
+# to phases that do not exist yet; adding them now would be guessing at their fields with
+# nothing to check the guess against. `mission` and `step` arrived with Phase 2 (R8, D67).
 
 
 class Observation(Event):
@@ -436,8 +474,197 @@ class Contradiction(Event):
     note: str | None = None
 
 
+# --- missions (D67) ----------------------------------------------------------------------
+
+# A node id is a path-safe token, like a stream id: lowercase, no dots, no spaces. It is
+# quoted in refs' company ("d-mbp:3 names node 'water-plants'") and may one day name a
+# per-step working directory, so it is held to the same rule now rather than sanitized then.
+_NODE_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+
+
+def _check_node_id(value: str) -> str:
+    if not _NODE_ID_RE.fullmatch(value):
+        raise ValueError(f"not a node id: {value!r} — lowercase letters, digits, '_' and '-'")
+    return value
+
+
+type NodeId = Annotated[str, AfterValidator(_check_node_id)]
+
+
+def find_cycle(ids: Iterable[str], links: Iterable[tuple[str, str]]) -> list[str] | None:
+    """The first cycle in a directed graph, as a path that returns to its start, or ``None``.
+
+    Depth-first from each node in the order given, so the answer is deterministic for one
+    input and names the loop a person can read: ``['b', 'c', 'd', 'b']``. Iterative, so a
+    long chain cannot hit the recursion limit. A link naming a node outside ``ids`` is the
+    caller's error to report; here it is simply followed.
+    """
+    successors: dict[str, list[str]] = {}
+    for source, target in links:
+        successors.setdefault(source, []).append(target)
+    done: set[str] = set()
+    for start in ids:
+        if start in done:
+            continue
+        path, on_path = [start], {start}
+        cursors = [iter(successors.get(start, ()))]
+        while cursors:
+            nxt = next(cursors[-1], None)
+            if nxt is None:  # every successor of path[-1] is explored
+                finished = path.pop()
+                on_path.discard(finished)
+                done.add(finished)
+                cursors.pop()
+            elif nxt in on_path:
+                return [*path[path.index(nxt) :], nxt]
+            elif nxt not in done:
+                path.append(nxt)
+                on_path.add(nxt)
+                cursors.append(iter(successors.get(nxt, ())))
+    return None
+
+
+class Node(BaseModel):
+    """One step of a mission: what it is, who runs it, and its manifest (D67, D75).
+
+    The manifest is the permission grant (§7 rule 2): ``reads`` and ``writes`` are the paths
+    the step may touch and ``egress`` the hosts it may send to, checked before dispatch and
+    not after. A later version that declares more lapses whatever grant the mission had
+    (D117). ``token_budget`` is D22's threshold abort, per step.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: NodeId
+    title: str = Field(min_length=1, max_length=200)
+    reads: list[str] = Field(default_factory=list)
+    writes: list[str] = Field(default_factory=list)
+    egress: list[str] = Field(default_factory=list)
+    token_budget: int | None = Field(default=None, ge=1)
+    assignee: str | None = Field(default=None, min_length=1, max_length=64)
+    """Who runs it: an actor. ``None`` means whoever runs the mission. Changed by a
+    ``reassign`` step, never by rewriting this."""
+
+
+class Link(BaseModel):
+    """``source`` must be completed before ``target`` is ready. ``node_link_data``'s edge."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source: NodeId
+    target: NodeId
+
+
+class Mission(Event):
+    """A DAG of steps (D67), in the shape of networkx's ``node_link_data``: ``nodes`` and
+    ``links``. The event is the plan as proposed; everything that happens to it afterwards
+    is a ``step``, and the DAG as it stands now is ``walle.missions.fold_missions``.
+
+    A mission whose links loop is refused here, at construction and on load, because no
+    fold could give it a true answer: a step that waits on itself is never ready and never
+    wrong. Duplicate node ids and links to nodes the mission does not have are refused for
+    the same reason the log has one spelling for an instant — two shapes for one plan would
+    be two hashes.
+    """
+
+    type: Literal["mission"] = "mission"
+
+    title: str = Field(min_length=1, max_length=200)
+    nodes: list[Node] = Field(min_length=1)
+    links: list[Link] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _a_dag(self) -> Mission:
+        ids = [node.id for node in self.nodes]
+        seen: set[str] = set()
+        for node_id in ids:
+            if node_id in seen:
+                raise ValueError(f"node {node_id!r} appears twice")
+            seen.add(node_id)
+        edges: set[tuple[str, str]] = set()
+        for link in self.links:
+            for end in (link.source, link.target):
+                if end not in seen:
+                    raise ValueError(
+                        f"link {link.source} -> {link.target} names unknown node {end!r}"
+                    )
+            if (link.source, link.target) in edges:
+                raise ValueError(f"link {link.source} -> {link.target} appears twice")
+            edges.add((link.source, link.target))
+        cycle = find_cycle(ids, [(link.source, link.target) for link in self.links])
+        if cycle is not None:
+            raise ValueError(f"not a DAG, cycle: {' -> '.join(cycle)}")
+        return self
+
+
+class Step(Event):
+    """A delta against one mission (D67): a node's new status, or an intervention.
+
+    Which fields a step carries is decided by its ``verb``, and the validator holds each
+    verb to exactly its own fields, so that a pause cannot smuggle a status and a status
+    cannot smuggle a node. ``mission`` is a ref, like ``supersede.target``: a step whose
+    mission the fold was not given is reported, not dropped.
+
+    ========  =======================================================================
+    verb      fields
+    ========  =======================================================================
+    status    ``node``, ``status``; optionally ``cost_usd`` and ``tokens``, what this
+              step spent so far, summed by the fold for D22's abort
+    pause     none: the whole mission is held
+    resume    none
+    inject    ``inject`` (the new node), ``after`` (its predecessors) and ``before``
+              (its successors), both lists of existing node ids and both optional
+    reassign  ``node``, ``assignee``
+    ========  =======================================================================
+
+    ``note`` is free text for any verb: why it was paused, who asked for the reassign.
+    """
+
+    type: Literal["step"] = "step"
+
+    mission: Ref
+    verb: StepVerb
+
+    node: NodeId | None = None
+    status: StepStatus | None = None
+    cost_usd: float | None = Field(default=None, ge=0.0)
+    tokens: int | None = Field(default=None, ge=0)
+    inject: Node | None = None
+    after: list[NodeId] = Field(default_factory=list)
+    before: list[NodeId] = Field(default_factory=list)
+    assignee: str | None = Field(default=None, min_length=1, max_length=64)
+    note: str | None = None
+
+    @model_validator(mode="after")
+    def _fields_fit_the_verb(self) -> Step:
+        required, allowed = _STEP_FIELDS[self.verb]
+        present = {
+            name
+            for name in ("node", "status", "cost_usd", "tokens", "inject", "assignee")
+            if getattr(self, name) is not None
+        } | {name for name in ("after", "before") if getattr(self, name)}
+        if missing := required - present:
+            raise ValueError(f"a {self.verb.value} step needs {sorted(missing)}")
+        if extra := present - allowed:
+            raise ValueError(f"a {self.verb.value} step does not carry {sorted(extra)}")
+        return self
+
+
+_STEP_FIELDS: dict[StepVerb, tuple[frozenset[str], frozenset[str]]] = {
+    StepVerb.STATUS: (
+        frozenset({"node", "status"}),
+        frozenset({"node", "status", "cost_usd", "tokens"}),
+    ),
+    StepVerb.PAUSE: (frozenset(), frozenset()),
+    StepVerb.RESUME: (frozenset(), frozenset()),
+    StepVerb.INJECT: (frozenset({"inject"}), frozenset({"inject", "after", "before"})),
+    StepVerb.REASSIGN: (frozenset({"node", "assignee"}), frozenset({"node", "assignee"})),
+}
+"""Per verb: the fields it must carry, and the fields it may."""
+
+
 type AnyEvent = Annotated[
-    Observation | Assertion | Proposal | Supersede | Snapshot | Contradiction,
+    Observation | Assertion | Proposal | Supersede | Snapshot | Contradiction | Mission | Step,
     Field(discriminator="type"),
 ]
 
@@ -450,6 +677,8 @@ EVENT_TYPES: dict[str, type[Event]] = {
     "supersede": Supersede,
     "snapshot": Snapshot,
     "contradiction": Contradiction,
+    "mission": Mission,
+    "step": Step,
 }
 
 
