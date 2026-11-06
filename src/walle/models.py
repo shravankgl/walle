@@ -6,9 +6,9 @@ first colon splits the provider from the model, so a model name that holds a sla
 colon of its own reaches the provider exactly as written (aisuite's ``split(":", 1)``).
 
 The proposer's ``Model`` is a ``name`` and ``complete(request) -> str``; ``ProviderModel`` is
-that, plus ``text(prompt) -> str``, over one aisuite client. This is the same shape as the
-evals' adapter on the task 19b branch, so the two can become one module when both have
-landed.
+that, plus ``text(prompt) -> str``, over one aisuite client. It is the one provider adapter:
+``walle.evals.models`` re-exports it, so ``walle eval`` and ``walle propose`` reach a
+provider through the same call, the same timeout and the same scrubbing (issue #139).
 
 What a call does
 ----------------
@@ -35,8 +35,14 @@ never repeats a provider's error text, which is where a key would come back (a 4
 quotes the key it refused). An error carries the model name, a status, a duration or a
 class name, and is raised ``from None`` so a traceback does not carry the provider's
 exception either. Set-up messages from aisuite (an unknown provider, a missing key) are
-passed on after any value of a ``*KEY*``, ``*TOKEN*``, ``*SECRET*`` or ``*PASSWORD*``
-variable is masked; they name the variable, not its value.
+passed on after ``redact``: any value of a ``*KEY*``, ``*TOKEN*``, ``*SECRET*`` or
+``*PASSWORD*`` variable is masked, and so is a ``user:password@`` in the ``base_url`` the
+adapter was given; they name the variable, not its value. Whatever the SDK's constructor
+raises, of any class, is a ``ModelUnavailable`` said that way (issue #139): a provider
+library's own error type is not a reason to show its text.
+
+``redact`` is public because the ACP client (``walle.acp``) prints a host's error text to
+the terminal and masks it the same way.
 
 ``aisuite`` is imported inside ``ProviderModel`` and nowhere else, so this module loads with
 no provider library, and every other command keeps its start-up time.
@@ -60,6 +66,8 @@ NAME_CHARS = 64
 
 _PROVIDER_RE = re.compile(r"[A-Za-z0-9_.-]+:[A-Za-z0-9_.:/-]+")
 _SECRET_VAR = re.compile(r"KEY|TOKEN|SECRET|PASSWORD", re.IGNORECASE)
+_USERINFO = re.compile(r"//([^/@\s]+@)")
+"""The ``user:password@`` of a URL, with the ``@``: masked whole, so neither half is said."""
 _RETRY_AFTER = re.compile(r"\d{1,6}")
 
 
@@ -68,11 +76,16 @@ class ModelUnavailable(Exception):
     Raised before any call is made."""
 
 
-def _redact(text: str) -> str:
-    """``text`` with the value of every secret-named environment variable masked."""
+def redact(text: str, *urls: str | None) -> str:
+    """``text`` with the value of every secret-named environment variable masked, and the
+    ``user:password@`` of each of ``urls`` (where given) masked wherever it appears."""
     for var, value in os.environ.items():
         if _SECRET_VAR.search(var) and len(value) >= 8:
             text = text.replace(value, "[redacted]")
+    for url in urls:
+        if url:
+            for userinfo in _USERINFO.findall(url):
+                text = text.replace(userinfo, "[redacted]@")
     return text
 
 
@@ -188,7 +201,16 @@ class ProviderModel:
                 "retry limit, so walle does not use it"
             ) from None
         except ValueError as exc:
-            raise ModelUnavailable(f"{self._name} cannot be used: {_redact(str(exc))}") from None
+            raise ModelUnavailable(
+                f"{self._name} cannot be used: {redact(str(exc), self._base_url)}"
+            ) from None
+        except Exception as exc:
+            # An SDK's own error class (aisuite's LLMError, a provider's auth error) with
+            # whatever it chose to quote: said by its name, its text masked, from nothing.
+            raise ModelUnavailable(
+                f"{self._name} cannot be used: {type(exc).__name__}: "
+                f"{redact(str(exc), self._base_url)}"
+            ) from None
         return self._client
 
     def text(self, prompt: str) -> str:
