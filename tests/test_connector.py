@@ -149,6 +149,70 @@ def test_the_source_is_asked_with_the_folded_cursor(tmp_path: Path) -> None:
     assert second.asked == [Cursor(source="fake", observed_at=at(10), ts=TS, events=2)]
 
 
+class ScopedSource(ListSource):
+    """A source that asks for one slice of its provider (one calendar, one query) and writes
+    which slice on each body's first line. Its cursor is folded over that slice only."""
+
+    def __init__(self, scope: str, items: Iterable[Item]) -> None:
+        super().__init__(Item(i.observed_at, f"{scope}: {i.body}", i.source_version) for i in items)
+        self.scope = scope
+
+    def covers(self, body: str) -> bool:
+        return body.split("\n", 1)[0].startswith(f"{self.scope}: ")
+
+
+def test_a_source_that_covers_only_some_bodies_is_asked_with_the_cursor_over_those(
+    tmp_path: Path,
+) -> None:
+    """Issue #136: two calendars, or two queries, share one source name. Each is asked for
+    changes since *its own* last item, or the second one loses everything older than the
+    first one's cursor. The log already says which slice each item came from (D92)."""
+    writer = writer_for(tmp_path)
+    sync(ScopedSource("primary", items(at(9), at(10))), writer, ts=TS)
+    team = ScopedSource("team", items(at(5), at(7)))
+    report = sync(team, writer, ts=LATER)
+    assert team.asked == [Cursor(source="fake", observed_at=None, ts=None, events=0)]
+    assert [o.observed_at for o in report.appended] == [at(5), at(7)]
+    assert report.after == Cursor(source="fake", observed_at=at(7), ts=LATER, events=2)
+    primary = ScopedSource("primary", items(at(10)))
+    sync(primary, writer, ts=LATER)
+    assert primary.asked == [Cursor(source="fake", observed_at=at(10), ts=TS, events=2)]
+    # Without ``covers`` the fold is over the whole source, as before.
+    whole = ListSource([])
+    sync(whole, writer, ts=LATER)
+    assert whole.asked == [Cursor(source="fake", observed_at=at(10), ts=LATER, events=4)]
+    contents = read_stream(writer.root, writer.principal, writer.device)
+    assert cursor_of(contents, "fake", within=team.covers).observed_at == at(7)
+    assert fold_cursor(writer.root, "maya", "mbp", "fake", within=team.covers).events == 2
+
+
+def test_an_item_with_a_borrowed_time_is_the_same_item_whatever_the_time_says(
+    tmp_path: Path,
+) -> None:
+    """Issue #136: a cancelled event Google sends with no time of its own takes the
+    calendar's last change as ``observed_at``, and that moves with every edit. Such an item
+    is matched by its body alone, or it is appended again on every sync."""
+    writer = writer_for(tmp_path)
+    bare = Item(observed_at=at(10), body="event gone", borrowed_time=True)
+    sync(ListSource([bare]), writer, ts=TS)
+    moved = Item(observed_at=at(11), body="event gone", borrowed_time=True)
+    again = sync(ListSource([moved, moved]), writer, ts=LATER)
+    assert again.appended == () and len(again.already_logged) == 2
+    # Only the item that borrows its time is matched that way; an item with its own time
+    # and the same text is a new observation, as it always was.
+    own = sync(ListSource([Item(observed_at=at(11), body="event gone")]), writer, ts=LATER)
+    assert [o.observed_at for o in own.appended] == [at(11)]
+    # And a borrowed-time item seen in one run is not appended twice within it either.
+    fresh = writer_for(tmp_path / "other")
+    both = sync(
+        ListSource([bare, Item(observed_at=at(12), body="event gone", borrowed_time=True)]),
+        fresh,
+        ts=TS,
+    )
+    assert len(both.appended) == 1 and len(both.already_logged) == 1
+    assert [r["observed_at"] for r in lines_of(writer)] == [at(10), at(11)]
+
+
 # --- verify 1: a re-run adds no duplicates -------------------------------------------------
 
 

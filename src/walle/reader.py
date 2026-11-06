@@ -85,8 +85,35 @@ class CorruptStreamError(Exception):
     """A complete line of a stream is wrong in a way no interrupted append explains.
 
     Fatal rather than skipped: skipping would drop or renumber a real record without anyone
-    noticing. The message names the file and the 1-based line.
+    noticing. The message names the file and the 1-based line. When pydantic refused the
+    line, its message follows " — " and quotes the line; ``without_content`` says the same
+    error without the quote.
     """
+
+
+def without_content(exc: BaseException) -> str:
+    """The exception's message with its notes, minus anything pydantic quotes from its input.
+
+    The stream holds the owner's text, and pydantic's message for a line it refuses quotes the
+    offending value. So a validation failure is said as where it is (the file and line, from
+    this module's own words before " — ") and which field failed in what way, by pydantic's
+    error code. Never by its message, which can name an input value too ("Input tag 'x'").
+    An exception that did not come from pydantic is said as it is, notes included (D111).
+    """
+    notes = getattr(exc, "__notes__", [])
+    validation = exc if isinstance(exc, ValidationError) else exc.__cause__
+    if not isinstance(validation, ValidationError):
+        return "\n".join([str(exc), *notes])
+    problems = "; ".join(
+        f"{'.'.join(str(part) for part in error['loc']) or 'line'}: {error['type']}"
+        for error in validation.errors(include_url=False, include_input=False)
+    )
+    if validation is exc:
+        where = validation.title
+    else:  # "<file>:<line>: … — <pydantic's message>"; keep only the left
+        head, dash, _ = str(exc).partition(" — ")
+        where = head if dash else type(exc).__name__
+    return "\n".join([f"{where} ({problems})", *notes])
 
 
 @dataclass(frozen=True)
