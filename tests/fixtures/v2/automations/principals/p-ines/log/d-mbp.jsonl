@@ -1,0 +1,14 @@
+{"actor":"ines","caused_by":[],"name":"water-plants","seq":1,"title":"Remind me to water the plants on Sunday","ts":"2026-06-01T09:00:00.000000+00:00","type":"automation","v":2,"verb":"add"}
+{"actor":"ines","caused_by":[],"name":"bin-night","seq":2,"title":"Tell me on Tuesday evening which bins go out","ts":"2026-06-01T09:01:00.000000+00:00","type":"automation","v":2,"verb":"add"}
+{"actor":"ines","caused_by":[],"name":"school-run","seq":3,"title":"Text the school-run rota every Monday","ts":"2026-06-01T09:02:00.000000+00:00","type":"automation","v":2,"verb":"add"}
+{"actor":"ines","caused_by":[],"name":"dog-walk","seq":4,"title":"Remind me to book the dog walker","ts":"2026-06-01T09:03:00.000000+00:00","type":"automation","v":2,"verb":"add"}
+{"actor":"ines","caused_by":[],"name":"car-service","seq":5,"title":"Book the car service when the reminder letter comes","ts":"2026-06-01T09:04:00.000000+00:00","type":"automation","v":2,"verb":"add"}
+{"actor":"ines","caused_by":[],"note":"the council fines missed bins","seq":6,"target":"d-mbp:2","ts":"2026-06-02T09:00:00.000000+00:00","type":"automation","v":2,"verb":"pin"}
+{"actor":"ines","caused_by":[],"name":"piano-practice","seq":7,"title":"Nudge me to practise piano","ts":"2026-06-10T09:00:00.000000+00:00","type":"automation","v":2,"verb":"add"}
+{"actor":"kernel","caused_by":[],"result":"failed","seq":8,"target":"d-mbp:3","ts":"2026-08-01T09:00:00.000000+00:00","type":"outcome","v":1}
+{"actor":"ines","caused_by":[],"note":"still walking the dog in autumn","seq":9,"target":"d-mbp:4","ts":"2026-09-01T09:00:00.000000+00:00","type":"automation","v":2,"verb":"restore"}
+{"actor":"ines","caused_by":[],"depends_on":["d-mbp:5"],"name":"pay-rent","seq":10,"title":"Pay the rent on the first","ts":"2026-09-01T09:05:00.000000+00:00","type":"automation","v":2,"verb":"add"}
+{"actor":"kernel","caused_by":[],"result":"ok","seq":11,"target":"d-mbp:1","ts":"2026-09-10T09:00:00.000000+00:00","type":"outcome","v":1}
+{"actor":"curator","caused_by":[],"seq":12,"target":"d-mbp:7","ts":"2026-09-02T09:00:00.000000+00:00","type":"automation","v":2,"verb":"restore"}
+{"actor":"kernel","caused_by":[],"result":"ok","seq":13,"target":"d-mbp:7","ts":"2026-09-03T09:00:00.000000+00:00","type":"outcome","v":1}
+{"actor":"ines","caused_by":[],"seq":14,"target":"d-mbp:13","ts":"2026-09-04T09:00:00.000000+00:00","type":"supersede","v":1}

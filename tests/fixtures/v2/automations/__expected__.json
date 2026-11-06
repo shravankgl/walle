@@ -1,0 +1,32 @@
+{
+  "principal": "ines",
+  "events": 14,
+  "state_hash": "38a3055e0fb8591d46b831a76c155058339b5e818745851f219f197fea17ae36",
+  "fold": {
+    "current": [],
+    "retired": [],
+    "conflicts": [],
+    "unapplied": [],
+    "staged": []
+  },
+  "sentinels": {
+    "d-mbp:1.verb": "add",
+    "d-mbp:1.name": "water-plants",
+    "d-mbp:6.verb": "pin",
+    "d-mbp:6.target": "d-mbp:2",
+    "d-mbp:9.verb": "restore",
+    "d-mbp:9.target": "d-mbp:4",
+    "d-mbp:9.note": "still walking the dog in autumn",
+    "d-mbp:10.name": "pay-rent",
+    "d-mbp:10.depends_on": [
+      "d-mbp:5"
+    ],
+    "d-mbp:10.depends_on.0": "d-mbp:5",
+    "d-mbp:8.result": "failed",
+    "d-mbp:8.target": "d-mbp:3",
+    "d-mbp:12.actor": "curator",
+    "d-mbp:12.verb": "restore",
+    "d-mbp:14.type": "supersede",
+    "d-mbp:14.target": "d-mbp:13"
+  }
+}

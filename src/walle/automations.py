@@ -1,4 +1,4 @@
-"""The register of active automations, and the WIP cap on it (D6, D114, issue #95).
+"""The register of active automations, and the WIP cap on it (D6, D114, issues #95 and #96).
 
 D6: *restraint is enforced, not encouraged.* There is a hard cap on active automations,
 starting at 7, and adding one past it means retiring one (hard constraint 9). The register is
@@ -8,16 +8,22 @@ and 5), and picking which automations are active needs no model (hard constraint
 
 The rules
 ---------
-1. **Four verbs, each an event.** ``add`` puts an automation in the register as active;
+1. **Five verbs, each an event.** ``add`` puts an automation in the register as active;
    ``retire`` takes it out, and it stays in the log as retired, never deleted (D8, D114);
-   ``pin`` and ``unpin`` set and clear the human mark. An automation's identity is the ref of
-   its add, so a name retired and added again is a new automation.
+   ``pin`` and ``unpin`` set and clear the human mark; ``restore`` says a person still wants
+   it, changes nothing here, and resets the idle clock ``walle.rot`` labels by (#96). An
+   automation's identity is the ref of its add, so a name retired and added again is a new
+   automation.
 2. **The cap is hard.** With ``WIP_CAP`` automations active, an add is refused and writes
-   nothing, and the refusal names the one to retire: the oldest unpinned active automation,
-   by the ``ts`` of its add. ``add(..., retire=name)`` retires one and adds the new one under
-   one hold of the lock, so a swap cannot lose its slot to another writer. The fold holds an
-   add past the cap to the same rule, so an eighth that reached the log some other way (a
-   second device, a hand-written line) is reported, never applied. One slot is one workflow:
+   nothing, and the refusal names the one to retire: the oldest unpinned active automation
+   that no live automation names in ``depends_on``, by the ``ts`` of its add. While the
+   owner has ``WALLE_ROT=on`` as well, the writer offers an archived one first, then a stale
+   one (``walle.rot``; the owner's decision 1 on #96). The fold's own message keeps the rule
+   above, because it has no clock to label by. ``add(..., retire=name)`` retires one and
+   adds the new one under one hold of the lock, so a swap cannot lose its slot to another
+   writer. The fold holds an add past the cap to the same rule, so an eighth that reached
+   the log some other way (a second device, a hand-written line) is reported, never
+   applied. One slot is one workflow:
    an add's ``caused_by`` names at most one ref that is not a retire the register holds —
    the kept workflow it runs — beside at most one retire, the swap. An add naming eight
    workflows would take one slot and, through ``walle.builder.run_step``, authorise all
@@ -34,8 +40,16 @@ The rules
    automation without the unpin rule 3 requires, or free a slot with no retire on record.
    This is the inbox's rule 6 in another place: a fold says what a supersede means for it.
 6. **One check, two callers.** ``refusal`` is the only test of whether an event may change the
-   register. The writes call it before appending and the fold calls it after reading.
-7. **Off by default.** Nothing here writes unless the owner has set ``WALLE_AUTOMATIONS=on``
+   register. The writes call it before appending and the fold calls it after reading. Both
+   hand it the refs the log holds, so ``depends_on`` is checked the same way in both.
+7. **Dependencies are checked, and they hold (#96).** An add's ``depends_on`` names events
+   that must already be in this principal's log: the writer checks it under the lock, from
+   the same read the register is folded from, before anything is written, and the fold
+   reports an add naming a ref the log does not hold, or naming itself. Nothing an active
+   automation names is offered for retirement here, or labelled stale or archived by
+   ``walle.rot`` (D114, the owner's decision 2). A person may still retire it: that is a
+   person's call (D72), and nothing refuses it.
+8. **Off by default.** Nothing here writes unless the owner has set ``WALLE_AUTOMATIONS=on``
    in the environment, outside the log (D117: install is not enable, and the owner's
    condition on #95). Reading is not acting: ``active`` and the fold work either way. Nothing
    calls the writes on its own, and the CLI has no command for them.
@@ -81,7 +95,7 @@ from __future__ import annotations
 import contextlib
 import os
 import sys
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Container, Iterable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -177,6 +191,9 @@ class Entry:
     one (``workflow=``), and the retire it swapped with. ``walle.builder.run_step`` looks for
     the kept workflow here, so a workflow runs only while an active automation names it
     (D6, #121)."""
+    depends_on: tuple[str, ...] = ()
+    """The add's ``depends_on``: what this automation needs, which is never offered for
+    retirement or labelled while this one is active (#96)."""
 
     @property
     def status(self) -> Status:
@@ -215,14 +232,30 @@ class Register:
     def full(self) -> bool:
         return len(self.active) >= WIP_CAP
 
+    def held_by(self, ref: str) -> tuple[str, ...]:
+        """The active automations whose ``depends_on`` names ``ref``, in merge order (rule 7).
+        While any does, ``ref`` is never offered for retirement or labelled."""
+        return tuple(e.ref for e in self.active if ref in e.depends_on)
+
+    @property
+    def held(self) -> tuple[Entry, ...]:
+        """The active automations some active automation names in ``depends_on``."""
+        return tuple(e for e in self.active if self.held_by(e.ref))
+
+    @property
+    def offerable(self) -> tuple[Entry, ...]:
+        """The active automations that may be offered for retirement: not pinned (rule 3) and
+        not named by any active automation (rule 7)."""
+        return tuple(e for e in self.active if not e.pinned and not self.held_by(e.ref))
+
     @property
     def suggestion(self) -> Entry | None:
-        """The automation to retire to make room (rule 2): the oldest unpinned active one, by
-        the ``ts`` of its add and then by ref. ``None`` when every active one is pinned."""
-        unpinned = [e for e in self.active if not e.pinned]
-        if not unpinned:
+        """The automation to retire to make room (rule 2): the oldest offerable one, by the
+        ``ts`` of its add and then by ref. ``None`` when none is offerable."""
+        offerable = self.offerable
+        if not offerable:
             return None
-        return min(unpinned, key=lambda e: (datetime.fromisoformat(e.added), parse_ref(e.ref)))
+        return min(offerable, key=lambda e: (datetime.fromisoformat(e.added), parse_ref(e.ref)))
 
     def find(self, name: str) -> Entry | None:
         """The active automation called ``name``, if there is one."""
@@ -233,30 +266,56 @@ class Register:
         return next((e for e in self.entries if e.ref == ref), None)
 
 
-def full_message(register: Register, name: str) -> str:
+def full_message(
+    register: Register, name: str, *, offer: Entry | None = None, why: str | None = None
+) -> str:
     """What a refused add says (rule 2): the count, and which one to retire, or that none can
-    be offered because every active automation is pinned."""
+    be offered because every active automation is pinned or named by a live one.
+
+    ``offer`` and ``why`` replace the default suggestion and its description; the writer
+    passes ``walle.rot``'s archived or stale one while ``WALLE_ROT`` is on."""
     head = (
         f"the register is full: {len(register.active)} of {WIP_CAP} automations are active, "
         f"so '{name}' is past the cap"
     )
-    offer = register.suggestion
     if offer is None:
+        offer, why = register.suggestion, None
+    held = [e for e in register.held if not e.pinned]
+    held_note = ", ".join(f"'{e.name}' ({e.ref})" for e in held)
+    if offer is None:
+        if held:
+            return (
+                f"{head}, and every active automation is pinned or named by a live automation "
+                f"({held_note}): a person must unpin one, or retire what names it, first"
+            )
         return (
             f"{head}, and every active automation is pinned: a person must unpin one before "
             "it can be retired"
         )
     pinned = ", ".join(f"'{e.name}' ({e.ref})" for e in register.pinned)
     tail = f" Pinned, so not offered: {pinned}." if pinned else ""
-    return (
-        f"{head}. Retire one to make room: the oldest unpinned is '{offer.name}' "
-        f"({offer.ref}).{tail}"
+    if held:
+        tail += f" Named by a live automation, so not offered: {held_note}."
+    default = (
+        "the oldest not pinned or named by a live automation" if held else "the oldest unpinned"
     )
+    described = why if why is not None else default
+    return f"{head}. Retire one to make room: {described} is '{offer.name}' ({offer.ref}).{tail}"
 
 
-def refusal(register: Register, event: Automation) -> str | None:
+def refusal(
+    register: Register,
+    event: Automation,
+    *,
+    log: Container[str] = (),
+    ref: str | None = None,
+) -> str | None:
     """Why ``event`` may not change ``register`` as it stands, or ``None`` if it may (rules 2
-    to 4). Pure: the one check the writes and the fold share (rule 6)."""
+    to 4, and 7). Pure: the one check the writes and the fold share (rule 6).
+
+    ``log`` is the refs the principal's log holds, which an add's ``depends_on`` must be
+    among; ``ref`` is the event's own ref once it has one, which ``depends_on`` may not name.
+    """
     actor = event.actor
     if actor in MACHINE_ACTORS:
         return f"{actor!r} is part of walle, not a person: only a person changes the register (D72)"
@@ -278,6 +337,14 @@ def refusal(register: Register, event: Automation) -> str | None:
             return (
                 f"'{event.name}' names {len(swapped)} retires in caused_by; a swap retires one "
                 "to make room for one (rule 2)"
+            )
+        needs = event.depends_on or []
+        if ref is not None and ref in needs:
+            return f"'{event.name}' names itself ({ref}) in depends_on (rule 7)"
+        if missing := [d for d in needs if d not in log]:
+            return (
+                f"'{event.name}' depends on {', '.join(missing)}, which this principal's log "
+                "does not hold; depends_on names events that exist (rule 7)"
             )
         return None
     assert event.target is not None  # the event's validator requires it
@@ -309,8 +376,11 @@ def _apply(register: Register, ref: str, event: Automation) -> Register:
             title=event.title,
             added=event.ts,
             caused_by=tuple(event.caused_by),
+            depends_on=tuple(event.depends_on or ()),
         )
         return replace(register, entries=(*register.entries, added))
+    if event.verb is AutomationVerb.RESTORE:
+        return register  # the register is unchanged; walle.rot reads the restore from the log
     entries = []
     for e in register.entries:
         if e.ref == event.target:
@@ -351,7 +421,7 @@ def fold_automations(records: Iterable[Record]) -> Register:
             continue
         if not isinstance(event, Automation):
             continue
-        if (why := refusal(register, event)) is not None:
+        if (why := refusal(register, event, log=events, ref=ref)) is not None:
             unapplied.append(Unapplied(ref, why))
             continue
         register = _apply(register, ref, event)
@@ -381,10 +451,18 @@ def add(
     note: str | None = None,
     retire: str | None = None,
     workflow: str | None = None,
+    depends_on: Iterable[str] = (),
     actor: str = ACTOR_USER,
     environ: Mapping[str, str] | None = None,
 ) -> Entry:
     """Add an automation to the register, active, and return it.
+
+    With ``depends_on``, refs of events in this principal's log that the automation needs
+    (rule 7): each must already be in the log, checked under the lock from the same read the
+    register is folded from, and refused with ``RefusedError`` before anything is written,
+    the retire half of a swap included. While the owner also has ``WALLE_ROT=on``, a full
+    register's ``CapReachedError`` offers an archived automation first, then a stale one
+    (``walle.rot``), instead of the oldest by add.
 
     With ``workflow``, the ref of a kept workflow (``walle.builder.workflow``), the add's
     ``caused_by`` names it: that is what binds the automation to the workflow it runs, and
@@ -414,6 +492,7 @@ def add(
         title=title,
         note=note,
         caused_by=[] if workflow is None else [workflow],
+        depends_on=list(depends_on) or None,
     )
     _require_person(actor)
     with _exclusive(root, principal):
@@ -424,6 +503,7 @@ def add(
                 "automation is bound to an event that exists (D111)"
             )
         register = fold_automations(records)
+        known = {r.ref for r in records}
         swap: Automation | None = None
         if retire is not None:
             out = _active_named(register, retire)
@@ -438,9 +518,10 @@ def add(
                 raise RefusedError(why)
             # The ref is a stand-in: only the add's refusal is read from this register.
             register = _apply(register, "d-pending:1", swap)
-        if (why := refusal(register, event)) is not None:
+        if (why := refusal(register, event, log=known)) is not None:
             if register.full and register.find(name) is None:
-                raise CapReachedError(why, suggestion=register.suggestion, pinned=register.pinned)
+                offer, why = _cap_offer(register, records, event, environ, why)
+                raise CapReachedError(why, suggestion=offer, pinned=register.pinned)
             raise RefusedError(why)
         if swap is not None:
             retired = writer.append(swap)
@@ -459,7 +540,31 @@ def add(
         title=title,
         added=written.ts,
         caused_by=tuple(written.caused_by),
+        depends_on=tuple(written.depends_on or ()),
     )
+
+
+def _cap_offer(
+    register: Register,
+    records: list[Record],
+    event: Automation,
+    environ: Mapping[str, str] | None,
+    why: str,
+) -> tuple[Entry | None, str]:
+    """The automation a full register's refusal offers, and the refusal's words. The D6 rule
+    (``Register.suggestion``) unless the owner has ``WALLE_ROT=on``, when ``walle.rot`` offers
+    an archived automation first, then a stale one, labelled as of this add's ``ts``."""
+    from walle import rot  # rot imports this module; imported here, only when asked
+
+    if not rot.enabled(environ):
+        return register.suggestion, why
+    assert event.name is not None  # an add's validator requires it
+    label = rot.rot(register, records, datetime.fromisoformat(event.ts)).offer
+    entry = register.entry(label.ref) if label is not None else None
+    if label is None or entry is None:
+        return register.suggestion, why
+    described = f"{label.status}, idle {label.idle.days} days,"
+    return entry, full_message(register, event.name, offer=entry, why=described)
 
 
 def retire(
@@ -506,6 +611,23 @@ def unpin(
     return _change(root, principal, device, name, AutomationVerb.UNPIN, note, actor, environ)
 
 
+def restore(
+    root: Path,
+    principal: str,
+    device: str,
+    name: str,
+    *,
+    note: str | None = None,
+    actor: str = ACTOR_USER,
+    environ: Mapping[str, str] | None = None,
+) -> Entry:
+    """Say the active automation called ``name`` is still wanted (#96). The register is
+    unchanged; ``walle.rot`` counts its idle time from this event, so a stale or archived
+    automation is active again. Person-only like every register write (rule 4), and off
+    with the register. Returns it, unchanged."""
+    return _change(root, principal, device, name, AutomationVerb.RESTORE, note, actor, environ)
+
+
 def _change(
     root: Path,
     principal: str,
@@ -516,7 +638,7 @@ def _change(
     actor: str,
     environ: Mapping[str, str] | None,
 ) -> Entry:
-    """Retire, pin or unpin one active automation, deciding under ``automations.lock`` with
+    """Retire, pin, unpin or restore one active automation, deciding under ``automations.lock`` with
     the log read only after the lock is taken (see the walkthrough). Raises
     ``AutomationsOffError`` while off, ``FileNotFoundError`` for a principal with no log, and
     ``RefusedError`` when the change may not be made — all before anything is written."""
