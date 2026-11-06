@@ -15,6 +15,13 @@ Before the model
 ----------------
 Observations hold real session text, so three things happen before any of it is sent:
 
+0. **Contact details become tokens, when the owner says so** (``walle.pseudonyms``, D18,
+   issue #144). With ``WALLE_PSEUDONYMS=on`` an address, a phone number, a street address,
+   an account number or a message id is replaced by a stable local token before anything
+   below looks at the text, and a proposal that comes back citing a token is staged with
+   the value put back, so the log stays re-identifiable locally and nothing else does.
+   Off, which is the default, this step is not there and contact details are withheld by
+   step 1 exactly as before.
 1. **Hazards are flagged** (``hazards.flag``). An observation carrying a credential, a
    secret, contact details, a confidence, a planted instruction, a claim of approval, or a
    forged marker or turn is withheld entirely and reported by ref and kind, never by
@@ -42,6 +49,15 @@ it cannot hide anything either. A staged item is flagged whole and only then cut
 head the judge sees, and the head is scanned too; a reply's summary is flagged as the model
 wrote it and only then cut to one line. A hazard past a cut is still a hazard, and a cut
 that hid one would make the gate a matter of length.
+
+**Every model call goes through one door** (``pseudonyms.Egress``): ``propose`` and the
+shadow judge call ``door.complete(request)`` and never a model's own ``complete``. The door
+checks the exact string the adapter will send, ``request.prompt``, against every detector
+and against the mapping, and refuses rather than sends when anything is found, however it
+got there. A refused propose request withholds every observation it carried, reported by
+ref and kind like a flagged one; a refused judge request records a ``drop`` for each item
+in it, with the kinds as the reason. The pipeline above should leave the door nothing to
+find; the door is there for the day it does not.
 
 After the model
 ---------------
@@ -138,7 +154,7 @@ from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from walle import hazards, index
+from walle import hazards, index, pseudonyms
 from walle.envelope import deface
 from walle.events import (
     ACTOR_PROPOSER,
@@ -576,7 +592,12 @@ def workflow_idea(proposal: Proposal) -> bool:
 
 
 def _candidates(
-    reply: str, allowed: set[str], seen: set[tuple[str, str, str]], *, workflows: bool = False
+    reply: str,
+    allowed: set[str],
+    seen: set[tuple[str, str, str]],
+    *,
+    workflows: bool = False,
+    reidentify: Callable[[str], str] | None = None,
 ) -> tuple[list[_Candidate], list[str]]:
     """The proposals in a reply that pass every check, and a reason for each one that did not.
 
@@ -585,7 +606,10 @@ def _candidates(
     requests, so one fact proposed from two excerpts of a long observation is staged once.
     ``workflows`` is the owner's switch: off, an item that says it is a workflow is refused
     as ``workflow-off``; on, it is checked exactly as a memory is and staged with
-    ``WORKFLOW_PREFIX`` on its summary.
+    ``WORKFLOW_PREFIX`` on its summary. ``reidentify`` is the pseudonym layer's, when it is
+    on: applied to the summary and body *after* every check on the model's own text, because
+    the values it puts back are exactly what those checks refuse, and this is the one place
+    they belong, the local log.
     """
     kept: list[_Candidate] = []
     dropped: list[str] = []
@@ -624,6 +648,16 @@ def _candidates(
         if hazards.flag(whole):
             dropped.append("hazard-in-text")
             continue
+        if reidentify is not None:
+            try:
+                summary = clean_summary(summarise(head + reidentify(item.summary.strip())))
+                body = clean_body(reidentify(item.body))
+            except ValueError:
+                dropped.append("malformed")
+                continue
+            if len(body) > BODY_CHARS:
+                dropped.append("oversize")  # a value is longer than its token
+                continue
         observation = _ref_of(item.excerpt)
         key = (observation, summary, body)
         if key in seen:
@@ -766,7 +800,9 @@ def _append_seen(path: Path, seen: Iterable[Seen]) -> int:
 
 @dataclass(frozen=True)
 class Withheld:
-    """An observation kept off the wire: its ref and the kinds found, nothing of its text."""
+    """An observation kept off the wire: its ref and the kinds found, nothing of its text.
+    The kinds are ``hazards.KINDS``, or the door's own (``pseudonyms.LEAK``,
+    ``pseudonyms.UNWRAPPED``) when the door refused the request it was in."""
 
     ref: str
     hazards: tuple[str, ...]
@@ -850,6 +886,10 @@ def propose(
     writer = StreamWriter(root, principal, device)  # validates both names first
     when = now_instant() if ts is None else ts
     workflows = workflows_enabled(environ)
+    layer = (
+        pseudonyms.Pseudonymiser(root, principal, device) if pseudonyms.enabled(environ) else None
+    )
+    door = pseudonyms.Egress(model, layer)
     report = index.update(root, principal)
     records = report.records
 
@@ -861,27 +901,43 @@ def propose(
     for record in records:
         if not isinstance(record.event, Observation) or record.ref in considered:
             continue
-        kinds, pieces = _scanned(record.ref, record.event.body)
+        kinds, pieces = _scanned(record.ref, record.event.body, layer)
         if kinds:
             withheld.append(Withheld(record.ref, kinds))
             continue
         items.extend(pieces)
         shown.append(record.ref)
 
-    # Ask, with no lock held. Every reply is read before anything is written, so a bad one
-    # among several writes nothing at all.
+    # Ask, through the door, with no lock held. Every reply is read before anything is
+    # written, so a bad one among several writes nothing at all. A request the door refuses
+    # was never sent: its observations are withheld and not marked seen.
     candidates: list[_Candidate] = []
     dropped: list[str] = []
     seen_candidates: set[tuple[str, str, str]] = set()
     requests = 0
     for request in _requests("propose", items, workflows=workflows):
-        requests += 1
         allowed = {item_id for item_id, _ in request.items}
-        kept, refused = _candidates(
-            model.complete(request), allowed, seen_candidates, workflows=workflows
+        try:
+            reply = door.complete(request)
+        except pseudonyms.Refused as refused:
+            refs = {_ref_of(item_id) for item_id in allowed}
+            withheld.extend(Withheld(ref, refused.kinds) for ref in shown if ref in refs)
+            shown = [ref for ref in shown if ref not in refs]
+            continue
+        requests += 1
+        kept, refused_items = _candidates(
+            reply,
+            allowed,
+            seen_candidates,
+            workflows=workflows,
+            reidentify=None if layer is None else layer.reidentify,
         )
         candidates.extend(kept)
-        dropped.extend(refused)
+        dropped.extend(refused_items)
+    # A long observation spans requests; one sent and one refused leaves it withheld, and a
+    # withheld observation is never also proposed from (review of PR #145, low 2).
+    kept_off = {w.ref for w in withheld}
+    candidates = [c for c in candidates if c.observation not in kept_off]
 
     proposed: list[str] = []
     new_items: list[Staged] = []
@@ -928,7 +984,7 @@ def propose(
         have = {(v.proposal, v.model) for v in read_verdicts(root, principal)}
         to_judge = [item for item in queue if (item.ref, model.name) not in have]
         if to_judge:
-            judged, asked = _judge(model, to_judge, when)
+            judged, asked = _judge(door, to_judge, when, layer)
             requests += asked
             verdicts = _append_verdicts(verdicts_path(root, principal), judged)
     except (ModelReplyError, ModelCallError, OSError, ValueError) as exc:
@@ -947,23 +1003,42 @@ def propose(
     )
 
 
-def _scanned(ref: str, body: str) -> tuple[tuple[str, ...], list[tuple[str, str]]]:
+def _scanned(
+    ref: str, body: str, layer: pseudonyms.Pseudonymiser | None = None
+) -> tuple[tuple[str, ...], list[tuple[str, str]]]:
     """The hazards in an observation and, when there are none, the excerpts to send.
 
-    The body is scanned whole, as the observer wrote it, and then every excerpt is scanned
-    exactly as the model will see it, labelled and cut; the kinds found anywhere, in
-    ``hazards.KINDS`` order, withhold the whole observation. The second pass is what makes
-    the cut safe whatever it falls on (issue #137): a label the slice put at the start of a
-    line is a turn in the piece even when it was mid-line in the body.
+    With ``layer`` on, the body is pseudonymised first, and everything below reads the
+    result: the scan is of the text that would go out, so an address the layer missed is
+    still ``contact`` and still withholds (issue #144). The body is scanned whole, and then
+    every excerpt is scanned exactly as the model will see it, labelled and cut; the kinds
+    found anywhere, in ``hazards.KINDS`` order, withhold the whole observation. The second
+    pass is what makes the cut safe whatever it falls on (issue #137): a label the slice
+    put at the start of a line is a turn in the piece even when it was mid-line in the body.
+    With the layer on, a value the mapping holds that is still in the body or a piece is
+    ``pseudonyms.LEAK`` here, per observation, so one such observation is withheld alone
+    rather than refused by the door with every other item in its request (review of PR
+    #145, medium 2).
     """
-    kinds = hazards.flag(body)
+    if layer is not None:
+        body = layer.pseudonymise(body)
+    kinds = _flagged(body, layer)
     if kinds:
         return kinds, []
     pieces = excerpts(ref, labelled(body))
-    found = {kind for _, text in pieces for kind in hazards.flag(text)}
+    found = {kind for _, text in pieces for kind in _flagged(text, layer)}
     if found:
-        return tuple(kind for kind in hazards.KINDS if kind in found), []
+        return tuple(kind for kind in (*hazards.KINDS, pseudonyms.LEAK) if kind in found), []
     return (), pieces
+
+
+def _flagged(text: str, layer: pseudonyms.Pseudonymiser | None) -> tuple[str, ...]:
+    """``hazards.flag``, plus ``pseudonyms.LEAK`` when the layer is on and a mapped value is
+    in ``text``: the door's checks, run per item before any batching."""
+    kinds = hazards.flag(text)
+    if layer is not None and layer.leaks(text):
+        kinds = (*kinds, pseudonyms.LEAK)
+    return kinds
 
 
 def _cited_now(stream: LockedStream, log: Path) -> set[str]:
@@ -993,36 +1068,56 @@ def _read_other(path: Path) -> StreamContents:
         return parse_stream(f.read(), path, path.stem)
 
 
-def _judge(model: Model, queue: Sequence[Staged], when: str) -> tuple[list[ShadowVerdict], int]:
+def _judge(
+    door: pseudonyms.Egress,
+    queue: Sequence[Staged],
+    when: str,
+    layer: pseudonyms.Pseudonymiser | None = None,
+) -> tuple[list[ShadowVerdict], int]:
     """The model's verdict on each staged item, and how many requests that took.
 
     A staged item that itself carries a hazard (``walle remember`` takes any text) never
     reaches the model. It gets a ``drop`` from this module, with the kind as the reason. The
     whole item is flagged; only an item with nothing in it is cut to the head the model
-    sees, and the head is flagged again as it will be sent (issue #137).
+    sees, and the head is flagged again as it will be sent (issue #137). With ``layer`` on
+    the item is pseudonymised first, like an observation, so a remembered address is judged
+    as a token rather than dropped unseen. Every call goes through ``door``; a request it
+    refuses records a ``drop`` for each item in it, with the kinds as the reason.
     """
     by_ref = {item.ref: item for item in queue}
     verdicts: dict[str, ShadowVerdict] = {}
     items: list[tuple[str, str]] = []
+
+    def withheld(ref: str, kinds: tuple[str, ...]) -> ShadowVerdict:
+        return ShadowVerdict(
+            ts=when,
+            proposal=ref,
+            model=door.name,
+            verdict="drop",
+            reason=f"withheld from the model: {', '.join(kinds)}",
+        )
+
     for item in queue:
         whole = f"{item.proposal.summary}\n{item.proposal.body}"
+        if layer is not None:
+            whole = layer.pseudonymise(whole)
         # Judged on its head, bounded like an excerpt: ``walle remember`` takes any length.
         head = excerpts(item.ref, whole)[0][1]
-        if kinds := hazards.flag(whole) or hazards.flag(head):
-            verdicts[item.ref] = ShadowVerdict(
-                ts=when,
-                proposal=item.ref,
-                model=model.name,
-                verdict="drop",
-                reason=f"withheld from the model: {', '.join(kinds)}",
-            )
+        if kinds := _flagged(whole, layer) or _flagged(head, layer):
+            verdicts[item.ref] = withheld(item.ref, kinds)
         else:
             items.append((item.ref, head))
     requests = 0
     for request in _requests("judge", items):
-        requests += 1
         asked = {item_id for item_id, _ in request.items}
-        for raw in _parse_list(model.complete(request), "judge"):
+        try:
+            reply = door.complete(request)
+        except pseudonyms.Refused as refused:
+            for ref in asked:
+                verdicts.setdefault(ref, withheld(ref, refused.kinds))
+            continue
+        requests += 1
+        for raw in _parse_list(reply, "judge"):
             try:
                 item = _VerdictReply.model_validate(raw)
             except ValidationError:
@@ -1034,7 +1129,7 @@ def _judge(model: Model, queue: Sequence[Staged], when: str) -> tuple[list[Shado
                 reason = "reason withheld: it carried a hazard or a marker"
             reason = reason[:500]
             verdicts[item.ref] = ShadowVerdict(
-                ts=when, proposal=item.ref, model=model.name, verdict=item.verdict, reason=reason
+                ts=when, proposal=item.ref, model=door.name, verdict=item.verdict, reason=reason
             )
     return [verdicts[ref] for ref in by_ref if ref in verdicts], requests
 

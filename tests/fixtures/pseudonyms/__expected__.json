@@ -1,0 +1,18 @@
+{
+  "tokens": {
+    "From: Alice Tutor <alice.tutor@example.test>": "From: PERSON_74d58d3c53",
+    "Call 555-0142 today": "Call PHONE_e4e7280166 today",
+    "Location: 12 Orchard Lane": "Location: ADDRESS_7f888d503c",
+    "Message-ID: <m-0001.abc@mail.example.test>": "Message-ID: MSGID_afdd26370d",
+    "account number 12345678": "account number ACCOUNT_806ca02842",
+    "Cc: pat@example.test": "Cc: PERSON_d13495d469"
+  },
+  "reidentify": {
+    "PERSON_74d58d3c53": "alice.tutor@example.test",
+    "PHONE_e4e7280166": "555-0142",
+    "ADDRESS_7f888d503c": "12 Orchard Lane",
+    "MSGID_afdd26370d": "<m-0001.abc@mail.example.test>",
+    "ACCOUNT_806ca02842": "12345678",
+    "PERSON_d13495d469": "PERSON_d13495d469"
+  }
+}
