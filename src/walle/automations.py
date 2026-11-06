@@ -17,7 +17,11 @@ The rules
    by the ``ts`` of its add. ``add(..., retire=name)`` retires one and adds the new one under
    one hold of the lock, so a swap cannot lose its slot to another writer. The fold holds an
    add past the cap to the same rule, so an eighth that reached the log some other way (a
-   second device, a hand-written line) is reported, never applied.
+   second device, a hand-written line) is reported, never applied. One slot is one workflow:
+   an add's ``caused_by`` names at most one ref that is not a retire the register holds —
+   the kept workflow it runs — beside at most one retire, the swap. An add naming eight
+   workflows would take one slot and, through ``walle.builder.run_step``, authorise all
+   eight; it is refused and reported like an eighth (#130).
 3. **``pinned`` is a floor (D114).** A pinned automation is never offered for retirement, and
    a retire or a swap naming it is refused until a person unpins it, which is its own event.
    If every active automation is pinned, the refusal says so and offers none.
@@ -262,6 +266,19 @@ def refusal(register: Register, event: Automation) -> str | None:
             return f"'{event.name}' is already active as {same.ref}"
         if register.full:
             return full_message(register, event.name)
+        retires = {e.retired_ref for e in register.retired}
+        swapped = [c for c in event.caused_by if c in retires]
+        workflows = [c for c in event.caused_by if c not in retires]
+        if len(workflows) > 1:
+            return (
+                f"'{event.name}' names {len(workflows)} workflows in caused_by; one automation "
+                "is one slot under the cap and runs one workflow (D6, hard constraint 9)"
+            )
+        if len(swapped) > 1:
+            return (
+                f"'{event.name}' names {len(swapped)} retires in caused_by; a swap retires one "
+                "to make room for one (rule 2)"
+            )
         return None
     assert event.target is not None  # the event's validator requires it
     target = register.entry(event.target)

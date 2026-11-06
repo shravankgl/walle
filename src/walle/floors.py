@@ -87,6 +87,12 @@ changes what is at the path), ``delete``, ``rename`` (both ends) and ``link`` (h
 symbolic; the name made and the thing it names). The kind is carried into the refusal so it
 reads as what was asked; no kind is let through that another is not.
 
+``escape`` is the third reader of a path here, for the Builder's runner (``walle.builder``,
+#130): not whether a path reaches a floor, but whether the place it lands is the place a
+container that sees the workspace at ``/workspace`` would land it. A link is read the same on
+both sides only when its target is relative and the walk never leaves the workspace; an
+absolute target or a climb above it is refused, whatever the host finds there.
+
 The dormant rule, for a check
 -----------------------------
 This module never writes, starts nothing, reads no clock and no environment, and has no
@@ -388,6 +394,67 @@ def _check(
             return found, hop, True
     if (rel := _relative(landing, root_real)) is not None and (found := hit(rel)) is not None:
         return found, landing, False
+    return None
+
+
+def escape(root: str | os.PathLike[str], path: str) -> str | None:
+    """How ``path``, read from ``root``, would land somewhere else for a process that sees
+    ``root`` under another name — a container with ``root`` bind-mounted at ``/workspace``
+    (``walle.executor``) — or ``None`` when that process and this one agree (#130; D68).
+
+    The two agree only when every link met is relative and the walk never leaves ``root``.
+    ``path`` is walked from ``root`` one component at a time, following links as the OS does:
+    a link with an absolute target is refused (it names the other process's path, which here
+    is another place or nothing); a ``..`` that climbs above ``root`` is refused at once,
+    even if the rest of the path would climb back in (``/workspace/../ws/notes`` is not
+    ``<root>/notes`` over there); a walk that cannot finish — a loop, a name that cannot be
+    read — is refused (D86); and the landing must be strictly inside ``root``. ``_walk`` is
+    not reused because it follows an absolute target to where *this* process finds it, which
+    is the right answer for a floor and the wrong one here. Reads the filesystem only to
+    resolve names: ``lstat`` and ``readlink``.
+    """
+    base_dir = os.path.abspath(os.fspath(root))
+    base = base_dir.rstrip(os.sep) + os.sep
+    current = base_dir
+    parts = [p for p in path.split(os.sep) if p]
+    hops = 0
+    while parts:
+        part = parts.pop(0)
+        if part == ".":
+            continue
+        if part == "..":
+            current = os.path.dirname(current)
+            if current != base_dir and not current.startswith(base):
+                return (
+                    "climbs above the workspace through a link; a container would land it elsewhere"
+                )
+            continue
+        candidate = os.path.join(current, part)
+        try:
+            is_link = stat.S_ISLNK(os.lstat(candidate).st_mode)
+        except FileNotFoundError:
+            is_link = False  # nothing there yet: the rest of the path is what would be made
+        except (OSError, ValueError):
+            return "cannot be resolved in the workspace; refused (D86)"
+        if not is_link:
+            current = candidate
+            continue
+        hops += 1
+        if hops > HOP_LIMIT:
+            return "follows too many links in the workspace; refused (D86)"
+        try:
+            target = os.readlink(candidate)
+        except (OSError, ValueError):
+            return "cannot be resolved in the workspace; refused (D86)"
+        if os.path.isabs(target):
+            name = os.path.relpath(candidate, base_dir)
+            return (
+                f"passes through link {name!r} whose target is absolute; a container sees the "
+                "workspace at another path, so only a relative link inside it is trusted"
+            )
+        parts = [p for p in target.split(os.sep) if p] + parts
+    if current == base_dir or not current.startswith(base):
+        return "lands outside the workspace through a link; a container would land it elsewhere"
     return None
 
 
