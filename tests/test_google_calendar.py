@@ -1349,3 +1349,162 @@ def test_the_command_reports_a_missing_token_file_plainly(tmp_path: Path) -> Non
     )  # fmt: skip
     assert result.exit_code != 0
     assert "sign-in" in result.output
+
+
+# --- the audit (issue #136): a bare cancellation, a second calendar, the exchange, the command
+
+
+def test_a_cancelled_event_without_a_time_is_not_logged_again_when_the_calendar_moves_on(
+    tmp_path: Path,
+) -> None:
+    """Issue #136: the borrowed ``observed_at`` is the calendar's last change, which moves
+    with every edit anywhere on the calendar, so the same bare cancellation came back as a
+    new item on every sync inside the overlap. The same body is the same item."""
+    fake = FakeCalendar(calendar_updated="2026-11-04T10:00:00.000Z")
+    fake.add(
+        "primary",
+        {"kind": "calendar#event", "id": "gone", "status": "cancelled"},
+        hidden_updated="2026-11-04T09:50:00.000Z",
+    )
+    writer = writer_for(tmp_path)
+    first = sync(CalendarSource(client(fake)), writer)
+    assert [a.observed_at for a in first.appended] == ["2026-11-04T10:00:00.000000+00:00"]
+    # Another event changes at 10:10; the calendar's ``updated`` moves with it.
+    fake.calendar_updated = "2026-11-04T10:10:00.000Z"
+    fake.add("primary", event("other", updated="2026-11-04T10:10:00Z", start=when("2026-12-01")))
+    second = sync(CalendarSource(client(fake)), writer, ts="2026-11-04T10:10:00.000000+00:00")
+    assert [a.body.split("\n")[0] for a in second.appended] == [
+        "Google Calendar event other on calendar primary"
+    ]
+    assert len(second.already_logged) == 1
+    gone = [b for b in bodies(writer) if b.startswith("Google Calendar event gone ")]
+    assert len(gone) == 1
+    # And on the full-listing fallback too.
+    fake.calendar_updated = "2026-11-04T10:20:00.000Z"
+    fake.too_old_before = "2099-01-01T00:00:00Z"
+    third = sync(CalendarSource(client(fake)), writer, ts="2026-11-04T10:20:00.000000+00:00")
+    assert third.appended == ()
+    assert len([b for b in bodies(writer) if b.startswith("Google Calendar event gone ")]) == 1
+
+
+def test_a_second_calendar_in_the_same_stream_starts_from_its_own_cursor(tmp_path: Path) -> None:
+    """Issue #136: both calendars fold one ``google-calendar`` cursor, so the team calendar
+    was asked for changes since the primary's last one and lost everything older."""
+    fake = FakeCalendar()
+    fake.add("primary", event("mine", updated="2026-11-06T08:00:00Z", start=when("2026-12-01")))
+    team = "team@group.calendar.example.com"
+    fake.add(team, event("standup", updated="2026-11-06T05:00:00Z", start=when("2026-12-02")))
+    fake.add(team, event("retro", updated="2026-11-06T07:30:00Z", start=when("2026-12-03")))
+    writer = writer_for(tmp_path)
+    assert len(sync(CalendarSource(client(fake)), writer).appended) == 1
+    fake.requests.clear()
+    report = sync(
+        CalendarSource(client(fake), calendar_id=team),
+        writer,
+        ts="2026-11-06T09:00:00.000000+00:00",
+    )
+    assert report.before.observed_at is None
+    assert "updatedMin" not in fake.list_params[0]
+    assert sorted(a.body.split("\n")[0] for a in report.appended) == [
+        f"Google Calendar event retro on calendar {team}",
+        f"Google Calendar event standup on calendar {team}",
+    ]
+    assert report.after.observed_at == "2026-11-06T07:30:00.000000+00:00"
+    # Each calendar's next sync starts from its own cursor, less the overlap.
+    fake.requests.clear()
+    sync(CalendarSource(client(fake)), writer)
+    assert fake.list_params[0]["updatedMin"] == "2026-11-06T07:00:00.000000+00:00"
+    fake.requests.clear()
+    sync(CalendarSource(client(fake), calendar_id=team), writer)
+    assert fake.list_params[0]["updatedMin"] == "2026-11-06T06:30:00.000000+00:00"
+
+
+def test_a_source_covers_only_the_bodies_of_its_own_calendar() -> None:
+    source = CalendarSource(client(FakeCalendar()), calendar_id="team@group.calendar.example.com")
+    _, mine = render_event(event("e", updated="2026-11-01T00:00:00Z"), calendar_id="primary")
+    _, theirs = render_event(
+        event("e", updated="2026-11-01T00:00:00Z"), calendar_id="team@group.calendar.example.com"
+    )
+    assert source.covers(theirs) and not source.covers(mine)
+    assert CalendarSource(client(FakeCalendar())).covers(mine)
+    assert not source.covers("user: Google Calendar event e on calendar primary")
+
+
+def test_the_code_exchange_error_names_no_secret_and_stays_on_one_line() -> None:
+    """The #65 low: Google's error text went into ``AuthError`` unscrubbed."""
+    verifier = "FAKE-VERIFIER-NOT-REAL-0004"
+
+    def echoing(request: Request) -> Response:
+        form = form_of(request)
+        return Response(
+            400,
+            {"Content-Type": "application/json"},
+            json.dumps(
+                {
+                    "error": "invalid_grant\nsecret=" + form["client_secret"]
+                    + " code=" + form["code"] + " verifier=" + form["code_verifier"]
+                }
+            ).encode(),
+        )  # fmt: skip
+
+    with pytest.raises(AuthError) as caught:
+        gcal.exchange_code(
+            echoing,
+            client_id=CLIENT_ID,
+            client_secret=CLIENT_SECRET,
+            code="fake-auth-code",
+            redirect_uri="http://127.0.0.1:1/",
+            code_verifier=verifier,
+        )
+    text = str(caught.value)
+    assert "invalid_grant" in text
+    for secret in (CLIENT_SECRET, "fake-auth-code", verifier):
+        assert secret not in text
+    assert "\n" not in text
+
+
+def test_a_refresh_granted_a_wider_scope_is_refused_and_neither_file_nor_log_is_written(
+    tmp_path: Path,
+) -> None:
+    fake = calendar()
+    original = fake._token
+
+    def wider(request: Request) -> Response:
+        response = original(request)
+        data = json.loads(response.body)
+        data["scope"] = f"{READONLY_SCOPE} https://www.googleapis.com/auth/calendar"
+        return Response(response.status, dict(response.headers), json.dumps(data).encode())
+
+    fake._token = wider  # type: ignore[method-assign]
+    store = TokenStore(tmp_path / "outside" / "token.json")
+    store.save(token(expires_at=PAST))
+    before = store.path.read_bytes()
+    writer = writer_for(tmp_path)
+    expired = client(fake, token(expires_at=PAST), store=store)
+    with pytest.raises(AuthError, match="scope"):
+        sync(CalendarSource(expired), writer)
+    assert store.path.read_bytes() == before
+    assert not writer.path.exists()
+    assert fake.api_requests == []
+
+
+def test_the_command_reports_a_corrupt_stream_without_quoting_its_contents(
+    tmp_path: Path,
+) -> None:
+    writer = writer_for(tmp_path)
+    writer.path.parent.mkdir(parents=True)
+    planted = "SOMETHING-PRIVATE-IN-THE-LOG"
+    writer.path.write_text(
+        json.dumps({"seq": 1, "type": "observation", "body": planted}) + "\n", encoding="utf-8"
+    )
+    store = TokenStore(tmp_path / "outside" / "token.json")
+    store.save(token())
+    result = CliRunner().invoke(
+        gcal.main,
+        ["sync", "--root", str(writer.root), "--principal", "maya", "--device", "mbp",
+         "--token-file", str(store.path)],
+    )  # fmt: skip
+    assert result.exit_code != 0
+    assert planted not in result.output
+    assert f"{writer.path}:1" in result.output
+    assert "ts: missing" in result.output

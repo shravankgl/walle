@@ -395,3 +395,36 @@ def test_a_read_waits_for_an_append_in_progress(tmp_path: Path) -> None:
 
     assert [r.seq for r in result[0]] == [1, 2]
     assert result[0].skips == ()
+
+
+def test_a_refusal_can_be_said_without_the_line_it_refused() -> None:
+    """``without_content`` (issue #136): a corrupt line's error names the file, the line and
+    the failing fields by pydantic's code, never the value that was there. Shared by the
+    ``walle`` command and the connectors' own commands."""
+    from pydantic import BaseModel, ConfigDict, ValidationError
+
+    from walle.reader import without_content
+
+    class Strict(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
+    secret = "NOT-FOR-THE-TERMINAL"
+    with pytest.raises(ValidationError) as caught:
+        Strict.model_validate({"field": secret})
+    wrapped = CorruptStreamError(
+        f"/log/d-x.jsonl:3: a complete line that is not a valid event — {caught.value}"
+    )
+    wrapped.__cause__ = caught.value
+    bare = RuntimeError(f"wrapped {caught.value}")
+    bare.__cause__ = caught.value
+    for exc in (caught.value, wrapped, bare):
+        message = without_content(exc)
+        assert secret not in message
+        assert "field: extra_forbidden" in message
+    assert without_content(wrapped) == (
+        "/log/d-x.jsonl:3: a complete line that is not a valid event (field: extra_forbidden)"
+    )
+    assert without_content(bare).startswith("RuntimeError (")
+    plain = CorruptStreamError("/log/d-x.jsonl:3: an event with no seq")
+    plain.add_note("built 2026-11-06")
+    assert without_content(plain) == "/log/d-x.jsonl:3: an event with no seq\nbuilt 2026-11-06"

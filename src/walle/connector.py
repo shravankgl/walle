@@ -44,6 +44,26 @@ What makes two items the same: ``(source, observed_at, body, source_version)``. 
 second observation, which is right: the thing observed changed. Telling the two apart needs
 a stable item id on the event, and that is a schema change (D88, D96), not a base concern.
 
+One exception, declared by the source: an item whose ``observed_at`` is *borrowed*. A
+cancelled calendar event the provider sends bare has no time of its own, so the source lends
+it the calendar's last change, and that moves with every edit anywhere on the calendar. Matched
+on the full key, such an item is new on every sync (issue #136). So an ``Item`` with
+``borrowed_time`` set is the same as a logged one when ``(source, body, source_version)``
+match, whatever either ``observed_at`` says. The log is not changed and carries no flag; the
+source knows which of its items borrowed a time, and says so on each pull.
+
+One source, several asks (issue #136)
+--------------------------------------
+A source name is one provider: ``mail``, ``calendar``. The owner can ask one provider for
+several slices of itself: a second calendar, a different search. Folded over
+the whole source, the cursor after syncing the first slice is the ``since`` the second is
+asked with, and everything in the second slice older than that is never fetched. The fix
+is still a fold, still over the log and nothing else (D92): a source that writes which
+slice each item came from on the item itself may also say which bodies it ``covers``, and
+the base then folds the cursor over those bodies only. The content fold that stops a
+duplicate is not narrowed; it is over the whole source, as before. A source without
+``covers`` is folded whole, as before.
+
 Order of operations, and why
 ----------------------------
 1. Fold the cursor from the stream (a short ``LOCK_SH`` read; a missing stream is an empty
@@ -89,7 +109,7 @@ under the lock and neither sees the other's items as its own (the key carries ``
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -117,6 +137,10 @@ class Item:
     where text is recalled (D55), not here, and nothing in the base reads it."""
     source_version: str | None = None
     """The version of what produced it, when the source has one (D101)."""
+    borrowed_time: bool = False
+    """``observed_at`` is not the item's own time but one the source lent it, and may differ
+    the next time the same item is pulled. Such an item is matched by body and version alone
+    (module docstring). The flag is the source's word to the base; nothing writes it."""
 
 
 @dataclass(frozen=True)
@@ -152,6 +176,18 @@ class Source(Protocol):
         ...
 
 
+@runtime_checkable
+class Scoped(Protocol):
+    """A source that asks its provider for one slice of itself (one calendar, one search)
+    and marks each item with which. Optional: a source without ``covers`` is folded whole."""
+
+    def covers(self, body: str) -> bool:
+        """Whether a logged observation of this source came from the slice this source
+        asks for. Read from the body, which is where the source wrote it; a body it cannot
+        read is not covered, which only makes the cursor earlier, never later."""
+        ...
+
+
 @dataclass(frozen=True)
 class SyncReport:
     """What one ``sync`` did."""
@@ -175,17 +211,27 @@ def _key(event: Observation) -> _Key:
     return (event.source, event.observed_at, event.body, event.source_version)
 
 
+def _without_time(key: _Key) -> tuple[str, str, str | None]:
+    """The key an item with a borrowed time is matched by: the same, less ``observed_at``."""
+    return (key[0], key[2], key[3])
+
+
 def _instant(value: str) -> datetime:
     # Both spellings an ``Instant`` can have carry an offset, so these compare as moments.
     return datetime.fromisoformat(value)
 
 
-def cursor_of(contents: StreamContents, source: str) -> Cursor:
-    """The fold: this source's cursor over one stream's contents. Pure, and reads no clock."""
-    return _fold(contents.events, source)
+type Within = Callable[[str], bool]
+"""A source's ``covers``: which bodies of its source the cursor is folded over."""
 
 
-def _fold(events: Sequence[AnyEvent], source: str) -> Cursor:
+def cursor_of(contents: StreamContents, source: str, *, within: Within | None = None) -> Cursor:
+    """The fold: this source's cursor over one stream's contents, over the bodies ``within``
+    covers when given. Pure, and reads no clock."""
+    return _fold(contents.events, source, within)
+
+
+def _fold(events: Sequence[AnyEvent], source: str, within: Within | None) -> Cursor:
     # The maxima are kept as the strings the log holds, compared as the moments they name.
     # Two spellings of one moment (``+05:30`` beside ``+00:00``) keep the first seen; the
     # fold is still deterministic, because the log has one order.
@@ -194,6 +240,8 @@ def _fold(events: Sequence[AnyEvent], source: str) -> Cursor:
     count = 0
     for event in events:
         if not isinstance(event, Observation) or event.source != source:
+            continue
+        if within is not None and not within(event.body):
             continue
         count += 1
         observed = _later(observed, event.observed_at)
@@ -211,7 +259,9 @@ def _later(best: tuple[datetime, str] | None, value: str) -> tuple[datetime, str
     return (moment, value) if best is None or moment > best[0] else best
 
 
-def fold_cursor(root: Path, principal: str, device: str, source: str) -> Cursor:
+def fold_cursor(
+    root: Path, principal: str, device: str, source: str, *, within: Within | None = None
+) -> Cursor:
     """Read the stream and fold the cursor. A stream that does not exist yet is empty.
 
     The reader refuses a missing stream so that a misspelt principal does not read as someone
@@ -223,7 +273,7 @@ def fold_cursor(root: Path, principal: str, device: str, source: str) -> Cursor:
         contents = read_stream(root, principal, device)
     except FileNotFoundError:
         return Cursor(source=source, observed_at=None, ts=None, events=0)
-    return cursor_of(contents, source)
+    return cursor_of(contents, source, within=within)
 
 
 def _logged(contents: StreamContents, source: str) -> set[_Key]:
@@ -246,7 +296,8 @@ def sync(source: Source, writer: StreamWriter, *, ts: str | None = None) -> Sync
     (``CorruptStreamError``, ``FutureSchemaError``) raises before anything is appended too.
     """
     name = source.name
-    before = fold_cursor(writer.root, writer.principal, writer.device, name)
+    within = source.covers if isinstance(source, Scoped) else None
+    before = fold_cursor(writer.root, writer.principal, writer.device, name, within=within)
     stamp = now_instant() if ts is None else ts
     # Everything the source has to say, validated, before the lock and before any append.
     pulled = [
@@ -271,15 +322,18 @@ def sync(source: Source, writer: StreamWriter, *, ts: str | None = None) -> Sync
     with writer.locked() as stream:
         contents = stream.read()
         logged = _logged(contents, name)
+        timeless = {_without_time(key) for key in logged}
         for item, observation in pulled:
             key = _key(observation)
-            if key in logged:
+            held = _without_time(key) in timeless if item.borrowed_time else key in logged
+            if held:
                 already.append(item)
                 continue
             appended.append(stream.append(observation))
             logged.add(key)
+            timeless.add(_without_time(key))
     # The same fold the next run will do, over what the stream held plus what joined it.
-    after = _fold([*contents.events, *appended], name)
+    after = _fold([*contents.events, *appended], name, within)
     return SyncReport(
         before=before, appended=tuple(appended), already_logged=tuple(already), after=after
     )
