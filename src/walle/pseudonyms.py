@@ -233,11 +233,16 @@ class Refused(Exception):
 _HEADER = re.compile(r"(?im)^((?:From|To|Cc|Bcc|Reply-To|Organizer|Attendees):[ \t]*)(.*)$")
 _MSGID_HEADER = re.compile(r"(?im)^(Message-ID:[ \t]*)(\S+)[ \t]*$")
 # A mailbox on a header line: a quoted or bare display name, then ``<address>``; or a bare
-# address. The name must open with something other than a space, so the space after a comma
-# between two mailboxes is left where it is.
+# address, with an RFC 5322 comment after it or not (``addr (Name)``). The name must open
+# with something other than a space or a comma, so the separator between two mailboxes is
+# left where it is, and it may hold a comma: ``google_calendar._person`` writes the name
+# unquoted, so ``Tutor, Alice <addr>`` is one mailbox (review of PR #145). It may not hold
+# ``@``, so a bare address before a named one is never swallowed into the name, nor a
+# parenthesis, so the note after one mailbox (``(you, accepted)``) is never the start of
+# the next one's name.
 _MAILBOX = re.compile(
-    r'(?:"[^"\n]*"|[^<>,\n\s][^<>,\n]*?)?\s*<([^<>\s@]+@[^<>\s@]+)>'
-    rf"|({hazards.EMAIL_PATTERN.pattern})"
+    r'(?:"[^"\n]*"|[^<>,@()\n\s][^<>@()\n]*?)?\s*<([^<>\s@]+@[^<>\s@]+)>'
+    rf"|({hazards.EMAIL_PATTERN.pattern})(?:[ \t]*\([^()\n]*\))?"
 )
 _ACCOUNT = re.compile(
     r"(?i)(\b(?:account|acct\.?|a/c|iban|sort code|routing(?: number)?|card)"
@@ -257,6 +262,22 @@ def _collapsed(value: str) -> str:
 
 def _alnum(value: str) -> str:
     return "".join(ch for ch in value if ch.isalnum()).upper()
+
+
+def _replace_known(text: str, known: Mapping[str, str]) -> str:
+    """``text`` with every value in ``known`` replaced by its token, case-insensitively,
+    longest first so a value inside a longer one is not cut up. Only the text between tokens
+    is searched: a digit run inside a token's hex is the token, not a value."""
+    if not known or not any(value.lower() in text.lower() for value in known):
+        return text
+    values = re.compile(
+        "|".join(re.escape(v) for v in sorted(known, key=len, reverse=True)), re.IGNORECASE
+    )
+    by_lower = {v.lower(): t for v, t in known.items()}
+    parts = TOKEN.split(text)
+    tokens = TOKEN.findall(text)
+    parts = [values.sub(lambda m: by_lower[m.group(0).lower()], p) for p in parts]
+    return parts[0] + "".join(t + p for t, p in zip(tokens, parts[1:], strict=True))
 
 
 # --- the layer -------------------------------------------------------------------------------
@@ -320,13 +341,23 @@ class Pseudonymiser:
             value = match.group(0)
             return token(ADDRESS, _collapsed(value), value)
 
+        # The structured headers first, so ``Name <addr>`` is one mailbox and the name goes
+        # with the address. Then every value the mapping already holds, and this call's new
+        # ones, wherever they appear: an account number or a message id is only
+        # *recognised* after its keyword or header, but once known it is replaced bare as
+        # well, so a repeat of it never reaches the door (review of PR #145, medium 2).
+        # That pass runs before the shapes in text so a known message id is its ``MSGID_``
+        # token and not the address inside it, and once more after them for what they found.
+        known = {entry.value: entry.token for entry in self._entries() if entry.value is not None}
         out = _MSGID_HEADER.sub(msgid, text)
         out = _HEADER.sub(header, out)
+        out = _replace_known(out, {**known, **{v: t for t, v in found.items()}})
         out = hazards.EMAIL_PATTERN.sub(bare, out)
         out = _ACCOUNT.sub(account, out)
         for pattern in hazards.PHONE_PATTERNS:
             out = pattern.sub(phone, out)
         out = hazards.STREET_PATTERN.sub(street, out)
+        out = _replace_known(out, {v: t for t, v in found.items()})
         if found:
             self._record(found)
         return out
@@ -533,7 +564,7 @@ class Egress:
         found: set[str] = set()
         opening = f"<<<untrusted:{request.marker}>>>\n"
         closing = f"\n<<</untrusted:{request.marker}>>>"
-        rest = request.prompt
+        whole: list[tuple[str, str]] = []
         for item_id, wrapped in request.items:
             if (
                 not wrapped.startswith(opening)
@@ -543,7 +574,16 @@ class Egress:
                 found.add(UNWRAPPED)
                 continue
             found.update(hazards.flag(wrapped[len(opening) : -len(closing)]))
-            rest = rest.replace(wrapped, "").replace(item_id, "")
+            whole.append((item_id, wrapped))
+        # The residue is worked out from the original prompt, never by mutating it item by
+        # item: every block comes out first, then every id, longest first. Stripping an id
+        # before a later block was removed could change that block, leave its markers
+        # behind, and refuse the request as ``boundary`` (review of PR #145, medium 1).
+        rest = request.prompt
+        for _, wrapped in whole:
+            rest = rest.replace(wrapped, "")
+        for item_id, _ in sorted(whole, key=lambda pair: len(pair[0]), reverse=True):
+            rest = rest.replace(item_id, "")
         found.update(hazards.flag(rest))
         if self._layer is not None and self._layer.leaks(request.prompt):
             found.add(LEAK)

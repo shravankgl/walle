@@ -199,8 +199,62 @@ replaces it for agent work). No author-as-reviewer pass beyond the stranger pass
 - `shred` is a resolution rule, not a deletion (above). Crypto-shredding of the mapping line
   and D12's TTL compaction are the two halves to build.
 - `_HEADER` also handles `Bcc` and `Reply-To`, which no connector writes today; harmless.
+- A mapped value that is a substring of a longer number is replaced inside it (round 1), garbling that number in the prompt; nothing leaks, but a word-boundary rule would be kinder.
 - `walle propose` does not say whether the layer was on for a run. The owner who set the
   switch knows; a line in the report would still help a later reader.
+
+## Review round 1 (head `bb09362`, Gemini 4 Argon: 2 medium, 2 low)
+
+All four fixed on the same branch, each with a failing test first (the ten new cases in
+`tests/test_pseudonyms.py` under *review round 1* all failed at `bb09362` for the reasons the
+reviewer gave). Main at `e097fd5` (#142) merged in; no overlap with these files.
+
+- **Medium 1, `Egress.check` mutated `rest` item by item.** Stripping an earlier item's id
+  could change a later item's block before it was removed, leave its markers behind, and
+  refuse the batch as `boundary`. The residue is now worked out from the original prompt:
+  every verified block removed first, then every id, longest first (so `d-mbp:1` never eats
+  the front of `d-mbp:10`). Test: `test_the_door_leaves_later_items_whole_when_an_earlier_id_is_in_them`,
+  a judge request whose second item mentions the first's id and whose third id has the
+  first as a prefix; `check` returns `()`.
+- **Medium 2, context-dependent tokens.** `ACCOUNT_` and `MSGID_` were replaced only after
+  their keyword or header, so a bare repeat of a mapped value stayed in the text and the
+  door refused the whole batch. Two changes. (a) `pseudonymise` now replaces **every value
+  the mapping holds, wherever it appears** (`_replace_known`: case-insensitive, longest first,
+  only in the text between tokens, and this call's own new values included so a repeat in
+  the same body is caught). A proposal citing an `ACCOUNT_` token re-identifies to the
+  number, and the judge sees it as the token again. (b) `_scanned` and `_judge` run the
+  door's leak check **per item before batching** (`_flagged` = `hazards.flag` +
+  `pseudonyms.LEAK`), so an observation or staged item that still carries a mapped value is
+  withheld or dropped alone, is not marked seen, and the rest of the batch is sent. The door's
+  own whole-prompt check stays as the backstop. Tests:
+  `test_a_mapped_value_is_replaced_wherever_it_appears`,
+  `test_a_proposal_citing_an_account_token_re_identifies_and_is_judged_as_a_token`,
+  `test_a_leak_is_found_per_item_so_one_bad_item_is_withheld_alone`.
+- **Low 1, names with a comma and RFC 5322 comments.** `_MAILBOX`'s display name may now hold
+  a comma (`google_calendar._person` writes it unquoted) but not `@` or a parenthesis, so a
+  bare address before a named mailbox is not swallowed into its name and the note after one
+  mailbox (`(you, accepted)`) never starts the next one's; and a bare address may be followed
+  by a `(comment)`, which goes with it. Test: five header shapes, no name word left.
+- **Low 2, both `proposed` and `withheld`.** After the request loop, every candidate whose
+  observation is in `withheld` is dropped. Test: a 5-excerpt observation across two requests,
+  the second refused; nothing staged, nothing seen, one `Withheld`.
+
+Stranger pass on the round: `_replace_known` splits on `TOKEN` so a digit run inside a token's
+hex is never read as a value; the order of passes in `pseudonymise` (headers, known values,
+text shapes, this call's values again) is explained inline, because a known message id must
+become `MSGID_` before the e-mail pattern sees the address inside it, and a known address in a
+header must still go out with its display name. A mapped value inside a longer unrelated
+number is now replaced rather than refused, which garbles that number in the prompt; it is
+the conservative side and is noted under *Noticed, not done*.
+
+Checks on the branch with main merged (`4408` = `4380` + 10 here + 18 from #142):
+
+```
+uv run pytest                 4408 passed, 35 skipped
+uv run ruff check             All checks passed!
+uv run ruff format --check    220 files already formatted
+uv run pyright                0 errors, 0 warnings, 0 informations
+```
 
 **Cost:** author (Fable 5.1, Hyperagent thread `cmw4jffid04cz07adfubga0m8`): see Hyperagent's
 usage for that thread. Reviewer: in its own log.

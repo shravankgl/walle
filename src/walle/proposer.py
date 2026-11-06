@@ -934,6 +934,10 @@ def propose(
         )
         candidates.extend(kept)
         dropped.extend(refused_items)
+    # A long observation spans requests; one sent and one refused leaves it withheld, and a
+    # withheld observation is never also proposed from (review of PR #145, low 2).
+    kept_off = {w.ref for w in withheld}
+    candidates = [c for c in candidates if c.observation not in kept_off]
 
     proposed: list[str] = []
     new_items: list[Staged] = []
@@ -1011,17 +1015,30 @@ def _scanned(
     found anywhere, in ``hazards.KINDS`` order, withhold the whole observation. The second
     pass is what makes the cut safe whatever it falls on (issue #137): a label the slice
     put at the start of a line is a turn in the piece even when it was mid-line in the body.
+    With the layer on, a value the mapping holds that is still in the body or a piece is
+    ``pseudonyms.LEAK`` here, per observation, so one such observation is withheld alone
+    rather than refused by the door with every other item in its request (review of PR
+    #145, medium 2).
     """
     if layer is not None:
         body = layer.pseudonymise(body)
-    kinds = hazards.flag(body)
+    kinds = _flagged(body, layer)
     if kinds:
         return kinds, []
     pieces = excerpts(ref, labelled(body))
-    found = {kind for _, text in pieces for kind in hazards.flag(text)}
+    found = {kind for _, text in pieces for kind in _flagged(text, layer)}
     if found:
-        return tuple(kind for kind in hazards.KINDS if kind in found), []
+        return tuple(kind for kind in (*hazards.KINDS, pseudonyms.LEAK) if kind in found), []
     return (), pieces
+
+
+def _flagged(text: str, layer: pseudonyms.Pseudonymiser | None) -> tuple[str, ...]:
+    """``hazards.flag``, plus ``pseudonyms.LEAK`` when the layer is on and a mapped value is
+    in ``text``: the door's checks, run per item before any batching."""
+    kinds = hazards.flag(text)
+    if layer is not None and layer.leaks(text):
+        kinds = (*kinds, pseudonyms.LEAK)
+    return kinds
 
 
 def _cited_now(stream: LockedStream, log: Path) -> set[str]:
@@ -1086,7 +1103,7 @@ def _judge(
             whole = layer.pseudonymise(whole)
         # Judged on its head, bounded like an excerpt: ``walle remember`` takes any length.
         head = excerpts(item.ref, whole)[0][1]
-        if kinds := hazards.flag(whole) or hazards.flag(head):
+        if kinds := _flagged(whole, layer) or _flagged(head, layer):
             verdicts[item.ref] = withheld(item.ref, kinds)
         else:
             items.append((item.ref, head))

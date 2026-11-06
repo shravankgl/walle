@@ -660,3 +660,150 @@ def test_a_token_never_trips_the_hazard_gate() -> None:
         token = f"{kind}_0123456789"
         assert pseudonyms.TOKEN.fullmatch(token)
         assert hazards.flag(f"tool: From: {token}\nTo: {token}\nnote {token} and {token}.") == ()
+
+
+# --- review round 1 (PR #145, head bb09362) ------------------------------------------------
+
+
+def test_the_door_leaves_later_items_whole_when_an_earlier_id_is_in_them() -> None:
+    """Medium 1: ``rest`` was mutated item by item, so stripping an earlier item's id from
+    it could change a later item's block before that block was removed, and the leftover
+    markers read as ``boundary``. The residue is worked out from the original: every block
+    removed first, then every id, longest first."""
+    door = pseudonyms.Egress(RecordingModel(), None)
+    marker = "0123456789abcdef"
+    first = proposer.envelope("Keep Thursday free", marker)
+    # A later item that mentions the earlier id, and an id the earlier one is a prefix of.
+    second = proposer.envelope(f"see d-{D}:1 and d-{D}:1#1 for the rest", marker)
+    tenth = proposer.envelope("another item", marker)
+    items = ((f"d-{D}:1", first), (f"d-{D}:1#1", second), (f"d-{D}:10", tenth))
+    body = "\n\n".join(f"item {item_id}\n{text}" for item_id, text in items)
+    request = proposer.Request(
+        kind="judge", marker=marker, items=items, prompt=f"{proposer.JUDGE_INSTRUCTIONS}\n{body}\n"
+    )
+    assert door.check(request) == ()
+
+
+def test_a_mapped_value_is_replaced_wherever_it_appears(tmp_path: Path) -> None:
+    """Medium 2: ``ACCOUNT_`` and ``MSGID_`` were replaced only after their keyword or
+    header. A repeat of a value the mapping already holds is replaced anywhere."""
+    layer = pseudonyms.Pseudonymiser(tmp_path / "root", P, D)
+    account = layer.pseudonymise(f"account number {ACCOUNT} (put {ACCOUNT} on the slip)")
+    assert re.fullmatch(r"account number (ACCOUNT_[0-9a-f]{10}) \(put \1 on the slip\)", account)
+    assert layer.pseudonymise(f"Paid {ACCOUNT} today") == f"Paid {account.split()[2]} today"
+    msgid = layer.pseudonymise(f"Message-ID: {MSGID}")
+    token = msgid.split(": ")[1]
+    assert layer.pseudonymise(f"replying to {MSGID} now") == f"replying to {token} now"
+    assert layer.reidentify(f"Paid {token}") == f"Paid {MSGID}"
+
+
+def test_a_proposal_citing_an_account_token_re_identifies_and_is_judged_as_a_token(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    _observe(root, CALENDAR, source="google-calendar")
+
+    def cites_account(request: proposer.Request) -> str:
+        if request.kind != "propose":
+            return json.dumps(
+                [
+                    {"ref": i, "verdict": "keep", "reason": "a standing payment"}
+                    for i, _ in request.items
+                ]
+            )
+        item_id, wrapped = request.items[0]
+        token = re.search(r"ACCOUNT_[0-9a-f]{10}", wrapped).group(0)  # type: ignore[union-attr]
+        return json.dumps(
+            [
+                {
+                    "excerpt": item_id,
+                    "summary": f"Send the Friday invoice to {token}",
+                    "body": f"Send the Friday invoice to {token} every week.",
+                    "level": "explicit",
+                }
+            ]
+        )
+
+    model = ScriptedModel(cites_account)
+    report = proposer.propose(root, P, D, model, environ=ON)
+    (proposal,) = _proposals(root)
+    assert ACCOUNT in proposal.body and "ACCOUNT_" not in proposal.body
+    assert report.proposed and report.withheld == ()
+    judged = [r for r in model.requests if r.kind == "judge"]
+    assert len(judged) == 1 and ACCOUNT not in judged[0].prompt and "ACCOUNT_" in judged[0].prompt
+    (verdict,) = proposer.read_verdicts(root, P)
+    assert not verdict.reason.startswith("withheld")
+
+
+def test_a_leak_is_found_per_item_so_one_bad_item_is_withheld_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    pseudonyms.Pseudonymiser(root, P, D).pseudonymise(f"account number {ACCOUNT}")
+    bad = _observe(root, f"Paid {ACCOUNT} today.", source="gmail")
+    good = _observe(root, "Subject: Piano\n\nThe lesson stays at 16:00.", source="gmail")
+    staging.remember(root, P, D, f"Pay {ACCOUNT} on Fridays", summary="Friday payment")
+    monkeypatch.setattr(pseudonyms.Pseudonymiser, "pseudonymise", lambda self, text: text)
+    model = RecordingModel()
+    report = proposer.propose(root, P, D, model, environ=ON)
+    assert report.withheld == (proposer.Withheld(bad, (pseudonyms.LEAK,)),)
+    shown = [i for r in model.requests if r.kind == "propose" for i, _ in r.items]
+    assert shown == [f"{good}#1"]
+    assert {s.observation for s in proposer.read_seen(root, P)} == {good}
+    assert [r for r in model.requests if r.kind == "judge"] == []
+    (verdict,) = proposer.read_verdicts(root, P)
+    assert verdict.reason == f"withheld from the model: {pseudonyms.LEAK}"
+
+
+@pytest.mark.parametrize(
+    ("text", "shape"),
+    [
+        (f"Organizer: Tutor, Alice <{TUTOR}>", r"^Organizer: PERSON_[0-9a-f]{10}$"),
+        (f"From: {TUTOR} (Alice Tutor)", r"^From: PERSON_[0-9a-f]{10}$"),
+        (
+            f"Attendees: Tutor, Alice <{TUTOR}> (accepted), Example, Sam <{ME}> (you)",
+            r"^Attendees: PERSON_[0-9a-f]{10} \(accepted\), PERSON_[0-9a-f]{10} \(you\)$",
+        ),
+        (
+            f"Cc: {BOOKINGS}, Example, Pat <{PAT}>",
+            r"^Cc: PERSON_[0-9a-f]{10}, PERSON_[0-9a-f]{10}$",
+        ),
+        (f"To: {BOOKINGS} (Bookings), {PAT}", r"^To: PERSON_[0-9a-f]{10}, PERSON_[0-9a-f]{10}$"),
+    ],
+)
+def test_a_comma_in_a_display_name_or_an_rfc5322_comment_leaves_no_name(
+    tmp_path: Path, text: str, shape: str
+) -> None:
+    """Low 1: ``google_calendar._person`` writes the name unquoted, so ``Tutor, Alice``
+    stopped the mailbox at the comma and left the surname; ``addr (Name)`` left the name."""
+    out = pseudonyms.Pseudonymiser(tmp_path / "root", P, D).pseudonymise(text)
+    assert re.fullmatch(shape, out), out
+    for word in ("Tutor", "Alice", "Example", "Sam", "Pat", "Bookings"):
+        assert word not in out, out
+
+
+def test_a_withheld_observation_is_never_also_proposed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Low 2: a long observation spans two requests; the first is sent and yields a
+    candidate, the second is refused. The observation is withheld, and nothing is staged
+    from it."""
+    root = tmp_path / "root"
+    filler = "\n".join(
+        f"assistant: line {n} of a long reply about the lesson plan." for n in range(1, 260)
+    )
+    ref = _observe(root, f"user: Always keep Thursday free.\n{filler}", source="transcript")
+    original = pseudonyms.Egress.check
+
+    def refuse_the_tail(self: pseudonyms.Egress, request: proposer.Request) -> tuple[str, ...]:
+        if any(item_id.endswith("#5") for item_id, _ in request.items):
+            return (pseudonyms.LEAK,)
+        return original(self, request)
+
+    monkeypatch.setattr(pseudonyms.Egress, "check", refuse_the_tail)
+    model = RecordingModel()
+    report = proposer.propose(root, P, D, model, environ=OFF)
+    assert len(model.requests) >= 1, "the first request was sent"
+    assert report.withheld == (proposer.Withheld(ref, (pseudonyms.LEAK,)),)
+    assert report.proposed == () and _proposals(root) == []
+    assert proposer.read_seen(root, P) == ()
