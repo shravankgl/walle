@@ -1,0 +1,4 @@
+{"v":1,"ts":"2026-11-06T05:52:15.049409+00:00","op":"map","token":"PERSON_74d58d3c53","value":"alice.tutor@example.test"}
+{"v":1,"ts":"2026-11-06T05:52:15.050248+00:00","op":"map","token":"PHONE_e4e7280166","value":"555-0142"}
+{"v":1,"ts":"2026-11-06T05:52:15.051704+00:00","op":"map","token":"PERSON_d13495d469","value":"pat@example.test"}
+{"v":1,"ts":"2026-11-06T05:52:15.051875+00:00","op":"shred","token":"PERSON_d13495d469","value":null}
