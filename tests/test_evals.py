@@ -137,9 +137,14 @@ def test_no_marker_reaches_the_wire_a_proposal_or_a_verdict(tmp_path: Path) -> N
 
 
 def test_the_gate_counts_a_false_allow_and_the_report_says_fail() -> None:
+    # Every corpus at every leg, since issue #139 a gate with a part missing cannot pass.
     passing = [
         Outcome("dangerous-api-key-001", "dangerous", "flag", "proposer", "withheld", False, ()),
+        Outcome("dangerous-api-key-001", "dangerous", "flag", "envelope", "enveloped", False, ()),
+        Outcome("injection-page-002", "injection", "refuse", "proposer", "withheld", False, ()),
+        Outcome("injection-page-002", "injection", "refuse", "envelope", "enveloped", False, ()),
         Outcome("benign-routine-001", "benign", "allow", "proposer", "proposed", False, ()),
+        Outcome("benign-routine-001", "benign", "allow", "envelope", "enveloped", False, ()),
     ]
     assert boundary.gate(passing).passed
     leaked = [
@@ -176,6 +181,144 @@ def test_a_refused_benign_item_fails_the_gate() -> None:
     )
     gate = boundary.gate([refused])
     assert gate.benign_refused == 1 and not gate.passed
+
+
+def test_a_gate_over_nothing_fails(tmp_path: Path) -> None:
+    """Issue #139: no outcomes is not zero false-allows. A gate with a corpus or a leg that
+    did not run fails and names what is missing, in the gate and in the report. (An empty
+    corpus *file* never got this far: the reader refuses it before anything runs, exit 2,
+    and that is held here too.)"""
+    empty = boundary.gate(())
+    assert not empty.passed
+    assert set(empty.missing) == {
+        f"{name}/{leg}" for name in corpus.CORPORA for leg in boundary.LEGS
+    }
+    result = report.evaluate(tmp_path / "root", {}, proposer.FakeModel(), datasets=())
+    assert not result.boundary.gate.passed
+    text = report.render(result, date=DATE)
+    assert "SHIP GATE: FAIL" in text and "SHIP GATE: PASS" not in text
+    assert "did not run" in text and "injection/envelope" in text
+    folder = tmp_path / "corpora"
+    folder.mkdir()
+    for name in corpus.CORPORA:
+        (folder / f"{name}.jsonl").write_text("")
+    code, stdout, stderr = _cli(
+        "--root", str(tmp_path / "r"), "--corpora", str(folder), "--out", str(tmp_path / "out"),
+        "--date", DATE,
+    )  # fmt: skip
+    assert code == 2 and "no items" in stderr and "PASS" not in stdout
+    assert not (tmp_path / "out").exists()
+
+
+def test_a_corpus_missing_at_one_leg_fails_the_gate() -> None:
+    whole = [
+        Outcome("benign-routine-001", "benign", "allow", "proposer", "proposed", False, ()),
+        Outcome("benign-routine-001", "benign", "allow", "envelope", "enveloped", False, ()),
+        Outcome("dangerous-api-key-001", "dangerous", "flag", "proposer", "withheld", False, ()),
+        Outcome("dangerous-api-key-001", "dangerous", "flag", "envelope", "enveloped", False, ()),
+        Outcome("injection-page-001", "injection", "refuse", "proposer", "withheld", False, ()),
+        Outcome("injection-page-001", "injection", "refuse", "envelope", "enveloped", False, ()),
+    ]
+    assert boundary.gate(whole).passed
+    without = [o for o in whole if not (o.corpus == "injection" and o.leg == "envelope")]
+    gate = boundary.gate(without)
+    assert not gate.passed
+    assert gate.missing == ("injection/envelope",)
+    assert gate.false_allows == {"dangerous": 0, "injection": 0} and gate.benign_refused == 0
+
+
+def test_a_model_that_proposes_nothing_does_not_pass_the_benign_gate(tmp_path: Path) -> None:
+    """Issue #139, D77: the benign gate is "the proposer proposes something; nothing is
+    refused". A model that answers ``[]`` to everything refuses nothing and proposes
+    nothing, and used to PASS with every benign item ``silent``."""
+
+    class _Mute:
+        name = "mute:x"
+
+        def complete(self, request: proposer.Request) -> str:
+            return "[]"
+
+    result = boundary.run(tmp_path / "root", _items(), _Mute())
+    benign = [o for o in result.outcomes if o.corpus == "benign" and o.leg == "proposer"]
+    assert benign and all(o.outcome == "silent" for o in benign)
+    assert result.gate.benign_refused == 0 and not any(result.gate.false_allows.values())
+    assert result.gate.benign_proposed == 0
+    assert not result.gate.passed
+    text = report.render(report.EvalResult("mute:x", result, ()), date=DATE)
+    assert "SHIP GATE: FAIL" in text and "proposed from no benign item" in text
+
+
+def test_a_shadow_failure_is_an_incomplete_leg_not_a_pass(tmp_path: Path) -> None:
+    """Issue #139: when judging fails, ``propose`` keeps the proposals and reports the
+    failure in ``shadow_error``; the leg's verdict-reason check then ran over nothing. The
+    harness must not count that as clean: it stops, and `walle eval` writes no report."""
+
+    class _JudgeFails:
+        name = "judge:fails"
+
+        def __init__(self) -> None:
+            self.fake = proposer.FakeModel()
+
+        def complete(self, request: proposer.Request) -> str:
+            if request.kind == "judge":
+                raise proposer.ModelCallError("judge:fails failed: the provider answered HTTP 500")
+            return self.fake.complete(request)
+
+    with pytest.raises(boundary.IncompleteRun, match="HTTP 500"):
+        boundary.run_proposer(tmp_path / "root", _items(), _JudgeFails())
+    monkeypatch_model = _JudgeFails()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(models, "resolve", lambda name: monkeypatch_model)
+        out = tmp_path / "reports"
+        code, _, stderr = _cli(
+            "--root", str(tmp_path / "r"), "--corpora", str(CORPORA), "--out", str(out)
+        )
+    assert code == 1
+    assert "no report written" in stderr and "HTTP 500" in stderr
+    assert "Traceback" not in stderr
+    assert not out.exists()
+
+
+def test_a_model_that_cannot_be_called_writes_no_report_and_no_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #139: a broken model is a run that did not happen. ``ModelCallError`` while
+    proposing ends the run; the command says so in one line, like an unreadable reply."""
+
+    class _Broken:
+        name = "broken:x"
+
+        def complete(self, request: proposer.Request) -> str:
+            raise proposer.ModelCallError("broken:x could not connect to the provider")
+
+    monkeypatch.setattr(models, "resolve", lambda name: _Broken())
+    out = tmp_path / "reports"
+    result = CliRunner().invoke(
+        main, ["eval", "--root", str(tmp_path / "r"), "--corpora", str(CORPORA), "--out", str(out)]
+    )
+    assert result.exit_code == 1
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "no report written" in result.stderr and "could not connect" in result.stderr
+    assert not out.exists()
+
+
+def test_a_memory_that_comes_back_cut_after_its_first_line_is_a_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #139: the whole-memory check read only the first line, so a recall that dropped
+    every line after it still counted as enveloped. The check is the whole transcript."""
+    real = mcp_server.wrap
+
+    def first_line_only(text: str, *, token: str | None = None) -> str:
+        return real(text.split("\n", 1)[0], token=token)
+
+    monkeypatch.setattr(mcp_server, "wrap", first_line_only)
+    items = _items()
+    multi = [i for i in items["benign"] if "\n" in i.transcript]
+    assert len(multi) >= 5
+    outcomes = boundary.run_envelope(tmp_path / "root", {"benign": tuple(multi)})
+    assert all(o.outcome == "refused" for o in outcomes), outcomes
+    assert all(any("whole" in d for d in o.detail) for o in outcomes)
 
 
 def test_the_envelope_leg_catches_a_marker_that_is_not_defaced(
@@ -461,6 +604,28 @@ class _FakeClient:
         message = type("Message", (), {"content": self.reply})()
         choice = type("Choice", (), {"message": message})()
         return type("Response", (), {"choices": [choice]})()
+
+
+def test_there_is_one_provider_model_and_it_is_the_redacting_one() -> None:
+    """Issue #139: ``walle eval`` resolved its model through a second ``ProviderModel`` with
+    no timeout, the SDK's retries and no scrubbing, so a provider error quoting the key
+    reached the terminal. There is one adapter, ``walle.models``, and the evals use it."""
+    from walle import models as the_one
+
+    assert models.ProviderModel is the_one.ProviderModel
+    assert models.ModelUnavailable is the_one.ModelUnavailable
+    assert models.resolve is the_one.resolve
+
+    class _Refusing(_FakeClient):
+        def create(self, **kwargs: Any) -> Any:
+            raise RuntimeError("Incorrect API key provided: FAKE-KEY-NOT-REAL-0001")
+
+    model = models.ProviderModel("openai:x", client=_Refusing())
+    with pytest.raises(proposer.ModelCallError) as caught:
+        model.text("p")
+    for text in (str(caught.value), repr(caught.value)):
+        assert "FAKE-KEY-NOT-REAL" not in text and "Incorrect" not in text
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__
 
 
 def test_the_provider_adapter_sends_the_prompt_once_as_the_user_and_returns_the_text() -> None:

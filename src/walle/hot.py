@@ -432,6 +432,88 @@ def _judge(path: Path, new: bytes, vouched: tuple[str, ...] | list[str]) -> str 
     return Preserved(path.name, path, found, reason)
 
 
+# --- the age of a render --------------------------------------------------------------------
+
+
+class Age(StrEnum):
+    """What a surface that serves the tier can say about the render it read."""
+
+    CURRENT = "current"
+    STALE = "stale"
+    UNCHECKED = "unchecked"
+
+
+STALE_HEAD = "This hot tier is older than the log."
+UNCHECKED_HEAD = "This hot tier's age could not be checked."
+
+
+@dataclass(frozen=True)
+class Aged:
+    age: Age
+    why: str
+    """Why it is stale or unchecked, in words that quote nothing from the log; empty when
+    current."""
+
+    def note(self, principal: str) -> str:
+        """The paragraph a surface puts in front of a render that is not current, and an empty
+        string for one that is. One text for every surface (D83): the MCP Resource and the ACP
+        client say the same words."""
+        if self.age is Age.CURRENT:
+            return ""
+        head = STALE_HEAD if self.age is Age.STALE else UNCHECKED_HEAD
+        return (
+            f"{head} {self.why[0].upper()}{self.why[1:]}. What follows is still what you "
+            f"remember of {principal}; `walle render --principal {principal}` brings it up to "
+            "date.\n\n"
+        )
+
+
+def age(root: Path, principal: str, manifest: bytes | None) -> Aged:
+    """Whether the render ``manifest`` describes is the log's fold now (D66), for a surface
+    that has read both under ``hook.snapshot``. Never raises for the state of the log or the
+    manifest: a fold that fails, or a manifest that says nothing, is ``unchecked``, named by
+    kind and never quoted, because a corrupt line is log text and the tier is not enveloped.
+
+    Checking needs the index brought up to date, as ``recall`` does. On a read-only profile
+    that raises ``PermissionError`` and the age is checked against the index as last built,
+    which is what ``recall`` answers from too.
+    """
+    try:
+        rendered_from = _state_of(manifest)
+    except _NoRecord as exc:
+        return Aged(Age.UNCHECKED, str(exc))
+    try:
+        try:
+            records = index.update(root, principal).records
+        except PermissionError:
+            records = index.load_records(root, principal)
+        now = index.state_hash(resolve(records))
+    except Exception as exc:  # any failure to fold is "could not check", never an error
+        return Aged(Age.UNCHECKED, f"the log could not be folded ({type(exc).__name__})")
+    if now != rendered_from:
+        return Aged(
+            Age.STALE, "the log has changed since it was rendered, and the change is not in it"
+        )
+    return Aged(Age.CURRENT, "")
+
+
+class _NoRecord(Exception):
+    """The manifest cannot say which fold the render came from."""
+
+
+def _state_of(manifest: bytes | None) -> str:
+    if manifest is None:
+        raise _NoRecord("there is no record of the render it came from")
+    try:
+        data = json.loads(manifest)
+    except ValueError:
+        raise _NoRecord("the record of the render it came from is unreadable") from None
+    state = data.get("state") if isinstance(data, dict) else None
+    if not isinstance(state, str):
+        raise _NoRecord("the record of the render it came from names no state")
+    return state
+
+
 def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 

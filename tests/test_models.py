@@ -20,6 +20,7 @@ import json
 import logging
 import shutil
 from pathlib import Path
+from typing import Any
 
 import pytest
 from click.testing import CliRunner
@@ -352,6 +353,42 @@ def test_an_unknown_provider_is_unavailable_before_any_call() -> None:
     with pytest.raises(models.ModelUnavailable) as caught:
         models.resolve("nosuchvendor:some-model")
     assert "nosuchvendor" in str(caught.value)
+
+
+def test_a_provider_that_fails_to_build_for_any_reason_is_unavailable_and_scrubbed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #139: ``_ensure_client`` caught ``ImportError``, ``TypeError`` and ``ValueError``
+    from the SDK's constructor and let anything else through with its text and traceback.
+    Any failure to build a provider is ``ModelUnavailable``, raised from nothing, with no key
+    in it; and a message that quotes a ``base_url`` loses the ``user:password@`` in it."""
+    from aisuite.provider import ProviderFactory
+
+    class _SdkError(Exception):
+        pass
+
+    def refuse(cls: Any, key: str, config: dict[str, Any]) -> Any:
+        raise _SdkError(f"bad key {FAKE_KEY} for {config.get('base_url')}")
+
+    monkeypatch.setattr(ProviderFactory, "create_provider", classmethod(refuse))
+    url = "https://alice:FAKE-URL-PASSWORD-NOT-REAL@llm.example.net/v1"
+    with pytest.raises(models.ModelUnavailable) as caught:
+        models.ProviderModel("openai:gpt-4o-mini", base_url=url)._ensure_client()
+    said = str(caught.value)
+    assert "openai:gpt-4o-mini" in said
+    assert FAKE_KEY not in said and "FAKE-KEY-NOT-REAL" not in said
+    assert "FAKE-URL-PASSWORD-NOT-REAL" not in said and "alice:" not in said
+    assert "llm.example.net" in said  # the host is fine to name; the userinfo is not
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__
+
+    def echo_url(cls: Any, key: str, config: dict[str, Any]) -> Any:
+        raise ValueError(f"cannot reach {config.get('base_url')}")
+
+    monkeypatch.setattr(ProviderFactory, "create_provider", classmethod(echo_url))
+    with pytest.raises(models.ModelUnavailable) as caught:
+        models.ProviderModel("openai:gpt-4o-mini", base_url=url)._ensure_client()
+    assert "FAKE-URL-PASSWORD-NOT-REAL" not in str(caught.value)
+    assert "alice" not in str(caught.value)
 
 
 def test_the_cli_refuses_a_name_that_is_not_provider_model(tmp_path: Path) -> None:

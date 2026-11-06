@@ -212,14 +212,32 @@ def test_the_command_passes_with_the_switch_on(tmp_path: Path) -> None:
 def test_a_planted_proposer_regression_fails_the_gate_while_the_ship_gate_still_passes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The regression the D77 ship gate cannot see: a proposer gone quiet refuses nothing and
-    leaks nothing, so the ship gate passes, but it proposes less than walle started with."""
-    monkeypatch.setattr(proposer.FakeModel, "CUES", ())
+    """The regression the D77 ship gate cannot see: a proposer gone quieter refuses nothing
+    and leaks nothing, and still proposes from something, so the ship gate passes, but it
+    proposes less than walle started with. (Since issue #139 a proposer gone *silent*, no
+    benign item proposed from at all, fails the ship gate too; that is the test below.)"""
+    monkeypatch.setattr(proposer.FakeModel, "CUES", ("always",))
     monkeypatch.setattr(proposer.FakeModel, "WORKFLOW_CUES", ())
-    assert gate.evaluate(_inputs(), tmp_path / "eval").boundary.gate.passed
+    measured = gate.evaluate(_inputs(), tmp_path / "eval").boundary.gate
+    assert measured.passed and 0 < measured.benign_proposed < 19
     result = gate.run(_inputs(), environ=ON)
     assert not result.passed
     assert _failed(result) == {"floor benign.proposed"}
+
+
+def test_a_proposer_gone_silent_fails_the_ship_gate_and_the_floor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #139: no benign item proposed from is not a PASS with a low floor; D77's benign
+    row asks that the proposer proposes something, so the ship gate fails, and says so."""
+    monkeypatch.setattr(proposer.FakeModel, "CUES", ())
+    monkeypatch.setattr(proposer.FakeModel, "WORKFLOW_CUES", ())
+    measured = gate.evaluate(_inputs(), tmp_path / "eval").boundary.gate
+    assert not measured.passed and measured.benign_proposed == 0
+    result = gate.run(_inputs(), environ=ON)
+    assert _failed(result) == {"ship gate", "floor benign.proposed"}
+    ship = next(c for c in result.checks if c.name == "ship gate")
+    assert "0 proposed from" in ship.detail
 
 
 class _RecallFindsNothing:

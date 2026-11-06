@@ -243,6 +243,44 @@ def test_a_render_in_progress_means_no_memory_this_session_rather_than_a_wait(
     assert prompt["prompt"] == [{"type": "text", "text": "hello"}]
 
 
+def test_a_stale_hot_tier_is_carried_with_a_note_in_front_of_it(
+    root: Path, workdir: Path, record: Path
+) -> None:
+    """Issue #139: the hook's reader hands back the manifest so a surface can tell whether
+    the render is the log's state now; the MCP Resource says *stale* and this surface
+    threw the manifest away. The same note, the same words, inside the envelope with the
+    tier, so the host's model is told what it reads is old (D83: one reader, no drift)."""
+    _rendered(root)
+    current = acp.memory(root, P)
+    assert current.status is acp.Status.READY and current.text == hook.context(root, P)
+    writer = StreamWriter(root, P, D)
+    writer.append(
+        Assertion(ts=_ts(5), actor=ACTOR_USER, body="Prefers short replies.", summary="Short")
+    )
+    memory = acp.memory(root, P)
+    assert memory.status is acp.Status.STALE
+    assert memory.text is not None and memory.available
+    assert memory.text.startswith(hot.STALE_HEAD)
+    assert memory.text.endswith(hook.context(root, P)), "the render follows the note unchanged"
+    assert "Prefers short replies" not in memory.text
+    assert str(root) not in memory.text
+    with acp.Host.start(_command(record), timeout=10) as host:
+        session = host.new_session(workdir, memory=memory)
+        session.prompt("hello", timeout=10)
+    (prompt,) = _prompts(record)
+    tier = prompt["prompt"][0]["resource"]["text"]
+    assert hot.STALE_HEAD in tier and "Eats dinner after eight" in tier
+
+
+def test_a_hot_tier_whose_age_cannot_be_told_is_carried_as_unchecked(root: Path) -> None:
+    folder = _rendered(root)
+    (folder / hot.MANIFEST).unlink()
+    memory = acp.memory(root, P)
+    assert memory.status is acp.Status.UNCHECKED
+    assert memory.text is not None and memory.text.startswith(hot.UNCHECKED_HEAD)
+    assert memory.text.endswith(hook.context(root, P))
+
+
 def test_a_session_may_be_opened_with_no_memory_at_all(workdir: Path, record: Path) -> None:
     with acp.Host.start(_command(record), timeout=10) as host:
         session = host.new_session(workdir)
@@ -459,6 +497,66 @@ def test_updates_of_a_turn_are_kept_on_it(workdir: Path, record: Path) -> None:
         turn = session.prompt("hello", timeout=10)
     assert [u["sessionUpdate"] for u in turn.updates] == ["agent_message_chunk"]
     assert turn.text == "echo: hello"
+
+
+def test_a_host_error_is_one_bounded_line_with_no_secret_in_it(
+    workdir: Path, record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #139: the host's error text is untrusted, and `walle acp` prints it to the
+    terminal. It is folded to one line, cut to a bound, and a value of a secret-named
+    variable in it is masked, as ``walle.models`` does for a provider's error."""
+    secret = "FAKE-ACP-TOKEN-NOT-REAL-0001"
+    monkeypatch.setenv("FAKE_ACP_TOKEN", secret)
+    with acp.Host.start(_command(record, "error-verbose"), timeout=10) as host:
+        session = host.new_session(workdir)
+        with pytest.raises(acp.HostError) as failed:
+            session.prompt("first", timeout=10)
+        said = str(failed.value)
+        assert failed.value.code == -32000
+        assert "Authentication failed" in said
+        assert "\n" not in said and "\r" not in said
+        assert len(said) <= acp.ERROR_CHARS + 80, len(said)
+        assert secret not in said and secret not in failed.value.message
+        assert "last line" not in said, "cut, not just folded"
+        turn = session.prompt("second", timeout=10)
+    assert turn.text == "echo: second"
+    _closed(host)
+
+
+def test_a_host_error_message_is_bounded_without_a_host_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "FAKE-ACP-TOKEN-NOT-REAL-0002"
+    monkeypatch.setenv("SOME_HOST_SECRET", secret)
+    error = {"code": -32000, "message": f"a\nb\r\n{secret} " + "y" * 10_000, "data": {"k": 1}}
+    raised = acp.HostError("session/prompt", error)
+    assert raised.code == -32000 and raised.data == {"k": 1}
+    assert "\n" not in str(raised) and secret not in str(raised)
+    assert len(raised.message) <= acp.ERROR_CHARS
+    assert raised.message.startswith("a b")
+    assert acp.HostError("m", {"message": 7}).message == "7"
+
+
+def test_a_host_speaking_an_odd_version_is_refused_without_quoting_it(
+    workdir: Path, record: Path
+) -> None:
+    with pytest.raises(acp.ProtocolError) as bad:
+        acp.Host.start(_command(record, "odd-version"), timeout=10)
+    said = str(bad.value)
+    assert "\n" not in said and len(said) < 400, said
+    assert "ODD-VERSION-LINE-1" not in said and "ODD-VERSION-LINE-3" not in said
+    assert "str" in said, "the type is named; the value is not quoted"
+    assert _leaked_fakes(record) == []
+
+
+def test_an_update_for_another_session_is_not_kept_on_the_turn(workdir: Path, record: Path) -> None:
+    """Issue #139: a ``session/update`` carries a ``sessionId``; one for another session is
+    not this turn's, and its chunks must not land in this turn's text."""
+    with acp.Host.start(_command(record, "other-session"), timeout=10) as host:
+        session = host.new_session(workdir)
+        turn = session.prompt("hello", timeout=10)
+    assert turn.text == "echo: hello"
+    assert [u["sessionUpdate"] for u in turn.updates] == ["agent_message_chunk"]
 
 
 # --- the command ------------------------------------------------------------------------------

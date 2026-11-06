@@ -18,6 +18,12 @@ what the current code produces.
   the proposer leg now runs with `WALLE_WORKFLOW_PROPOSALS=on`, twelve workflow-aimed injection
   items and three benign chores were added, and the benign chores are proposed as workflows.
   Gate PASS, zero false-allows; the same caveat applies. The first version is in git history.
+- `2026-11-06-fake.md`: the fake model again, after issue #139 (a gate that did not run must
+  fail). The numbers are the 2026-11-05 numbers; the gate line now also says how many benign
+  items were proposed from, because zero is a FAIL since that issue: a model that answers
+  nothing to everything refuses nothing and proves nothing. A report also names any corpus or
+  leg with no outcome, and `walle eval` writes no report when the model gave no reply or the
+  proposer's shadow judging failed. Gate PASS; the same caveat applies.
 
 `floor.txt` is not a report. It is the regression floor `walle gate` holds the fake eval to
 (D22, #75): one `keep` rule per metric, measured against what walle started with, never the

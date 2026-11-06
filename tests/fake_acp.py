@@ -27,6 +27,13 @@ ways a real host can misbehave, so the client's failure paths can be exercised o
 ``ask-fs``            on a prompt, sends ``fs/read_text_file`` first and echoes the client's
                       answer (expected: an error) in its message.
 ``stderr-noise``      writes a few hundred kilobytes to stderr during a prompt, then answers.
+``error-verbose``     answers the first ``session/prompt`` with an error whose message runs to
+                      many lines and many kilobytes and quotes ``FAKE_ACP_TOKEN`` from its
+                      environment, as a careless host would echo a credential it was given.
+``odd-version``       answers ``initialize`` with a ``protocolVersion`` that is a long,
+                      multi-line string rather than an integer.
+``other-session``     on a prompt, sends a ``session/update`` for a session id that is not
+                      this one before its own, as a host with two sessions on one pipe might.
 
 Synthetic throughout: no account, no token, no transcript.
 """
@@ -35,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import sys
 import time
@@ -119,6 +127,12 @@ class Fake:
         if self.mode == "init-error":
             self.fail(id_, -32603, "the fake host refuses to initialize")
             return
+        if self.mode == "odd-version":
+            self.reply(
+                id_,
+                {"protocolVersion": "ODD-VERSION-LINE-1\n" + "x" * 5000 + "\nODD-VERSION-LINE-3"},
+            )
+            return
         embedded = self.mode != "text-only"
         self.reply(
             id_,
@@ -151,6 +165,14 @@ class Fake:
                 time.sleep(3600)
         if self.mode == "error-first" and first:
             self.fail(id_, -32000, "Authentication required")
+            return
+        if self.mode == "error-verbose" and first:
+            token = os.environ.get("FAKE_ACP_TOKEN", "")
+            self.fail(
+                id_,
+                -32000,
+                f"Authentication failed for token {token}\n" + "x" * 5000 + "\nlast line",
+            )
             return
         if self.mode == "garbage" and first:
             sys.stdout.write("fake-acp: BANNER-3f9c, not JSON\n")
@@ -186,6 +208,17 @@ class Fake:
         echo = "echo: " + " | ".join(texts)
         if notes:
             echo += " [" + "; ".join(notes) + "]"
+        if self.mode == "other-session":
+            self.notify(
+                "session/update",
+                {
+                    "sessionId": "fake-session-other",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "STRAY-FROM-ANOTHER-SESSION "},
+                    },
+                },
+            )
         self.notify(
             "session/update",
             {
