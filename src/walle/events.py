@@ -394,8 +394,12 @@ class Event(BaseModel):
         if not isinstance(data, dict):
             return data
         found = data.get("v", 1)
-        if not isinstance(found, int):
-            raise ValueError(f"v must be an integer, got {found!r}")
+        # The rule ``seq`` follows (``reader._record``): a JSON integer, not a bool, at least
+        # 1. ``bool`` is an ``int`` in Python, so ``true`` would otherwise pass as 1 and be
+        # read as v1; and ``0`` or ``false`` would blame a missing upcaster for a value no
+        # build ever wrote (issue #128, finding 4.1).
+        if not isinstance(found, int) or isinstance(found, bool) or found < 1:
+            raise ValueError(f"v must be a JSON integer >= 1, got {found!r}")
         if found > cls.SCHEMA_VERSION:
             raise FutureSchemaError(
                 event_type=data.get("type", cls.__name__),
