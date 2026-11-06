@@ -40,8 +40,10 @@ The rules
    principal's log only once the owner has set ``WALLE_ROT=on`` in the environment, outside
    the log; it refuses before reading anything otherwise. The register's switch does not
    turn this on. The pure ``rot`` reads nothing but its arguments, so it needs no switch.
-   Nothing calls ``labels`` on its own, the CLI has no command for it, and the only other
-   caller of ``rot`` is the register's cap refusal, while both switches are on.
+   Nothing calls ``labels`` on its own, and the CLI has no command for it. The other callers
+   of ``rot`` each hold this switch too: the register's cap refusal (with the register's),
+   ``walle.maintenance`` (with its own) and ``walle gate3``, the Phase 3 gate report (with
+   ``WALLE_GATE3``).
 
 There is no two-writer walkthrough because there is no writer: ``rot`` reads records it is
 handed and ``labels`` reads each stream under its own ``LOCK_SH`` for a moment, like
