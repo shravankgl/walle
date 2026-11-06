@@ -93,6 +93,15 @@ uv run ruff format --check  214 files already formatted
 uv run pyright              0 errors, 0 warnings, 0 informations
 ```
 
+After review round 1 (below), at the second commit:
+
+```
+uv run pytest               4344 passed, 35 skipped
+uv run ruff check           All checks passed!
+uv run ruff format --check  216 files already formatted
+uv run pyright              0 errors, 0 warnings, 0 informations
+```
+
 **Two-runner walkthrough:** Codex C appending to a rollout, this reader R; two Rs are serialised by
 the stream's lock as before (fold and append under one `locked()`; the `bodies` set and the
 `copying` set are built under it too).
@@ -113,7 +122,8 @@ the stream's lock as before (fold and append under one `locked()`; the `bodies` 
    write in progress and cheap on a crash.
 5. *Finding 3.3.* C writes `started q a aborted`. R observes `user: q\nassistant: a`. C (or anything)
    appends a reply to the file. R's next run: the aborted turn was finished at the abort; the late
-   reply opens an implicit turn nobody spoke in; nothing is observed, nothing appended.
+   reply joins a further segment of that turn, nobody spoke in it; nothing is observed, nothing
+   appended, nothing pending.
 6. *Finding 3.2.* R observes parent P (turn `p1`, version 0.60.0) and fork F (copy of `p1`,
    fresh-stamped, version 0.61.0, deduplicated by turn id within the lineage; own turn `f1`). The log
    holds `p1` from P and `f1` from F. Codex compresses P. R's next run: P is a counted skip; F's
@@ -145,9 +155,22 @@ and done:
 - The purity test (`test_the_module_imports_no_model_or_network_library`) still passes: the grace
   comes from `walle.transcript`, and time is read through `datetime`, so no new top-level import.
 
-**Review:** to be done by the reviewer agent on the PR's head commit (a different vendor's model,
-per the brief). Not reviewed by the author's own `scripts/review.sh` run, which the agent build
-period replaces.
+**Review:** Gemini 4 Argon, direct diff review (the `ocr` registry was unreachable from its
+sandbox), on head `0331fd2` (my commit `e6d78fe` plus a merge of `main` at `0f9cb81`, #140, that I
+did not make; I confirmed its tree equals a fresh merge of `main` into `e6d78fe` before building on
+it). `agent-review` failed: 2 medium, 1 low, no high. Each finding got a failing test on `0331fd2`
+first, then a fix on the same branch:
+
+| # | Finding | Test that failed on `0331fd2` | Fix |
+|---|---|---|---|
+| M1 | A whitespace-only `user_message` with no image still cut an implicit turn or split an explicit one before `if block:` ran, so the reply after it landed in an unspoken segment and was dropped | `test_a_blank_message_does_not_cut_or_split_a_turn` (an explicit turn loses `assistant: done`; a markerless file loses `q1 -> a1`) | `_record` returns `None` for it, as it does for an empty reply, so no such record reaches `_fold` at all; the `if block:` guard in `_fold` is gone, since the record now always holds speech |
+| M2 | In `append_observations`, an exact-key match did not discard the file from `copying`, so an orphan fork's prefix stayed open across the fork's own logged turns and a later turn repeating a logged body was dropped | `test_a_forks_own_logged_turn_closes_the_copied_prefix` | an exact key is a turn observed from this fork on an earlier run (a copy carries fresh timestamps, so it never matches by key): `copying.discard` there too |
+| L1 | `thread_rolled_back` sliced `finished` by segment, not by Codex turn, so after a split turn `num_turns=1` left the earlier segment observed; the implicit turn a late post-abort line opened counted as a turn of its own | `test_a_rollback_counts_codex_turns_not_segments` (a split turn, an aborted turn with a late reply, and `num_turns=2`) | `_rollback` counts consecutive segments with one turn id as one turn; `abort()` leaves a further segment of the aborted turn open (same id, `segment + 1`) instead of letting a late line open an implicit turn, which also follows Codex, whose reducer keeps writing under the aborted turn |
+
+The first-round tests all still pass; `test_a_record_after_turn_aborted_does_not_reopen_the_turn`
+holds with the tail segment (nobody spoke in it, so it is neither observed nor pending). Full
+checks at the second commit are above. Not reviewed by the author's own `scripts/review.sh` run,
+which the agent build period replaces.
 
 **Choices made inside the task:**
 
@@ -181,6 +204,15 @@ period replaces.
 - *3.3, finish on abort, not "keep pending until the next turn".* Pending would hold a Ctrl-C'd turn
   back until the person spoke again, possibly never. Codex's reducer leaves the turn in progress only
   so a UI can show it; for an observation the abort is the end.
+- *Round 1, blank message dropped in `_record`, not guarded in `_fold`.* The reviewer offered either.
+  Dropping it where the empty reply is dropped keeps the rule in one place, and `_fold` then has no
+  prompt record that is not speech, so the `spoke` flag needs no condition.
+- *Round 1, an abort tail rather than an implicit turn.* Letting a late line open an implicit turn was
+  the one place the fold made a turn Codex would not have, and the rollback count paid for it. The
+  tail segment is what Codex's reducer does (items after `turn_aborted` stay in that turn). A late
+  reply alone leaves it unspoken, so it is neither observed nor pending. Only if the person then
+  speaks in it, it is answered, and it is ended does it become an observation of its own, which is
+  what Codex itself records in that case; a real Codex opens the next prompt with `task_started`.
 - *4, a whitespace-only reply dropped.* Codex drops only `is_empty()`. A reply of spaces would add an
   `assistant:` line with nothing after it; dropping it is the same observation minus a blank line.
 

@@ -80,9 +80,13 @@ What a turn is (``ThreadHistoryBuilder``, and where this module departs from it)
    matches. *Departure (issue #138):* ``turn_aborted`` ends its turn and finishes it too.
    Codex leaves an aborted turn in progress, but an observation of it may already be in the
    log, and a late line joining the turn would make a second, longer one (D92's content key
-   cannot tell the two apart). A line after the abort opens an implicit turn nobody spoke
-   in, which is never observed.
-5. ``thread_rolled_back`` finishes the turn in progress and drops the last ``num_turns``.
+   cannot tell the two apart). What Codex still writes under the aborted turn goes into a
+   further segment of it, where nobody spoke, so it is never observed; a rollback still
+   counts the two as the one turn they are to Codex.
+   A ``user_message`` with no text and no image is nobody speaking: it is dropped as it is
+   read, like an empty reply, so it neither opens, cuts nor splits a turn.
+5. ``thread_rolled_back`` finishes the turn in progress and drops the last ``num_turns``,
+   counted as Codex counts them: a turn split into segments here is one turn there.
 
 When a turn is complete (D56)
 -----------------------------
@@ -475,6 +479,8 @@ def _record(
             for key in ("images", "local_images")
             if isinstance(value := payload.get(key), list)
         )
+        if not message.strip() and not images:
+            return None  # nobody spoke: it must not open, cut or split a turn either
         return RolloutRecord(path, number, at, "prompt", text=message, count=images)
     if event == "agent_message":
         message = payload.get("message")
@@ -610,6 +616,16 @@ def _fold(file: RolloutFile) -> list[_Turn]:
             current = _Turn(turn_id=None, explicit=False, line=record.line)
         return current
 
+    def abort() -> None:
+        """Finish the aborted turn, and leave a further segment of it open for whatever Codex
+        still writes under it: a late reply joins that segment, nobody spoke in it, and it is
+        never observed, while a rollback still counts the whole as one turn."""
+        nonlocal current
+        assert current is not None
+        tail = _Turn(current.turn_id, current.explicit, current.line, segment=current.segment + 1)
+        finish(cut=False)
+        current = tail
+
     for record in file.records:
         if record.kind == "started":
             finish(cut=True)
@@ -625,9 +641,8 @@ def _fold(file: RolloutFile) -> list[_Turn]:
             turn = ensure(record)
             block = [record.text] if record.text and record.text.strip() else []
             block.extend(["[image]"] * record.count)
-            if block:  # blank text and no image: nobody spoke
-                turn.spoke = True
-                turn.lines.append("user: " + "\n".join(block))
+            turn.spoke = True  # ``_record`` dropped the blank-and-imageless message already
+            turn.lines.append("user: " + "\n".join(block))
         elif record.kind in ("tool", "reply"):
             turn = ensure(record)
             text = f"[tool: {record.text}]" if record.kind == "tool" else record.text
@@ -645,15 +660,15 @@ def _fold(file: RolloutFile) -> list[_Turn]:
         elif record.kind == "aborted":
             if current is not None and record.turn_id in (None, current.turn_id):
                 current.ended = True
-                finish(cut=False)
+                abort()
             elif (done := _named(finished, record.turn_id)) is not None:
                 done.ended = True
             elif current is not None:
                 current.ended = True
-                finish(cut=False)
+                abort()
         else:  # rollback
             finish(cut=True)
-            del finished[max(len(finished) - record.count, 0) :]
+            _rollback(finished, record.count)
     if current is not None:
         current.open = True
         finished.append(current)
@@ -664,6 +679,27 @@ def _named(turns: list[_Turn], turn_id: str | None) -> _Turn | None:
     if turn_id is None:
         return None
     return next((t for t in turns if t.turn_id == turn_id), None)
+
+
+def _rollback(finished: list[_Turn], num_turns: int) -> None:
+    """Drop the last ``num_turns`` of Codex's turns from ``finished``, in place.
+
+    Codex counts turns; ``finished`` holds segments. Consecutive segments with the same turn id
+    (a follow-up's split, an abort's tail) are one turn. An implicit turn has no id and is one
+    turn by itself.
+    """
+    keep = len(finished)
+    turns = 0
+    previous: str | None = None
+    for index in range(len(finished) - 1, -1, -1):
+        turn_id = finished[index].turn_id
+        if turn_id is None or turn_id != previous:
+            turns += 1
+            if turns > num_turns:
+                break
+        previous = turn_id
+        keep = index
+    del finished[keep:]
 
 
 def _lineage(file: RolloutFile, by_id: Mapping[str, RolloutFile]) -> tuple[str, bool]:
@@ -830,6 +866,9 @@ def append_observations(
             key = _key(turn.observation)
             if key in logged:
                 already.append(turn)
+                # An exact key is a turn this fork itself was observed from on an earlier run
+                # (a copy carries fresh timestamps), so the copied prefix is over.
+                copying.discard(turn.path)
                 continue
             if turn.path in copying and turn.observation.body in bodies:
                 already.append(turn)  # the ancestor's turn, observed from the ancestor

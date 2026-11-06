@@ -1005,3 +1005,99 @@ def test_a_tool_name_is_one_line_and_blank_text_is_not_speech(tmp_path: Path) ->
     assert bodies(report) == ["user: real\nassistant: [tool: run tests]\nassistant: ok"]
     assert report.pending == ()
     assert hazards.flag(report.turns[0].observation.body) == ()
+
+
+# --- issue #138, review round 1 --------------------------------------------------------------
+
+
+def test_a_blank_message_does_not_cut_or_split_a_turn(tmp_path: Path) -> None:
+    """Review finding 1 (medium). A whitespace-only ``user_message`` with no image is nobody
+    speaking, so it must not close the turn in progress either: in an explicit turn it would
+    have opened an unspoken segment that swallowed the reply; in a markerless file it would
+    have cut the unanswered prompt and swallowed its reply."""
+    sessions = tmp_path / "sessions"
+    explicit = [
+        meta(),
+        started(10, "t1"),
+        said(11, "q"),
+        tool_call(12, "shell"),
+        said(13, "   "),
+        replied(14, "done"),
+        complete(15, "t1"),
+    ]
+    rollout(sessions, explicit, name="explicit")
+    markerless = [meta(), said(21, "q1"), said(22, " \n "), replied(23, "a1"), said(24, "q2")]
+    rollout(sessions, markerless, name="markerless")
+    report = observe_sessions(sessions, environ=ON)
+    assert bodies(report) == [
+        "user: q\nassistant: [tool: shell]\nassistant: done",
+        "user: q1\nassistant: a1",
+    ]
+    assert len(report.pending) == 1  # q2, unanswered
+
+
+def test_a_forks_own_logged_turn_closes_the_copied_prefix(tmp_path: Path) -> None:
+    """Review finding 2 (medium). Once a turn of an orphan fork is found in the log by its
+    exact key, it is the fork's own, so the copied prefix is over: a later turn whose body
+    happens to repeat a logged one is new and is appended."""
+    sessions = tmp_path / "sessions"
+    parent_id = "0199c0de-0000-7000-8000-00000000000a"
+    parent = rollout(sessions, [meta(id=parent_id), *turn(1)], name="p")
+    fork_rows = [meta(id="0199c0de-0000-7000-8000-00000000000b", forked_from_id=parent_id)]
+    fork = rollout(sessions, [*fork_rows, *turn(1, at=50), *turn(2, at=60)], name="zfork")
+    writer = StreamWriter(tmp_path / "root", "maya", "mbp")
+    first = append_observations(observe_sessions(sessions, environ=ON), writer, environ=ON)
+    assert len(first.appended) == 2
+
+    parent.rename(parent.with_suffix(".jsonl.zst"))
+    repeat = [
+        started(70, "t3"),
+        said(71, "question 2"),
+        replied(72, "answer 2"),
+        complete(73, "t3"),
+    ]
+    write(fork, [*fork_rows, *turn(1, at=50), *turn(2, at=60), *repeat])
+    second = append_observations(observe_sessions(sessions, environ=ON), writer, environ=ON)
+    assert [o.body for o in second.appended] == ["user: question 2\nassistant: answer 2"]
+    assert [o.observed_at for o in second.appended] == ["2026-11-03T10:01:12.000000+00:00"]
+    assert len(second.already_logged) == 2
+
+
+def test_a_rollback_counts_codex_turns_not_segments(tmp_path: Path) -> None:
+    """Review finding 3 (low). ``thread_rolled_back`` drops ``num_turns`` of Codex's turns. A
+    turn split into segments by a follow-up, or an aborted turn with a late line after it, is
+    still one turn to Codex, and all of it goes."""
+    sessions = tmp_path / "sessions"
+    back = line(40, "event_msg", {"type": "thread_rolled_back", "num_turns": 1})
+    split = [
+        meta(id="0199c0de-0000-7000-8000-00000000000a"),
+        started(10, "t1"),
+        said(11, "q"),
+        tool_call(12, "shell"),
+        said(13, "also"),
+        replied(14, "done"),
+        complete(15, "t1"),
+        back,
+        *turn(5, at=50),
+    ]
+    rollout(sessions, split, name="split")
+    aborted = line(13, "event_msg", {"type": "turn_aborted", "turn_id": "t1", "reason": "x"})
+    tail = [
+        meta(id="0199c0de-0000-7000-8000-00000000000b"),
+        started(10, "t1"),
+        said(11, "q"),
+        replied(12, "a"),
+        aborted,
+    ]
+    rollout(sessions, [*tail, replied(14, "late"), back, *turn(5, at=50)], name="tail")
+    both = [
+        meta(id="0199c0de-0000-7000-8000-00000000000c"),
+        *turn(1),
+        *turn(2),
+        line(30, "event_msg", {"type": "thread_rolled_back", "num_turns": 2}),
+        *turn(5, at=50),
+    ]
+    rollout(sessions, both, name="two")
+    report = observe_sessions(sessions, environ=ON)
+    assert bodies(report) == ["user: question 5\nassistant: answer 5"] * 3
+    assert report.pending == ()
