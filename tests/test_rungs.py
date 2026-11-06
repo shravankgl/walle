@@ -43,10 +43,10 @@ from walle.rungs import (
     Reply,
     RungsOffError,
     Standing,
+    _reply_for,
     ask,
     bounded,
     parse,
-    reply_for,
     resolve,
     to_ask,
 )
@@ -482,10 +482,10 @@ def test_an_inbox_answer_can_approve_once_or_deny_and_never_always() -> None:
     """An inbox approval carries no words, so the reply it stands for is ``approve`` or
     ``no``. Nothing that arrives through the inbox is the literal word ``always``."""
     asked = _ask(EMPTY, STATUS)
-    assert reply_for(asked.pending, AnswerOutcome.APPROVED) == "#c-1 approve"
-    assert reply_for(asked.pending, AnswerOutcome.DENIED) == "#c-1 no"
+    assert _reply_for(asked.pending, AnswerOutcome.APPROVED) == "#c-1 approve"
+    assert _reply_for(asked.pending, AnswerOutcome.DENIED) == "#c-1 no"
     for outcome in AnswerOutcome:
-        text = reply_for(asked.pending, outcome)
+        text = _reply_for(asked.pending, outcome)
         if outcome in (AnswerOutcome.APPROVED, AnswerOutcome.DENIED):
             assert text is not None
             resolved = _resolve(asked.ledger, text)
