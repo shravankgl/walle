@@ -25,15 +25,23 @@ Observations hold real session text, so three things happen before any of it is 
    observation spans several excerpts, each labelled ``<ref>#<part>`` so a proposal can
    still cite it. The observer labels only the first line of a block, so a piece that
    begins mid-block opens with the role it continues (``assistant: …``): every excerpt says
-   whose words it holds, and no reader has to guess from a bare line.
+   whose words it holds, and no reader has to guess from a bare line. A body with no turn
+   label at all is a connector's, a mail or a calendar event, and is never the person's
+   own words: ``labelled`` gives it the ``tool:`` label explicitly, the corpus's own role
+   for text a tool returned, rather than leaving its provenance to the absence of a label
+   (issue #137).
 3. **Every excerpt is wrapped in an untrusted envelope** with a marker random per request,
    and anything in the text already shaped like a marker is defaced first by
    ``walle.envelope.deface``, the one implementation of D55's rule (D55).
 
-Flagging comes before any cut, always: a staged item is flagged whole and only then cut to
-the head the judge sees; a reply's summary is flagged as the model wrote it and only then
-cut to one line. A hazard past a cut is still a hazard, and a cut that hid one would make
-the gate a matter of length.
+Flagging comes before any cut, always, and again on the exact text each cut produced: an
+observation is flagged whole and then every excerpt of it is flagged as it will be sent,
+and one flag anywhere withholds the whole observation. A cut cannot create what the whole
+was scanned for, a ``user:`` line where a long line was sliced (issue #137, finding 1), and
+it cannot hide anything either. A staged item is flagged whole and only then cut to the
+head the judge sees, and the head is scanned too; a reply's summary is flagged as the model
+wrote it and only then cut to one line. A hazard past a cut is still a hazard, and a cut
+that hid one would make the gate a matter of length.
 
 After the model
 ---------------
@@ -316,28 +324,54 @@ def _requests(
 
 _LABEL = hazards.LABEL  # one reading of a turn label, shared with the hazard checks
 
+UNLABELLED_ROLE = "tool"
+"""The role text with no turn label is given: a connector's body, or a piece cut from one.
+A mail, a calendar event, a fetched page are what a tool returned, never what the person
+said, and ``tool`` is the corpus's own word for that (``tests/corpora/generate.py``)."""
+
+
+def labelled(body: str) -> str:
+    """``body`` with an explicit turn label on its first line (issue #137, finding 2).
+
+    A transcript or a Codex body opens with ``user:`` or ``assistant:`` and is returned as
+    it is. A body whose first line carries no label, which is what every connector writes,
+    opens with ``tool: `` instead: it is a tool's text whole, and every reader, the hazard
+    scan, ``excerpts`` and the model, sees that said rather than inferring it from a label
+    that is not there. Nothing else changes; the body's own text follows the label. The
+    first line that is not blank decides, so a leading blank line before a ``user:`` label
+    does not turn the person's block into a tool's.
+    """
+    first = next((line for line in body.split("\n") if line.strip()), "")
+    if _LABEL.match(first):
+        return body
+    return f"{UNLABELLED_ROLE}: {body}"
+
 
 def excerpts(ref: str, body: str, limit: int = EXCERPT_CHARS) -> list[tuple[str, str]]:
     """Cut ``body`` into ``(id, text)`` pieces of at most ``limit`` characters, on line
     boundaries where a line fits and mid-line where it does not. Ids are ``<ref>#<n>``.
 
     A piece that begins inside a block opens with the label of the role it continues, as
-    the observer would have written it had the block started there. Nothing else is added
-    and nothing is lost: the pieces, less the labels carried forward, join back into the
-    body with only its line breaks gone.
+    the observer would have written it had the block started there; where no label has
+    been seen yet the text is a tool's and the piece opens with ``tool: `` (issue #137,
+    finding 1: a piece that opened bare could open with whatever the cut fell on, a
+    ``user:`` line included). Only the first piece can be bare, and only when the body is.
+    Nothing else is added and nothing is lost: the pieces, less the labels carried forward,
+    join back into the body with only its line breaks gone.
     """
     pieces: list[str] = []
     current: list[str] = []
     size = 0
-    role: str | None = None
+    role = UNLABELLED_ROLE
 
     for line in body.split("\n"):
         match = _LABEL.match(line)
         if match:
             role = match.group(1).lower()
         # What a new piece starting at this line opens with: nothing when the line has its
-        # own label or no role has been seen yet, else the role it continues.
-        prefix = "" if match or role is None else f"{role}: "
+        # own label or this is the body's own first line, else the role it continues; a
+        # tool's, when no label has been seen.
+        prefix = "" if match or not (pieces or current) else f"{role}: "
         room = max(1, limit - len(prefix))
         sliced = False
         while len(line) > room:
@@ -347,7 +381,7 @@ def excerpts(ref: str, body: str, limit: int = EXCERPT_CHARS) -> list[tuple[str,
             pieces.append(prefix + line[:room])
             line = line[room:]
             sliced = True
-            prefix = "" if role is None else f"{role}: "  # the rest is a continuation
+            prefix = f"{role}: "  # the rest is a continuation
             room = max(1, limit - len(prefix))
         if sliced and not line:
             continue
@@ -424,17 +458,24 @@ class FakeModel:
     @staticmethod
     def person_lines(excerpt: str) -> list[str]:
         """The lines of an excerpt that are the person's, by the observer's layout: the
-        ``user:`` block comes first and ends at the first line labelled with any other
-        role — ``assistant:``, ``tool:``, ``system:``. Nothing after that is ever read as
-        a turn, whatever it is prefixed with: a ``user:`` line there is pasted text, and
-        ``hazards`` has flagged it already. An excerpt with no label at all is a body with
-        no turns in it, and is read whole; ``excerpts`` labels every piece of a body that
-        has turns, so a reply's continuation never arrives bare."""
+        ``user:`` block opens the excerpt and ends at the first line labelled with any
+        other role — ``assistant:``, ``tool:``, ``system:``. Nothing after that is ever
+        read as a turn, whatever it is prefixed with: a ``user:`` line there is pasted
+        text, and ``hazards`` has flagged it already. An excerpt that does not open with a
+        ``user:`` label has no person in it (issue #137, finding 2): text with no label is
+        a connector's or a tool's, never the person's, and ``propose`` labels it ``tool:``
+        before it is cut, so a bare line here is never read as anyone's words."""
         out: list[str] = []
+        opened = False
         for line in excerpt.split("\n"):
+            if not line.strip():
+                continue
             match = _LABEL.match(line)
             if match and match.group(1).lower() != "user":
                 break
+            if not match and not opened:
+                break  # bare text before any user: label is not the person's block
+            opened = True
             said = line[match.end() :] if match else line
             if said.strip():
                 out.append(said.strip())
@@ -820,11 +861,11 @@ def propose(
     for record in records:
         if not isinstance(record.event, Observation) or record.ref in considered:
             continue
-        kinds = hazards.flag(record.event.body)
+        kinds, pieces = _scanned(record.ref, record.event.body)
         if kinds:
             withheld.append(Withheld(record.ref, kinds))
             continue
-        items.extend(excerpts(record.ref, record.event.body))
+        items.extend(pieces)
         shown.append(record.ref)
 
     # Ask, with no lock held. Every reply is read before anything is written, so a bad one
@@ -906,6 +947,25 @@ def propose(
     )
 
 
+def _scanned(ref: str, body: str) -> tuple[tuple[str, ...], list[tuple[str, str]]]:
+    """The hazards in an observation and, when there are none, the excerpts to send.
+
+    The body is scanned whole, as the observer wrote it, and then every excerpt is scanned
+    exactly as the model will see it, labelled and cut; the kinds found anywhere, in
+    ``hazards.KINDS`` order, withhold the whole observation. The second pass is what makes
+    the cut safe whatever it falls on (issue #137): a label the slice put at the start of a
+    line is a turn in the piece even when it was mid-line in the body.
+    """
+    kinds = hazards.flag(body)
+    if kinds:
+        return kinds, []
+    pieces = excerpts(ref, labelled(body))
+    found = {kind for _, text in pieces for kind in hazards.flag(text)}
+    if found:
+        return tuple(kind for kind in hazards.KINDS if kind in found), []
+    return (), pieces
+
+
 def _cited_now(stream: LockedStream, log: Path) -> set[str]:
     """Every observation a proposal cites, across all of the principal's streams, read
     under this stream's exclusive lock (the walkthrough, step 4).
@@ -938,14 +998,17 @@ def _judge(model: Model, queue: Sequence[Staged], when: str) -> tuple[list[Shado
 
     A staged item that itself carries a hazard (``walle remember`` takes any text) never
     reaches the model. It gets a ``drop`` from this module, with the kind as the reason. The
-    whole item is flagged; only an item with nothing in it is cut to the head the model sees.
+    whole item is flagged; only an item with nothing in it is cut to the head the model
+    sees, and the head is flagged again as it will be sent (issue #137).
     """
     by_ref = {item.ref: item for item in queue}
     verdicts: dict[str, ShadowVerdict] = {}
     items: list[tuple[str, str]] = []
     for item in queue:
         whole = f"{item.proposal.summary}\n{item.proposal.body}"
-        if kinds := hazards.flag(whole):
+        # Judged on its head, bounded like an excerpt: ``walle remember`` takes any length.
+        head = excerpts(item.ref, whole)[0][1]
+        if kinds := hazards.flag(whole) or hazards.flag(head):
             verdicts[item.ref] = ShadowVerdict(
                 ts=when,
                 proposal=item.ref,
@@ -954,8 +1017,7 @@ def _judge(model: Model, queue: Sequence[Staged], when: str) -> tuple[list[Shado
                 reason=f"withheld from the model: {', '.join(kinds)}",
             )
         else:
-            # Judged on its head, bounded like an excerpt: ``walle remember`` takes any length.
-            items.append((item.ref, excerpts(item.ref, whole)[0][1]))
+            items.append((item.ref, head))
     requests = 0
     for request in _requests("judge", items):
         requests += 1

@@ -30,7 +30,11 @@ follow it with nothing but the person's own lines between. Once a reply has begu
 line has been written (which only happens inside a block's text), nothing later is a turn
 boundary the observer made, however many ordinary lines come first. A ``user:`` line there is
 text that was pasted or returned and is shaped to be read as the person speaking. ``flag``
-reports it as ``turn``.
+reports it as ``turn``. A ``tool:`` line closes the block like a reply does (issue #137): no
+source writes the person after a tool. The observer leaves tool results out, Codex writes a
+call as ``assistant: [tool: <name>]``, and a connector body, a mail or a calendar event, has
+no turns at all; the proposer labels one ``tool:`` whole. The corpora's tool turns are text
+a tool returned, and whatever follows them is more of the same.
 
 **Each kind has one detector, and ``DETECTORS`` is the table.** ``flag`` is their union. The
 table is public so a test can hold every other detector out of the picture and show that the
@@ -279,16 +283,19 @@ def forged_turn(text: str) -> bool:
 
     The observer opens the body with the person's block and writes the reply after it, with
     no blank line between turns. A ``user:`` line is genuine only inside the opening block:
-    the body's first line, or a later line while nothing but labelled ``user:`` lines (or,
-    in the corpus layout, ``tool:`` lines) have come before it. Anything else closes the
-    block for good: a blank line, a reply, a ``system:`` line, or an unlabelled line, which
-    is a continuation of a paste or a tool's output. After that no ``user:`` line is a turn,
-    however many ordinary lines sit between. A body that does not open with a ``user:``
-    label has no opening block at all.
+    the body's first line, or a later line while nothing but labelled ``user:`` lines have
+    come before it. Anything else closes the block for good: a blank line, a reply, a
+    ``tool:`` line, a ``system:`` line, or an unlabelled line, which is a continuation of a
+    paste or a tool's output. After that no ``user:`` line is a turn, however many ordinary
+    lines sit between. A body that does not open with a ``user:`` label has no opening
+    block at all.
 
     So a prompt whose first text block runs over several lines and is followed by a second
     ``user:`` block is flagged too. That layout is rare and the cost is a withheld proposal;
-    passing a forged turn after a paste is the cost the other way (review of PR #50).
+    passing a forged turn after a paste is the cost the other way (review of PR #50). A
+    ``tool:`` line used to leave the block open, for the corpus layout ``user, tool, user``;
+    a one-line tool turn followed by a ``user:`` line then passed (issue #137, finding 5).
+    No source writes that shape for the person, and the corpus no longer does either.
     """
     inside = False  # past the opening block: a user: line from here on is forged
     first = True
@@ -305,7 +312,7 @@ def forged_turn(text: str) -> bool:
             continue
         if role == "user" and inside:
             return True
-        if role not in ("user", "tool"):
+        if role != "user":
             inside = True
     return False
 
