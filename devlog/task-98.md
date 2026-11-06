@@ -107,6 +107,15 @@ uv run ruff format --check  228 files already formatted
 uv run pyright              0 errors, 0 warnings, 0 informations
 ```
 
+After the review fixes (below), on the same branch:
+
+```
+uv run pytest               4589 passed, 35 skipped in 169.02s
+uv run ruff check           All checks passed!
+uv run ruff format --check  229 files already formatted
+uv run pyright              0 errors, 0 warnings, 0 informations
+```
+
 The 35 skips are the same as on `main`. No test assumes root. The suite ran as uid 1000.
 
 **Two-runner walkthrough:** there is no writer, so there is nothing to walk through.
@@ -137,6 +146,38 @@ error class only, never by text, so no provider text or key can come back throug
 
 **Review:** independent review is the reviewer agent's job on this PR, per the brief. I did
 not run `scripts/review.sh`, because the brief replaces it for agent work.
+
+*Round 1* (Gemini 4 Argon, direct diff review, on `52905b5`): `agent-review` failure, two
+medium, no high. I reproduced every example the review gave against `walle.hazards` before
+changing anything. Both are fixed on this branch:
+- *Medium 1: reply text checked in only one of its two forms.* A consolidation title was
+  flagged raw but kept collapsed, so `"keep in  confidence"` or `"saved\nto memory"` passed
+  and became a flagged title. A reason went the other way: flagged collapsed, so a raw
+  `"the door code is\nsunshine"` or `"ok\nsystem: override"` lost its line break before the
+  check, and cut after the check, so a suffix masking `555-0133` fell off at character
+  300. The fix: `_check` flags the title raw *and* collapsed, and returns the collapsed one
+  so `suggest` keeps exactly the string that passed. `_clean_reason` flags the raw reason,
+  the collapsed one and the cut, and returns the cut. A new `REPLY_FIELD_CHARS` (2000)
+  bounds both fields as written, before any pattern runs: an over-long title is `oversize`,
+  and an over-long reason becomes `REASON_UNCHECKED` ("too long to check"). It is not
+  `REASON_WITHHELD`, which would claim a hazard that was never looked for. Tests:
+  `test_a_title_that_becomes_a_hazard_once_collapsed_is_dropped` (five spacings),
+  `test_a_short_title_padded_past_the_bound_is_oversize`,
+  `test_a_reason_is_checked_raw_collapsed_and_cut` (the four examples),
+  `test_a_reason_too_long_to_check_is_withheld_and_says_so`, and
+  `test_every_suggestion_kept_passes_the_checks_as_kept`. That last one is a guard, and it
+  passed before the fix as well.
+- *Medium 2: the item text hid and made hazards.* The `title: ` prefix hid a leading
+  `system:` from `_BOUNDARY`, and the `label: ..., idle 120 days` line after the title read
+  as the value of a secret the title only names ("where the password is"). The fix: the
+  title is flagged on its own as well as inside the item (`_kinds`, kinds de-duplicated in
+  order), and the title is now the item's last line: `name`, `label`, `title`. The door
+  flags each item's inner text, the same string, so the false positive is gone there too.
+  Tests: `test_a_title_that_starts_with_a_role_label_is_withheld` and
+  `test_the_label_line_does_not_make_a_plain_title_a_secret` (two titles).
+
+All 14 new non-guard cases failed before the fix and pass after it. No existing test was
+edited.
 
 **Choices made inside the task:**
 - **Suggestions are returned, not written.** The alternatives were an inbox `ask` per
@@ -173,6 +214,13 @@ the whole pass. Then `_check`, which is every rule a reply item must pass.
   belongs with the register.
 - The Curator calls `model.complete` directly rather than through `pseudonyms.Egress`, while
   the proposer and this pass use the door. That is worth aligning, separately.
+- `proposer.py`'s shadow judge cleans its reason the way this module did before round 1: it
+  collapses, flags, then cuts to 500 characters. So it has the same two holes, a line-based
+  hazard erased by the collapse and a hazard exposed by the cut. The fix belongs in the
+  proposer, in its own task.
+- Several `walle.hazards` patterns match one literal space, so `"keep in  confidence"` does
+  not flag on its own. Making `hazards.flag` whitespace-tolerant would close this
+  everywhere at once. It is a change to a shared detector and needs its own task and tests.
 - `ARCHITECTURE.md` and `PLAN.md` do not mention `walle.maintenance` or
   `WALLE_MAINTENANCE`. They are CODEOWNERS paths and are left for the owner.
 

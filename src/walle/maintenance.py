@@ -23,18 +23,24 @@ The rules
    names is retired on usage grounds). Whatever the model names that it was not shown in
    the same request is dropped as ``unknown-item``.
 3. **Titles are a person's free text, so they are treated as the proposer treats it.** Each
-   item is flagged by ``hazards.flag`` whole and withheld, by ref and kind, when anything is
-   found. What is sent is enveloped under a marker random per request with anything
-   marker-shaped defaced first (D55), grouped into requests of at most ``REQUEST_CHARS``,
-   and sent through the one door, ``pseudonyms.Egress``, which checks the exact final text
-   and refuses rather than sends. A refused request withholds every item it carried.
+   item is flagged by ``hazards.flag`` whole, and its title on its own (where no ``title:``
+   prefix can hide a leading role label), and withheld, by ref and kind, when anything is
+   found. The title is the item's last line, so nothing written after it can be read as
+   the value of a secret it only names. What is sent is enveloped under a marker random
+   per request with anything marker-shaped defaced first (D55), grouped into requests of
+   at most ``REQUEST_CHARS``, and sent through the one door, ``pseudonyms.Egress``, which
+   checks the exact final text and refuses rather than sends. A refused request withholds
+   every item it carried.
 4. **The reply is data.** A ``retire`` names exactly one item; a ``consolidate`` names two
    or more distinct items and carries a one-line ``title`` for the automation that would
    replace them, at most ``TITLE_CHARS`` (an add's limit), with no hazard and no marker.
    Each automation is suggested for retirement once and each set for consolidation once per
    pass. A reason is cut to one line of ``REASON_CHARS``, and replaced by
-   ``REASON_WITHHELD`` when it carries a hazard or a marker. Every reply item refused is
-   counted in ``dropped`` with a reason.
+   ``REASON_WITHHELD`` when it carries a hazard or a marker. A title and a reason are each
+   checked as the model wrote them and as they are kept (collapsed, and for a reason, cut),
+   so neither collapsing whitespace nor the cut can hide a hazard or make one; one longer
+   than ``REPLY_FIELD_CHARS`` as written is refused before any check. Every reply item
+   refused is counted in ``dropped`` with a reason.
 5. **A model that fails costs only its suggestions.** A request the model gives no reply to
    (``ModelCallError``), or answers with something that is not a JSON list
    (``ModelReplyError``), is recorded in ``failures`` by the error's class, never its text,
@@ -94,7 +100,14 @@ TITLE_CHARS = 200
 REASON_CHARS = 300
 """The longest reason a suggestion carries."""
 
+REPLY_FIELD_CHARS = 2000
+"""The longest title or reason, as the model wrote it, that is checked at all. Anything
+longer is refused before a pattern runs over it, so a reply padded with whitespace cannot
+make the checks run over megabytes."""
+
 REASON_WITHHELD = "reason withheld: it carried a hazard or a marker"
+
+REASON_UNCHECKED = "reason withheld: it was too long to check"
 
 INSTRUCTIONS = (
     "You are the maintenance pass for walle's automations. Below are one person's active "
@@ -180,7 +193,18 @@ class Suggestions:
 
 def _text(label: Label, entry: Entry) -> str:
     idle = f"{label.status}, idle {label.idle.days} days"
-    return f"name: {entry.name}\ntitle: {entry.title}\nlabel: {idle}"
+    # The title last: a line after it (``idle 120 days``) would read as the value of a
+    # secret it only names ("where the password is").
+    return f"name: {entry.name}\nlabel: {idle}\ntitle: {entry.title}"
+
+
+def _kinds(*texts: str) -> tuple[str, ...]:
+    """Every hazard kind any of ``texts`` carries, each once, in the order found."""
+    return tuple(dict.fromkeys(kind for text in texts for kind in hazards.flag(text)))
+
+
+def _unsafe(*texts: str) -> bool:
+    return any(hazards.flag(text) or _marked(text) for text in texts)
 
 
 def _requests(items: Sequence[tuple[str, str]]) -> Iterator[Request]:
@@ -222,21 +246,28 @@ class _Reply(BaseModel):
 
 
 def _clean_reason(reason: str) -> str | None:
-    """One line of at most ``REASON_CHARS``; ``None`` for nothing; withheld for a hazard."""
-    one_line = " ".join(reason.split())
-    if not one_line:
+    """One line of at most ``REASON_CHARS``; ``None`` for nothing; withheld for a hazard, or
+    when it is too long to check (rule 4)."""
+    if not reason.strip():
         return None
-    if hazards.flag(one_line) or _marked(one_line):  # model output is data too
+    if len(reason) > REPLY_FIELD_CHARS:
+        return REASON_UNCHECKED
+    one_line = " ".join(reason.split())
+    cut = one_line[:REASON_CHARS]
+    # Model output is data too. The raw lines show what collapsing would erase (a value on
+    # the line after its name, a role label), and the cut shows what a suffix was masking.
+    if _unsafe(reason, one_line, cut):
         return REASON_WITHHELD
-    return one_line[:REASON_CHARS]
+    return cut
 
 
 class _Drop(Exception):
     """A reply item refused, and the one-word reason."""
 
 
-def _check(raw: Any, shown: set[str]) -> tuple[_Reply, frozenset[str]]:
-    """The reply item and the set it names, or ``_Drop`` saying why it is refused (rule 4)."""
+def _check(raw: Any, shown: set[str]) -> tuple[_Reply, frozenset[str], str | None]:
+    """The reply item, the set it names and the title to keep (collapsed to one line, for a
+    consolidation), or ``_Drop`` saying why it is refused (rule 4)."""
     if not isinstance(raw, dict):
         raise _Drop("malformed")
     try:
@@ -255,13 +286,14 @@ def _check(raw: Any, shown: set[str]) -> tuple[_Reply, frozenset[str]]:
         raise _Drop("unknown-item")
     if item.kind == "consolidate":
         assert item.title is not None and title is not None
-        if len(title) > TITLE_CHARS:
-            raise _Drop("oversize")
-        if _marked(item.title):  # as the model wrote it, before any cut
+        if len(item.title) > REPLY_FIELD_CHARS or len(title) > TITLE_CHARS:
+            raise _Drop("oversize")  # before any pattern runs over it
+        # As the model wrote it, and as it is kept: collapsing can join a hazard phrase.
+        if _marked(item.title) or _marked(title):
             raise _Drop("marker-in-text")
-        if hazards.flag(item.title):
+        if hazards.flag(item.title) or hazards.flag(title):
             raise _Drop("hazard-in-text")
-    return item, refs
+    return item, refs, title
 
 
 # --- the pass -----------------------------------------------------------------------------
@@ -297,7 +329,7 @@ def suggest(
         if entry is None:
             continue
         text = _text(label, entry)
-        if kinds := hazards.flag(text):
+        if kinds := _kinds(entry.title, text):
             withheld.append(Withheld(label.ref, kinds))
             continue
         items.append((label.ref, text))
@@ -322,7 +354,7 @@ def suggest(
             continue
         for raw in reply:
             try:
-                item, refs = _check(raw, shown)
+                item, refs, title = _check(raw, shown)
             except _Drop as drop:
                 dropped.append(str(drop))
                 continue
@@ -338,13 +370,13 @@ def suggest(
                 assert label is not None
                 retirements.append(Retirement(ref, entries[ref].name, label.status, reason))
             else:
-                assert item.title is not None
+                assert title is not None
                 targets = tuple(sorted(refs, key=order.__getitem__))
                 consolidations.append(
                     Consolidation(
                         targets=targets,
                         names=tuple(entries[r].name for r in targets),
-                        title=" ".join(item.title.split()),
+                        title=title,  # the string _check passed
                         reason=reason,
                     )
                 )
