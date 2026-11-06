@@ -52,6 +52,20 @@ Three rules, and where each lives
    start the same step or each open a mission for the same workflow; the lock is released
    before the container runs. Nothing is appended on a refusal.
 
+   A declared write is also followed through the filesystem, as the container will follow
+   it (#130). The workspace is mounted at ``/workspace``, so the host and the container
+   read a link at the same name two ways: an absolute target names a container path the
+   host cannot see (``plans -> /workspace/kernel`` is outside the workspace on the host and
+   under ``kernel/`` in the container), and a relative target that climbs above the
+   workspace lands against a different parent in each. The one shape both read the same is
+   a relative link whose every hop and whose landing stay strictly inside the workspace, so
+   that is the one shape a step may write through; everything else is refused
+   (``_contained``), after the floor has had its say on where the host sees it land
+   (``_linked_floor``). And the workspace itself goes through ``executor.check_workspace``
+   — the executor's own rule, absolute and resolved, an existing folder — before
+   ``missions.lock`` is taken, so a workspace the executor would refuse leaves no mission
+   and no ``running`` step in the log.
+
    The floor is also checked where a workflow is *read* — a model's reply and a staged or
    kept body alike — so a draft that would be refused by the mission gate is never staged,
    and a kept body a person edited onto the floor is refused before the log is asked for a
@@ -800,8 +814,9 @@ def _linked_floor(root: Path, workspace: Path, writes: Sequence[str]) -> str | N
     runner's half of ``missions`` rule 8, with a root in hand: ``floors.floored`` follows every
     link on the way and looks where the write lands — against the workspace, where a link
     ``plans -> kernel`` makes ``plans/meals.md`` a write under ``kernel/``, and against the
-    walle root with the path as the container would land it, where a link out of the
-    workspace reaches a principal's hot tier. A path that cannot be resolved is refused (D86)."""
+    walle root with the path as the host would land it, where a link out of the workspace
+    reaches a principal's hot tier. A path that cannot be resolved is refused (D86). Where
+    the host lands it is not always where the container will: ``_contained`` asks that."""
     for path in writes:
         op = floors.Op(floors.Kind.WRITE, path)
         if (found := floors.floored(workspace, op)) is not None:
@@ -809,6 +824,20 @@ def _linked_floor(root: Path, workspace: Path, writes: Sequence[str]) -> str | N
         landed = floors.Op(floors.Kind.WRITE, str(workspace / path))
         if (found := floors.floored(root, landed)) is not None:
             return f"in the walle root, {found.reason}"
+    return None
+
+
+def _contained(workspace: Path, writes: Sequence[str]) -> str | None:
+    """Why a declared write would land somewhere other than where the container will put
+    it, or ``None`` when host and container agree on every one (#130; D68, D72).
+
+    The container sees ``workspace`` as ``/workspace`` and nothing else of the host, so a
+    link inside the workspace reads the same on both sides only when its target is relative
+    and the walk never leaves the workspace. ``floors.escape`` is the walk; this names the
+    write it was asked about."""
+    for path in writes:
+        if (why := floors.escape(workspace, path)) is not None:
+            return f"write {path!r} {why}"
     return None
 
 
@@ -867,23 +896,30 @@ def run_step(
     the log for it is not its plan; ``missions.admit`` refuses (a floored write, missions
     off, paused, a breach, the step finished or not ready, the manifest); a declared write
     reaches a floor path through a link, in the workspace or in the walle root
-    (``floors.floored``); the step is already running; or the container executor is off.
+    (``floors.floored``); a declared write passes through a link the container would read
+    differently from the host — an absolute target, or one that leaves the workspace
+    (``_contained``); the step is already running; or the container executor is off.
     Otherwise appends the mission (when none is open) and ``running`` for the step on
     ``device``'s stream, hands the step to ``executor.run``, and appends ``completed`` or
     ``failed`` with how it ended. There is no other way for a step to run.
 
     Raises, rather than refusing: ``ValueError`` for a malformed ref or an unsafe principal or
-    device name, and for a workspace or token the executor's own checks refuse (missing, the
-    home folder, root-owned) — the step is then recorded as ``failed`` before the error
-    leaves; and ``FileNotFoundError`` for a principal with no log. Each is a caller's mistake,
-    not an answer about the workflow.
+    device name, and for a workspace ``executor.check_workspace`` refuses (relative, missing,
+    the filesystem root, the home folder) — each before any lock is taken or anything is
+    appended; ``ValueError`` for a token or a root-owned workspace the executor's later
+    checks refuse — the step is then recorded as ``failed`` before the error leaves; and
+    ``FileNotFoundError`` for a principal with no log. Each is a caller's mistake, not an
+    answer about the workflow.
     """
     if not enabled(environ):
         return Refusal(_off())
     root = Path(root)
     writer = StreamWriter(root, principal, device)  # validates both names first
     parse_ref(ref)  # a malformed ref is a ValueError, before any lock or file
-    workspace = Path(workspace)
+    # The executor's own rule for the mount, asked here so a workspace it would refuse
+    # leaves nothing in the log; resolved, so every check below reads the folder the
+    # container will be given, not a link to it (#130).
+    workspace = executor.check_workspace(Path(workspace))
     if _overlaps(workspace, root):
         return Refusal(
             f"workspace {str(workspace)!r} overlaps the walle root; a container there could "
@@ -918,6 +954,8 @@ def run_step(
         if (refused := missions.admit(state, node, touch, environ)) is not None:
             return Refusal(refused.reason)
         if (why := _linked_floor(root, workspace, step.writes)) is not None:
+            return Refusal(why)
+        if (why := _contained(workspace, step.writes)) is not None:
             return Refusal(why)
         if state.node(node).status is StepStatus.RUNNING:
             # ``admit`` lets a running node through because it is also the check at each tool
