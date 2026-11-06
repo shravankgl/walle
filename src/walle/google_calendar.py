@@ -10,7 +10,8 @@ Four rules, each with a test that would fail without it (``tests/test_google_cal
 
 * **One scope, and it is read-only.** ``SCOPES`` is ``calendar.events.readonly`` and nothing
   else, named in exactly one place. The sign-in asks for no previously granted scopes, and a
-  token whose grant comes back wider than ``SCOPES`` is refused, not kept. Every request to the
+  token whose grant comes back wider than ``SCOPES`` is refused, not kept, by the one check
+  both Google connectors share (``walle.google_oauth``). Every request to the
   API is a ``GET`` on ``events.list``; the only ``POST`` goes to the token endpoint. Nothing here
   knows how to create, change or delete an event, because no such endpoint is named.
 * **Tokens live outside the log and outside the repo.** A ``TokenStore`` writes one private
@@ -80,10 +81,19 @@ first left as it was (append, never mutate). ``showDeleted=true`` asks for cance
 
 Google guarantees nothing but ``id`` on a deleted event. One that arrives without ``updated``
 takes the list's own ``updated`` (the calendar's last change, at or after the deletion) and its
-body says so; a live event without one is a broken reply, and the sync is refused. An
+body says so. That borrowed time moves with every later change on the calendar, so the item
+is handed to the base with ``borrowed_time`` set and matched by its body alone: the same bare
+cancellation is one observation however many syncs see it (issue #136). A live event without
+``updated`` is a broken reply, and the sync is refused. An
 ``updatedMin`` Google calls too far in the past (``410 updatedMinTooLongAgo``) falls back to one
 full listing; the content fold appends only what is new. Nothing is stored between runs but the
 log: no sync token, which would be a side store (D92).
+
+The cursor is per calendar. Two calendars synced into one stream share the source name, and
+folded over the whole source the second would be asked for changes since the first's last
+one, losing everything older (issue #136). The first line of every body names its calendar,
+and ``CalendarSource.covers`` tells the base to fold the cursor over that calendar's bodies
+only.
 
 Expired tokens and rate limits
 ------------------------------
@@ -127,6 +137,9 @@ import click
 from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError
 
 from walle.connector import Cursor, Item, SyncReport, sync
+from walle.events import FutureSchemaError
+from walle.google_oauth import scrubbed, wider_than
+from walle.reader import CorruptStreamError, without_content
 from walle.writer import StreamWriter
 
 READONLY_SCOPE = "https://www.googleapis.com/auth/calendar.events.readonly"
@@ -361,15 +374,6 @@ def _epoch_instant(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, UTC).isoformat(timespec="microseconds")
 
 
-def _granted_too_much(data: Mapping[str, Any]) -> str | None:
-    """The scopes a token-endpoint reply grants beyond ``SCOPES``, as text, or ``None``."""
-    granted = data.get("scope")
-    if not isinstance(granted, str):
-        return None
-    extra = sorted(set(granted.split()) - set(SCOPES))
-    return _one_line(" ".join(extra))[:200] if extra else None
-
-
 def _token_from(
     client_id: str,
     client_secret: SecretStr,
@@ -379,8 +383,9 @@ def _token_from(
 ) -> Token:
     """A ``Token`` from the token endpoint's reply. A refresh reply may omit
     ``refresh_token``; it is then the one already held. Raises ``AuthError`` for a grant wider
-    than ``SCOPES``: a token that could write is not kept, even if Google offers one."""
-    if (extra := _granted_too_much(data)) is not None:
+    than ``SCOPES``, by the check the Gmail connector shares (issue #136): a token that could
+    write is not kept, even if Google offers one."""
+    if (extra := wider_than(SCOPES, data)) is not None:
         raise AuthError(
             f"Google granted more than the read-only scope ({extra}); nothing was kept. "
             "Remove walle's access in your Google account and run sign-in again"
@@ -601,6 +606,14 @@ class CalendarSource:
         self._page_size = page_size
         self._overlap = overlap_seconds
 
+    def covers(self, body: str) -> bool:
+        """Whether a logged observation is from this source's calendar. The first line says
+        (``render_event``); the base folds the cursor over these bodies only, so a second
+        ``--calendar`` into the same stream starts from its own last change, not the first's
+        (issue #136)."""
+        match = _FIRST_LINE.match(body)
+        return match is not None and match.group("calendar") == _one_line(self._calendar_id)
+
     def pull(self, cursor: Cursor) -> list[Item]:
         """Every event changed since the cursor, less the overlap, oldest change first. Raises
         on any failure, and the base then appends nothing."""
@@ -653,8 +666,16 @@ class CalendarSource:
                     )
                 except ValueError as error:
                     raise ApiError(200, str(error)) from None
+                # An event with no ``updated`` of its own borrowed the list's, which moves
+                # with every change on the calendar; the base matches it by body alone.
+                own_time = isinstance(entry.get("updated"), str) and bool(entry.get("updated"))
                 items.append(
-                    Item(observed_at=observed_at, body=body, source_version=SOURCE_VERSION)
+                    Item(
+                        observed_at=observed_at,
+                        body=body,
+                        source_version=SOURCE_VERSION,
+                        borrowed_time=not own_time,
+                    )
                 )
             next_token = page.get("nextPageToken")
             if not isinstance(next_token, str) or not next_token:
@@ -666,6 +687,10 @@ class CalendarSource:
 
 
 # --- rendering an event --------------------------------------------------------------------------
+
+
+_FIRST_LINE = re.compile(r"Google Calendar event \S+ on calendar (?P<calendar>.+?)(?:\n|$)")
+"""The connector's own first line, with the calendar the event was listed from."""
 
 
 def render_event(
@@ -993,7 +1018,14 @@ def exchange_code(
         or not data.get("refresh_token")
     ):
         kind = data.get("error") if isinstance(data, dict) else None
-        detail = f" ({_one_line(kind)[:80]})" if isinstance(kind, str) else ""
+        # Google's error text, never trusted to be a bare code: every secret the form carried
+        # is scrubbed and the rest is one short line (the low on PR #65).
+        shown = (
+            scrubbed(kind, (client_secret, code, code_verifier), limit=80)
+            if isinstance(kind, str)
+            else ""
+        )
+        detail = f" ({shown})" if shown else ""
         raise AuthError(f"Google would not exchange the sign-in code{detail}; try sign-in again")
     return _token_from(client_id, SecretStr(client_secret), str(data["refresh_token"]), data, now())
 
@@ -1182,6 +1214,9 @@ def sync_command(
         ) from None
     except (ValueError, CalendarError) as error:
         raise click.ClickException(str(error)) from None
+    except (CorruptStreamError, FutureSchemaError, OSError) as error:
+        # Without content: a line the reader refuses is quoted in pydantic's message.
+        raise click.ClickException(without_content(error)) from None
     click.echo(
         f"google-calendar: appended {len(report.appended)}, "
         f"already logged {len(report.already_logged)}; "

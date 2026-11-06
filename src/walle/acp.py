@@ -89,13 +89,29 @@ The client C reading the tier and a renderer R for the same principal.
 
 1. R holds ``render.lock`` exclusively. C's non-blocking shared request fails at once
    (``hook.Busy``); C opens the session without memory and reports ``busy``. It does not wait.
-2. R releases. C's next ``memory`` call takes the shared lock, reads the four files under it
-   (so never a new ``identity.md`` beside an old ``learned.md``), releases, and builds the
-   block from that text. The lock is held for the read only; nothing of the protocol runs
-   under it, and nothing here takes ``index.lock``.
+2. R releases. C's next ``memory`` call takes the shared lock, reads the four files and the
+   manifest under it (so never a new ``identity.md`` beside an old ``learned.md``, and a
+   manifest that describes that render), releases, and only then asks ``hot.age`` whether
+   the render is the log's fold now, which brings the index up to date under ``index.lock``.
+   ``render.lock`` is never held while ``index.lock`` is taken, so R's order (``render.lock``
+   then ``index.lock``) cannot meet its reverse here; it is ``hot_resource.read``'s order
+   exactly. Nothing of the protocol runs under either lock.
+3. A render Y lands between C's read and its fold: C reports the text it read as ``stale``
+   against the newer log, which is true of that text, and the session carries the older
+   render with the note in front. An append lands after C's fold: C calls the text current
+   one event early; newer is the right way round. Both as the MCP Resource has them.
 
-No model call, no network, no server: this module imports the hook's reader and the envelope,
-and the standard library.
+What the host says is data
+--------------------------
+A host's error text and its ``protocolVersion`` are untrusted, like anything it sends, and
+``walle acp`` prints an error to the terminal. So ``HostError`` keeps the host's message
+folded to one line, cut at ``ERROR_CHARS``, and with any value of a secret-named environment
+variable masked (``walle.models.redact``, the same rule a provider's error gets), and a
+``ProtocolError`` about the version names the value's type and not the value (issue #139).
+A ``session/update`` is kept on the turn only when its ``sessionId`` is the session's own.
+
+No model call, no network, no server: this module imports the hook's reader, the renderer's
+age check, the envelope and the redactor, and the standard library.
 """
 
 from __future__ import annotations
@@ -112,8 +128,9 @@ from enum import StrEnum
 from pathlib import Path
 from typing import IO, Any
 
-from walle import __version__, hook
+from walle import __version__, hook, hot
 from walle.envelope import wrap
+from walle.models import redact
 
 PROTOCOL_VERSION = 1
 """The one major version this client speaks (``schema-v1.29.1``)."""
@@ -137,6 +154,9 @@ GRACE = 2.0
 
 METHOD_NOT_FOUND = -32601
 
+ERROR_CHARS = 400
+"""The most of a host's error message that is kept: one line of it, cut here."""
+
 Permission = Callable[[dict[str, Any]], dict[str, Any]]
 """Answers a ``session/request_permission``: the request's params in, the ``outcome`` out."""
 
@@ -151,9 +171,19 @@ class HostError(AcpError):
     def __init__(self, method: str, error: Mapping[str, Any]) -> None:
         self.method = method
         self.code = error.get("code")
-        self.message = str(error.get("message", ""))
+        self.message = _said(error.get("message", ""))
+        """The host's message, folded to one line, cut at ``ERROR_CHARS``, secrets masked."""
         self.data = error.get("data")
         super().__init__(f"{method}: the host answered error {self.code}: {self.message}")
+
+
+def _said(text: object) -> str:
+    """Untrusted host text as this module will repeat it: redacted, then one line, then cut.
+    Redacted first, so a secret the cut would split in two is masked whole."""
+    one_line = " ".join(redact(str(text)).split())
+    if len(one_line) > ERROR_CHARS:
+        one_line = one_line[: ERROR_CHARS - 1] + "…"
+    return one_line
 
 
 class HostGone(AcpError):
@@ -175,6 +205,11 @@ class ProtocolError(AcpError):
 
 class Status(StrEnum):
     READY = "ready"
+    """The tier, and it is the log's state now."""
+    STALE = "stale"
+    """The tier with a note in front: the log has moved since it was rendered."""
+    UNCHECKED = "unchecked"
+    """The tier with a note in front: its age could not be told."""
     MISSING = "missing"
     BUSY = "busy"
 
@@ -198,19 +233,26 @@ NO_MEMORY = Memory(Status.MISSING, None, "no memory was asked for")
 def memory(root: Path, principal: str) -> Memory:
     """The hot tier as the hook reads it, without waiting on a render (D115).
 
-    ``ready`` with the text; ``busy`` when a render holds the lock right now; ``missing`` when
-    there is no complete tier, or it cannot be read, with the reason. Never raises for any
-    state of the tier; an unsafe principal name is a ``ValueError`` as everywhere else.
+    ``ready`` with the text; ``stale`` or ``unchecked`` with the text behind the same note the
+    MCP Resource puts there (``hot.age``), so the host's model is told the memory is older
+    than the log, or that nobody could tell; ``busy`` when a render holds the lock right now;
+    ``missing`` when there is no complete tier, or it cannot be read, with the reason. Never
+    raises for any state of the tier; an unsafe principal name is a ``ValueError`` as
+    everywhere else.
     """
     try:
-        text, _ = hook.snapshot(root, principal, wait=False)
+        text, manifest = hook.snapshot(root, principal, wait=False)
     except hook.Busy as exc:
         return Memory(Status.BUSY, None, str(exc))
     except hook.Silent as exc:
         return Memory(Status.MISSING, None, str(exc))
     except OSError as exc:  # the lock could not be taken at all (say, ENOLCK on a network disk)
         return Memory(Status.MISSING, None, f"the hot tier could not be read: {exc.strerror}")
-    return Memory(Status.READY, text)
+    aged = hot.age(root, principal, manifest)
+    if aged.age is hot.Age.CURRENT:
+        return Memory(Status.READY, text)
+    status = Status.STALE if aged.age is hot.Age.STALE else Status.UNCHECKED
+    return Memory(status, aged.note(principal) + text, aged.why)
 
 
 def tier_block(text: str, *, embedded: bool) -> dict[str, Any]:
@@ -342,8 +384,11 @@ class Host:
         )
         version = result.get("protocolVersion")
         if version != PROTOCOL_VERSION:
+            # An integer is said; anything else is named by type, not quoted, since it is
+            # whatever the host chose to send.
+            spoken = str(version) if isinstance(version, int) else f"a {type(version).__name__}"
             raise ProtocolError(
-                f"the host speaks protocol version {version!r}; this client speaks "
+                f"the host speaks protocol version {spoken}; this client speaks "
                 f"{PROTOCOL_VERSION} only, so the session was not opened"
             )
         self.protocol_version = PROTOCOL_VERSION
@@ -464,9 +509,11 @@ class Host:
         """Send a request and wait for its answer, serving the host meanwhile.
 
         ``timeout`` is seconds for the whole wait, ``None`` for no limit. ``on_update``
-        receives every ``session/update``'s ``update`` that arrives during the wait, and
-        ``permission`` answers the host's permission requests. Public so a caller can speak
-        a method this module does not wrap (``session/load``, say) over the same connection.
+        receives every ``session/update``'s ``update`` that arrives during the wait and
+        names the ``sessionId`` this request names (every one, when the request names
+        none), and ``permission`` answers the host's permission requests. Public so a
+        caller can speak a method this module does not wrap (``session/load``, say) over
+        the same connection.
         One request is in flight at a time; a second caller waits for the first. ``notify``
         and ``Session.cancel`` do not wait, so a turn can be cancelled from another thread.
         """
@@ -485,6 +532,8 @@ class Host:
             raise HostGone(self.process.returncode, f"{method} was not sent")
         self._next_id += 1
         id_ = self._next_id
+        named = params.get("sessionId")
+        session_id = named if isinstance(named, str) else None
         self._send({"jsonrpc": "2.0", "id": id_, "method": method, "params": params})
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
@@ -504,7 +553,7 @@ class Host:
                     "message, which the transport forbids; it has been closed"
                 )
             if "method" in message:
-                self._serve(message, on_update, permission)
+                self._serve(message, on_update, permission, session_id)
                 continue
             if message.get("id") != id_:
                 continue  # an answer to nothing we are waiting for; dropped
@@ -519,8 +568,10 @@ class Host:
         message: dict[str, Any],
         on_update: Callable[[dict[str, Any]], None] | None,
         permission: Permission,
+        session_id: str | None,
     ) -> None:
-        """A request or notification from the host, answered or filed."""
+        """A request or notification from the host, answered or filed. A ``session/update``
+        for a session other than ``session_id`` is dropped: it is not this turn's."""
         method = message.get("method")
         params = message.get("params")
         params = params if isinstance(params, dict) else {}
@@ -528,7 +579,8 @@ class Host:
         if id_ is None:  # a notification
             if method == "session/update":
                 update = params.get("update")
-                if isinstance(update, dict) and on_update is not None:
+                ours = session_id is None or params.get("sessionId") == session_id
+                if isinstance(update, dict) and on_update is not None and ours:
                     on_update(update)
             return
         if method == "session/request_permission":

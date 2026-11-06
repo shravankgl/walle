@@ -27,9 +27,14 @@ Four modules, one job each:
     One dated file per model under ``reports/``, with a literal ``SHIP GATE`` line. Nothing
     that did not run gets a number.
 
-``models`` holds the adapters: the fake from ``proposer`` and a provider through aisuite
-(D87), imported only when asked for, so this package loads with no key and no network
-library. No module here is imported by anything on the resolution path.
+``models`` is the model surface: the fake from ``proposer``, and the one provider adapter,
+``walle.models.ProviderModel`` (D87), re-exported; aisuite is imported only when asked for,
+so this package loads with no key and no network library. No module here is imported by
+anything on the resolution path.
+
+A gate that did not run fails (issue #139): a corpus or a leg with no outcome, a model that
+proposed from no benign item, and a run whose model gave no reply or whose shadow judging
+failed are a FAIL or no report, never a PASS.
 """
 
 from __future__ import annotations

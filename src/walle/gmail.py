@@ -16,6 +16,10 @@ Four rules, each with a test that would fail without it (``tests/test_gmail.py``
   type and size and skipped. ``users.messages.attachments.get`` is never called, and the fake
   in the tests raises if it is. A PDF, an image or a calendar file in a mail is where a payload
   would hide, and a memory layer has no business opening it.
+* **One scope, and nothing wider is kept.** The sign-in asks for no scope granted to the
+  client before (``include_granted_scopes`` is off), and a token whose grant comes back wider
+  than ``SCOPES``, at sign-in or at refresh, is refused and not written, by the one check both
+  Google connectors share (``walle.google_oauth``, issue #136).
 * **Tokens live outside the log and outside the repo.** A ``TokenStore`` writes one private
   file (``0600``, in a ``0700`` folder) at a path the owner chooses, by default under the user's
   config folder, and ``sync_gmail`` refuses a path under the walle root. No token is ever in an
@@ -44,7 +48,7 @@ What a message becomes
 ----------------------
 ::
 
-    Gmail message <id> in thread <threadId>
+    Gmail message <id> in thread <threadId> (query: <the --query, when one was given>)
     From: ...
     To: ...
     Cc: ...                (only when present)
@@ -75,6 +79,14 @@ it matches, then hands back every message in the thread, so a long-running conve
 re-arrives on every sync; the base's content fold appends only the new replies, and the test
 ``test_a_rerun_with_the_overlap_refetching_a_thread_appends_nothing`` holds that. Nothing is
 stored between runs but the log.
+
+The cursor is per query. A search is a slice of the mailbox, and a message that
+``label:urgent`` never asked for is not "already seen" because an urgent mail arrived after
+it; folded over the whole source, the cursor after one query would make the next query skip
+everything older than it (issue #136). So the first line of every body says which query it
+was asked with, and ``GmailSource.covers`` tells the base to fold the cursor over bodies
+asked with the same one. A message that matches two queries is logged under each: the body
+differs on its first line, and so it should, because the log says what was asked (D92).
 
 Expired tokens and rate limits
 ------------------------------
@@ -122,6 +134,9 @@ import click
 from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError
 
 from walle.connector import Cursor, Item, SyncReport, sync
+from walle.events import FutureSchemaError
+from walle.google_oauth import scrubbed, wider_than
+from walle.reader import CorruptStreamError, without_content
 from walle.writer import StreamWriter
 
 READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
@@ -143,7 +158,8 @@ SOURCE_VERSION = "gmail-v1"
 MAX_TEXT = 16_000
 """Characters of a message's own text kept before it is cut with a note."""
 
-_HOSTS = frozenset({"gmail.googleapis.com", "oauth2.googleapis.com"})
+_API_HOST = urllib.parse.urlsplit(API).hostname
+_API_PATH = urllib.parse.urlsplit(API).path + "/"
 _LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
 _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 _RATE_REASONS = frozenset(
@@ -219,7 +235,8 @@ _OPENER = urllib.request.build_opener(_NoRedirect)
 
 def urllib_transport(request: Request, *, timeout: float = 30.0) -> Response:
     """The real wire, from the standard library. Follows no redirect, so a token never travels
-    to a host Google did not name; refuses plain ``http`` anywhere but the loopback."""
+    to a host Google did not name; refuses plain ``http`` anywhere but the loopback. A network
+    failure of any kind, a timeout included, is a ``GmailError``."""
     url = urllib.parse.urlsplit(request.url)
     if url.scheme != "https" and url.hostname not in _LOOPBACK:
         raise ValueError(f"only https is sent anywhere but the loopback, not {url.scheme}")
@@ -234,6 +251,9 @@ def urllib_transport(request: Request, *, timeout: float = 30.0) -> Response:
             return Response(error.code, dict(error.headers.items()), error.read())
     except urllib.error.URLError as error:
         raise GmailError(f"could not reach {url.hostname}: {error.reason}") from error
+    except OSError as error:
+        # A read that times out, or a connection reset mid-reply, is not a URLError.
+        raise GmailError(f"could not reach {url.hostname}: {error}") from error
 
 
 def _header(headers: Mapping[str, str], name: str) -> str | None:
@@ -376,12 +396,24 @@ class GmailClient:
         return text
 
     def get(self, path: str, params: Mapping[str, str]) -> dict[str, Any]:
-        """One ``GET``, as parsed JSON. ``path`` is relative to ``API`` or a full URL on one
-        of the two Google hosts; anything else is refused before any request is made."""
+        """One ``GET``, as parsed JSON. ``path`` is relative to ``API``, or a full URL under it;
+        anything else, another host, another port, another Google API on the same host or a
+        path that steps out of this one, is refused before any request is made, because the
+        bearer token goes with it."""
         url = path if path.startswith("https://") else API + path
-        host = urllib.parse.urlsplit(url).hostname
-        if host not in _HOSTS:
-            raise ValueError(f"refusing to send the token to host {host!r}")
+        split = urllib.parse.urlsplit(url)
+        segments = split.path.split("/")
+        if (
+            split.scheme != "https"
+            or split.hostname != _API_HOST
+            or split.port is not None
+            or not split.path.startswith(_API_PATH)
+            or ".." in segments
+            or "." in segments
+        ):
+            raise ValueError(
+                f"refusing to send the token to host {split.hostname!r} at {split.path!r}"
+            )
         if params:
             url = f"{url}?{urllib.parse.urlencode(dict(params))}"
         # One refresh per call, whether it happens here or on a 401 below: a token minted a
@@ -487,7 +519,14 @@ def _token_from(
     now: float,
 ) -> Token:
     """A ``Token`` from the token endpoint's reply. The reply may omit ``refresh_token`` (a
-    refresh does); ``refresh_token`` is then the one already held."""
+    refresh does); ``refresh_token`` is then the one already held. Raises ``AuthError`` for a
+    grant wider than ``SCOPES``, by the check the calendar connector shares: a token that
+    could write is not kept, even if Google offers one (issue #136)."""
+    if (extra := wider_than(SCOPES, data)) is not None:
+        raise AuthError(
+            f"Google granted more than the read-only scope ({extra}); nothing was kept. "
+            "Remove walle's access in your Google account and run sign-in again"
+        )
     expires_in = data.get("expires_in", 3600)
     lifetime = float(expires_in) if isinstance(expires_in, int | float) else 3600.0
     return Token(
@@ -546,6 +585,13 @@ class GmailSource:
         self._page_size = page_size
         self._overlap = overlap_seconds
 
+    def covers(self, body: str) -> bool:
+        """Whether a logged observation was asked for with this source's query. The first
+        line says (``render_message``); the base folds the cursor over these bodies only, so
+        changing ``--query`` starts that query from its own last message, not another's."""
+        match = _FIRST_LINE.match(body)
+        return match is not None and (match.group("query") or "") == self._query
+
     def pull(self, cursor: Cursor) -> list[Item]:
         """Every message in every thread that changed since the cursor, oldest first. Raises
         on any failure, and the base then appends nothing."""
@@ -566,7 +612,7 @@ class GmailSource:
                     raise ApiError(
                         200, f"thread {thread_id!r} holds a message that is not an object"
                     )
-                observed_at, body = render_message(message)
+                observed_at, body = render_message(message, query=self._query)
                 items.append(
                     Item(observed_at=observed_at, body=body, source_version=SOURCE_VERSION)
                 )
@@ -604,12 +650,18 @@ class GmailSource:
 # --- rendering a message -----------------------------------------------------------------------
 
 
-def render_message(message: Mapping[str, Any]) -> tuple[str, str]:
+_FIRST_LINE = re.compile(r"Gmail message \S+ in thread \S+(?: \(query: (?P<query>.*)\))?(?:\n|$)")
+"""The connector's own first line, with the query the message was asked for with, if any."""
+
+
+def render_message(message: Mapping[str, Any], *, query: str = "") -> tuple[str, str]:
     """One Gmail message, ``format=full``, to ``(observed_at, body)``. Pure: no IO, no clock.
 
     Everything in the result is untrusted text (D55). Header values are folded onto one line,
     the first line is always the connector's own, attachments are named by type and size
-    only, and nothing is ever fetched from here.
+    only, and nothing is ever fetched from here. ``query`` is the search the message was
+    asked for with, written on the first line so the log says what was asked (D92) and the
+    cursor for that search is folded over its own messages (``GmailSource.covers``).
     """
     raw = message.get("internalDate")
     try:
@@ -621,7 +673,10 @@ def render_message(message: Mapping[str, Any]) -> tuple[str, str]:
 
     payload = message.get("payload") or {}
     msg_id, thread_id = _one_line(message.get("id")), _one_line(message.get("threadId"))
-    lines = [f"Gmail message {msg_id} in thread {thread_id}"]
+    asked = " ".join(query.split())
+    lines = [
+        f"Gmail message {msg_id} in thread {thread_id}" + (f" (query: {asked})" if asked else "")
+    ]
     found = _headers(payload.get("headers") if isinstance(payload, dict) else None)
     for name in _KEPT_HEADERS:
         value = found.get(name.lower())
@@ -760,11 +815,35 @@ class _TextOf(HTMLParser):
             self.pieces.append(data)
 
 
+_HTML_TAGS = (
+    # The living standard's elements, the obsolete ones a mail client still writes, and the
+    # Office namespaces (``o:p``, ``v:shape``) Outlook puts in. One letter and a colon is
+    # Office; ``untrusted:`` is nine letters and is not a tag.
+    "a|abbr|acronym|address|applet|area|article|aside|audio|b|base|basefont|bdi|bdo|big|blink"
+    "|blockquote|body|br|button|canvas|caption|center|cite|code|col|colgroup|data|datalist|dd"
+    "|del|details|dfn|dialog|dir|div|dl|dt|em|embed|fieldset|figcaption|figure|font|footer"
+    "|form|frame|frameset|h[1-6]|head|header|hgroup|hr|html|i|iframe|img|input|ins|kbd|keygen"
+    "|label|legend|li|link|listing|main|map|mark|marquee|math|menu|menuitem|meta|meter|nav"
+    "|nobr|noembed|noframes|noscript|object|ol|optgroup|option|output|p|param|picture"
+    "|plaintext|pre|progress|q|rb|rp|rt|rtc|ruby|s|samp|script|search|section|select|slot"
+    "|small|source|spacer|span|strike|strong|style|sub|summary|sup|svg|table|tbody|td"
+    "|template|textarea|tfoot|th|thead|time|title|tr|track|tt|u|ul|var|video|wbr|xmp"
+    "|[a-z]:[a-z][a-z0-9]*"
+)
+_NOT_A_TAG = re.compile(rf"<(?![!?]|/?(?:{_HTML_TAGS})(?=[\s/>]))", re.IGNORECASE)
+"""A ``<`` that opens no HTML element, comment, doctype or processing instruction."""
+
+
 def _html_to_text(html: str) -> str:
+    """The text of ``html``. Every ``<`` that does not open a known tag is escaped first, so
+    the parser keeps it as text: a forged ``<<</untrusted:...>>>`` marker, a ``<system>`` or
+    an ``<instructions>`` tag reaches the gate as written instead of vanishing as an unknown
+    tag (issue #136). Comments and conditional comments are dropped, as a mail client drops
+    them: the gate sees what a reader would."""
     if not html:
         return ""
     parser = _TextOf()
-    parser.feed(html)
+    parser.feed(_NOT_A_TAG.sub("&lt;", html))
     parser.close()
     return "".join(parser.pieces)
 
@@ -835,7 +914,8 @@ def pkce_challenge(verifier: str) -> str:
 
 
 def authorization_url(client_id: str, redirect_uri: str, *, state: str, code_challenge: str) -> str:
-    """The consent page, asking for ``SCOPES`` and a refresh token, with PKCE."""
+    """The consent page, asking for ``SCOPES`` and a refresh token, with PKCE, and for no
+    scope granted to this client before: the token is for reading mail and nothing else."""
     return f"{AUTH_URL}?" + urllib.parse.urlencode(
         {
             "client_id": client_id,
@@ -844,6 +924,7 @@ def authorization_url(client_id: str, redirect_uri: str, *, state: str, code_cha
             "scope": " ".join(SCOPES),
             "access_type": "offline",
             "prompt": "consent",
+            "include_granted_scopes": "false",
             "state": state,
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
@@ -887,7 +968,14 @@ def exchange_code(
         or not data.get("refresh_token")
     ):
         kind = data.get("error") if isinstance(data, dict) else None
-        detail = f" ({kind})" if isinstance(kind, str) else ""
+        # Google's error text, never trusted to be a bare code: every secret the form carried
+        # is scrubbed and the rest is one short line (the low on PR #65).
+        shown = (
+            scrubbed(kind, (client_secret, code, code_verifier), limit=80)
+            if isinstance(kind, str)
+            else ""
+        )
+        detail = f" ({shown})" if shown else ""
         raise AuthError(f"Gmail would not exchange the sign-in code{detail}; try sign-in again")
     return _token_from(client_id, SecretStr(client_secret), str(data["refresh_token"]), data, now())
 
@@ -1068,6 +1156,9 @@ def sync_command(
         ) from None
     except (ValueError, GmailError) as error:
         raise click.ClickException(str(error)) from None
+    except (CorruptStreamError, FutureSchemaError, OSError) as error:
+        # Without content: a line the reader refuses is quoted in pydantic's message.
+        raise click.ClickException(without_content(error)) from None
     click.echo(
         f"gmail: appended {len(report.appended)}, already logged {len(report.already_logged)}; "
         f"cursor {report.after.observed_at or 'none'} over {report.after.events} observations"

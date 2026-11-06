@@ -9,7 +9,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import click
-from pydantic import ValidationError
 
 from walle import __version__
 from walle import acp as walle_acp
@@ -31,7 +30,7 @@ from walle.evals import gate as walle_gate
 from walle.evals import report as walle_evals
 from walle.events import AnyEvent, Assertion, FutureSchemaError, Proposal, Supersede
 from walle.paths import principal_dir
-from walle.reader import CorruptStreamError
+from walle.reader import CorruptStreamError, without_content
 from walle.resolver import ResolutionError, resolve
 from walle.writer import CorruptLogError, StreamWriter
 
@@ -688,26 +687,9 @@ main.add_command(bench_command)
 
 
 def _without_content(exc: BaseException) -> str:
-    """Like ``_describe``, minus anything pydantic quotes from its input.
-
-    The stream holds transcript text, and pydantic's message for a line it refuses quotes the
-    offending value. So a validation failure is said as where it is (the file and line, from
-    the reader's own words before " — ") and which field failed in what way, by pydantic's
-    error code. Never by its message, which can name an input value too ("Input tag 'x'").
-    """
-    validation = exc if isinstance(exc, ValidationError) else exc.__cause__
-    if not isinstance(validation, ValidationError):
-        return _describe(exc)
-    problems = "; ".join(
-        f"{'.'.join(str(part) for part in error['loc']) or 'line'}: {error['type']}"
-        for error in validation.errors(include_url=False, include_input=False)
-    )
-    if validation is exc:
-        where = validation.title
-    else:  # the reader writes "<file>:<line>: … — <pydantic's message>"; keep only the left
-        head, dash, _ = str(exc).partition(" — ")
-        where = head if dash else type(exc).__name__
-    return "\n".join([f"{where} ({problems})", *getattr(exc, "__notes__", [])])
+    """Like ``_describe``, minus anything pydantic quotes from its input: the reader's own
+    ``without_content``, which the connectors' commands share (issue #136)."""
+    return without_content(exc)
 
 
 @contextmanager
