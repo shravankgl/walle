@@ -53,8 +53,12 @@ so `flag` was not used. Only fake and scripted models were run; no key, no netwo
   its tests are unchanged.
 - `reports/2026-11-06-fake.md`, new, and a bullet in `reports/README.md`: the gate paragraph's
   text changed, so the checked-in report was regenerated with `walle eval --date 2026-11-06`.
-  The numbers are the 2026-11-05 numbers. It still proves only the harness. `floor.txt` is
-  untouched: the floors are what walle started with, and nothing measured moved.
+  It still proves only the harness. `floor.txt` is untouched by this task: nothing this task
+  measures moved. Main gained #137 (#140) while this PR was open, which wrote the same dated
+  report and raised the benign floor to 21/30; the merge conflicted only in that report and its
+  README bullet. Resolved by regenerating the report on the merged code (the #137 numbers, 21
+  proposed from, with this task's gate line) and writing one README bullet that names both
+  issues. All four checks were rerun on the merged tree.
 - Tests, 18 new: `test_evals.py` (gate over nothing; a corpus missing at one leg; a mute
   model; a shadow failure; a model that cannot be called, through the CLI; a recall cut after
   line one; one `ProviderModel`, shown by identity and by a client that raises quoting a
