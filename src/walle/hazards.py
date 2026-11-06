@@ -12,10 +12,12 @@ read as an instruction:
   a forged turn (D77's ``injection`` corpus), which must not become a proposal.
 
 The proposer withholds a flagged observation entirely. For secrets that is stricter than D77
-asks (a dangerous item may become an assertion *with a flag*) and coarser than D18 wants
-(pseudonymise, so the model still sees the structure). For injection it is exactly D77's
-gate: zero reach a proposal. Both finer paths are the right later shape; for now the rule is
-the one that cannot leak and cannot be talked round: nothing flagged is sent.
+asks (a dangerous item may become an assertion *with a flag*). For contact details D18's
+finer path exists behind a switch (``walle.pseudonyms``, off by default): the address becomes
+a token before this gate reads the text, and the gate then sees what would be sent, so a
+shape the layer missed is still flagged here. For injection it is exactly D77's gate: zero
+reach a proposal. The rule stays the one that cannot leak and cannot be talked round:
+nothing flagged is sent.
 
 Deterministic, and conservative on purpose. A false flag costs one proposal; a miss sends a
 secret to a vendor or lets a web page write a memory. Every rule here was checked against
@@ -76,7 +78,8 @@ SECRET = "secret"
 
 CONTACT = "contact"
 """An e-mail address, a phone number or a street address. Whose it is cannot be told here,
-so the person's own are flagged too; D18's pseudonymisation is the finer path."""
+so the person's own are flagged too; ``walle.pseudonyms`` is D18's finer path, and it
+replaces exactly the shapes below (``EMAIL_PATTERN``, ``PHONE_PATTERNS``, ``STREET_PATTERN``)."""
 
 DISCLOSURE = "disclosure"
 """Something told in confidence, or another person's health, in so many words."""
@@ -173,8 +176,12 @@ _SECRET = (
     ),
 )
 
-_EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w-])")
-_PHONE = (
+# The contact shapes are public: ``walle.pseudonyms`` replaces exactly what this gate would
+# flag, with these same patterns, so the layer and the gate cannot disagree about what an
+# address is (D18). A shape added here is replaced there with no second edit; a shape the
+# layer misses is still flagged here, and the observation is withheld rather than sent.
+EMAIL_PATTERN = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w-])")
+PHONE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
         r"(?<![\w-])(?:\+\d{1,3}[\s.-]?)?(?:\(\d{3}\)|\d{3})[\s.-]\d{3}[\s.-]\d{4}(?![\w-])"
     ),
@@ -182,7 +189,7 @@ _PHONE = (
     re.compile(r"(?<![\w-])\+\d{9,15}(?![\w-])"),
     re.compile(r"(?<![\w-])0\d{9,10}(?![\w-])"),  # a national number written as one run
 )
-_STREET = re.compile(
+STREET_PATTERN = re.compile(
     r"\b\d{1,5}[A-Za-z]?\s+(?:[A-Z][a-z']+\s+){1,3}"
     r"(?:Street|St|Road|Rd|Close|Lane|Ln|Avenue|Ave|Drive|Dr|Way|Court|Ct|Place|Pl|"
     r"Crescent|Cres|Terrace|Square|Sq|Boulevard|Blvd|Gardens|Grove|Row|Hill|Park|Walk|Mews)\b"
@@ -343,7 +350,11 @@ def _secret(text: str) -> bool:
 
 
 def _contact(text: str) -> bool:
-    return bool(_EMAIL.search(text) or any(p.search(text) for p in _PHONE) or _STREET.search(text))
+    return bool(
+        EMAIL_PATTERN.search(text)
+        or any(p.search(text) for p in PHONE_PATTERNS)
+        or STREET_PATTERN.search(text)
+    )
 
 
 def _disclosure(text: str) -> bool:
