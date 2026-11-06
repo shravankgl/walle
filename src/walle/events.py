@@ -256,14 +256,17 @@ class AutomationVerb(StrEnum):
 
     ``add`` puts an automation in the register as active; ``retire`` takes one out, and it
     stays in the log as retired (D8); ``pin`` and ``unpin`` set and clear the human mark that
-    no automatic transition may cross. A closed set, like ``StepVerb``: adding a member is a
-    version bump with an upcaster (D88).
+    no automatic transition may cross. ``restore`` is a person saying an automation is still
+    wanted: it changes nothing in the register and resets the idle clock ``walle.rot`` labels
+    by (#96). A closed set, like ``StepVerb``: adding a member is a version bump with an
+    upcaster (D88), and ``restore`` was that bump, ``automation`` v1 to v2.
     """
 
     ADD = "add"
     RETIRE = "retire"
     PIN = "pin"
     UNPIN = "unpin"
+    RESTORE = "restore"
 
 
 class OutcomeResult(StrEnum):
@@ -841,6 +844,21 @@ class Answer(Event):
 # --- the automation register (D6, D114) ---------------------------------------------------
 
 
+def _automation_v1_to_v2(data: dict[str, Any]) -> dict[str, Any]:
+    """``automation`` v1 to v2 (#96): v2 only added things, so a v1 line is a v2 line as it
+    stands. A line that says v1 but carries ``restore`` or ``depends_on`` was not written by a
+    v1 build, and is refused rather than read as if it had been. Only a line that *says* v1 is
+    held to this: an event built in code carries no ``v`` until it is validated, and the chain
+    reads a missing ``v`` as 1, so a fresh v2 event passes through here too."""
+    if data.get("v") != 1:
+        return data
+    if data.get("verb") == AutomationVerb.RESTORE.value:
+        raise ValueError("an automation v1 has no restore verb; restore arrived in v2 (#96)")
+    if "depends_on" in data:
+        raise ValueError("an automation v1 has no depends_on; it arrived in v2 (#96)")
+    return data
+
+
 class Automation(Event):
     """One change to the register of active automations (D6, D114).
 
@@ -851,12 +869,24 @@ class Automation(Event):
     The validator holds each verb to exactly its own fields. ``note`` is free text for any
     verb: why it was retired, why it matters enough to pin.
 
-    There is no ``pinned`` or ``active`` field: both are what the fold says after reading
-    every event, never something an add declares about itself. Whether this event may change
-    the register at all (a person wrote it, the cap allows it, its target is not pinned) is
-    decided by the fold, which has the register in hand; one that may not is reported, not
-    applied.
+    An ``add`` may carry ``depends_on``: the refs of events in this principal's log that it
+    needs, such as another automation's add. Nothing a live automation names there is ever
+    labelled stale or archived, or offered for retirement (D114, the owner's decision 2 on
+    #96). It is optional and omitted when empty, so an add without dependencies is written
+    exactly as before.
+
+    There is no ``pinned``, ``active``, ``stale`` or ``archived`` field: each is what a fold
+    says after reading every event, never something an add declares about itself. Whether
+    this event may change the register at all (a person wrote it, the cap allows it, its
+    target is not pinned) is decided by the fold, which has the register in hand; one that may
+    not is reported, not applied.
+
+    **v2** (#96) added the ``restore`` verb and ``depends_on``. A v1 line loads unchanged; one
+    that claims v1 but carries either is refused, because no v1 build wrote it.
     """
+
+    SCHEMA_VERSION: ClassVar[int] = 2
+    UPCASTS: ClassVar[dict[int, Any]] = {1: _automation_v1_to_v2}
 
     type: Literal["automation"] = "automation"
 
@@ -864,19 +894,26 @@ class Automation(Event):
     name: NodeId | None = None
     title: str | None = Field(default=None, min_length=1, max_length=200)
     target: Ref | None = None
+    depends_on: list[Ref] | None = None
     note: str | None = None
 
     @model_validator(mode="after")
     def _fields_fit_the_verb(self) -> Automation:
         if self.verb is AutomationVerb.ADD:
-            required, allowed = {"name", "title"}, {"name", "title"}
+            required, allowed = {"name", "title"}, {"name", "title", "depends_on"}
         else:
             required, allowed = {"target"}, {"target"}
-        present = {n for n in ("name", "title", "target") if getattr(self, n) is not None}
+        fields = ("name", "title", "target", "depends_on")
+        present = {n for n in fields if getattr(self, n) is not None}
         if missing := required - present:
             raise ValueError(f"an automation {self.verb.value} needs {sorted(missing)}")
         if extra := present - allowed:
             raise ValueError(f"an automation {self.verb.value} does not carry {sorted(extra)}")
+        if self.depends_on is not None:
+            if not self.depends_on:
+                raise ValueError("depends_on is empty: omit it when an add depends on nothing")
+            if twice := sorted({r for r in self.depends_on if self.depends_on.count(r) > 1}):
+                raise ValueError(f"depends_on names {twice} twice")
         return self
 
 

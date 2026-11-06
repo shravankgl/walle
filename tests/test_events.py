@@ -254,8 +254,10 @@ def test_events_are_frozen() -> None:
 
 
 def test_every_event_carries_a_version() -> None:
+    # automation is the one type past v1: #96 added the restore verb (D88, D96).
     for event in _one_of_each():
-        assert event.v == type(event).SCHEMA_VERSION == 1
+        expected = 2 if isinstance(event, Automation) else 1
+        assert event.v == type(event).SCHEMA_VERSION == expected
         assert "v" in event.model_dump(mode="json")
 
 
