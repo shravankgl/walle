@@ -570,3 +570,124 @@ def test_a_sidechain_entry_naming_an_agent_is_never_its_anchor(tmp_path: Path) -
     )
     transcripts = load([trunk, first, second])
     assert transcripts.parent_of[u(20)] == u(2)  # not 11, though 11 is earlier
+
+
+# --- audit #129, finding 2.1: a line that is not an entry must not cut the chain -------------
+
+
+def test_an_orphan_behind_a_line_that_was_not_loaded_hangs_off_the_entry_before_it(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A torn line mid-file says nothing about its uuid. The entry after it names the torn
+    line as its parent; in an append-only file that parent is the line before, so the
+    orphan is attached there, and the repair is still reported."""
+    path = tmp_path / "p" / "s.jsonl"
+    path.parent.mkdir()
+    lines = [
+        json.dumps(row(1, None, "10:00:00")).encode(),
+        json.dumps(row(2, 1, "10:00:01")).encode(),
+        b'{"uuid": "' + u(3).encode() + b'", "parentUuid": "' + u(2).encode() + b'", CUT',
+        json.dumps(row(4, 3, "10:00:03")).encode(),
+        json.dumps(row(5, 4, "10:00:04")).encode(),
+    ]
+    path.write_bytes(b"\n".join(lines) + b"\n")
+    with caplog.at_level(logging.WARNING):
+        transcripts = load([path])
+    assert short(transcripts.walk()) == [1, 2, 4, 5]
+    assert transcripts.roots == (u(1),)
+    assert transcripts.parent_of[u(4)] == u(2)
+    assert [(a.kind, a.uuid) for a in transcripts.anomalies] == [("orphan", u(4))]
+    assert u(2) in transcripts.anomalies[0].detail
+    assert u(3) in caplog.text
+
+
+def test_an_orphan_with_no_gap_before_it_is_still_a_root(tmp_path: Path) -> None:
+    """Nothing was skipped between it and the entry before it, so the entry before it is
+    not where its parent went. The guess is only made where a line was lost."""
+    path = write(
+        tmp_path / "p" / "s.jsonl",
+        [row(1, None, "10:00:00"), row(2, 1, "10:00:01"), row(3, 99, "10:00:02")],
+    )
+    transcripts = load([path])
+    assert transcripts.roots == (u(1), u(3))
+    assert transcripts.parent_of[u(3)] is None
+    assert [(a.kind, a.uuid) for a in transcripts.anomalies] == [("orphan", u(3))]
+
+
+@pytest.mark.parametrize(
+    "middle",
+    [
+        {"type": "system", "uuid": u(3), "parentUuid": u(2), "subtype": "turn_duration"},
+        {**row(3, 2, "10:00:02"), "timestamp": "yesterday"},
+        {"type": "api-request", "uuid": u(3), "parentUuid": u(2), "payload": PAYLOAD},
+    ],
+    ids=["unthreaded", "skipped-but-parsed", "payload-line"],
+)
+def test_a_known_link_through_a_line_that_is_not_an_entry_is_followed(
+    tmp_path: Path, middle: dict[str, Any]
+) -> None:
+    """The line is kept aside or skipped, but it parsed and says who its parent is. The
+    entry below it is bridged to that parent and the bridge is reported, not an orphan."""
+    path = write(
+        tmp_path / "p" / "s.jsonl",
+        [row(1, None, "10:00:00"), row(2, 1, "10:00:01"), middle, row(4, 3, "10:00:03")],
+    )
+    transcripts = load([path])
+    assert short(transcripts.walk()) == [1, 2, 4]
+    assert transcripts.parent_of[u(4)] == u(2)
+    assert [(a.kind, a.uuid) for a in transcripts.anomalies] == [("bridged", u(4))]
+    for text in every_string(transcripts):
+        assert PAYLOAD not in text
+
+
+def test_two_lost_lines_in_a_row_are_bridged_through_both(tmp_path: Path) -> None:
+    path = write(
+        tmp_path / "p" / "s.jsonl",
+        [
+            row(1, None, "10:00:00"),
+            {**row(2, 1, "10:00:01"), "timestamp": None},
+            {**row(3, 2, "10:00:02"), "timestamp": None},
+            row(4, 3, "10:00:03"),
+        ],
+    )
+    transcripts = load([path])
+    assert transcripts.parent_of[u(4)] == u(1)
+    assert [(a.kind, a.uuid) for a in transcripts.anomalies] == [("bridged", u(4))]
+
+
+def test_a_link_to_a_lost_root_makes_a_root_not_an_orphan(tmp_path: Path) -> None:
+    """The first line is unreadable as an entry but says it has no parent. Its child is a
+    root by the file's own account, and nothing before it to hang from anyway."""
+    path = write(
+        tmp_path / "p" / "s.jsonl",
+        [{**row(1, None, "10:00:00"), "timestamp": None}, row(2, 1, "10:00:01")],
+    )
+    transcripts = load([path])
+    assert transcripts.roots == (u(2),)
+    assert [(a.kind, a.uuid) for a in transcripts.anomalies] == [("bridged", u(2))]
+
+
+# --- audit #129, finding 2.3: a torn tail someone is writing ---------------------------------
+
+
+def test_a_file_with_a_fresh_torn_tail_is_growing_and_a_stale_one_is_not(
+    tmp_path: Path,
+) -> None:
+    import os
+
+    path = write(tmp_path / "p" / "s.jsonl", [row(1, None, "10:00:00")], extra=b'{"uuid": "x')
+    fresh = read_transcript(path)
+    assert fresh.growing is True
+    assert "may still be writing" in fresh.skips[0].reason
+    assert dict(load([path]).growing) == {path: u(1)}
+
+    stamp = path.stat().st_mtime - 3600
+    os.utime(path, (stamp, stamp))
+    stale = read_transcript(path)
+    assert stale.growing is False
+    assert "unterminated" in stale.skips[0].reason
+    assert "may still be writing" not in stale.skips[0].reason
+    assert dict(load([path]).growing) == {}
+
+    whole = write(tmp_path / "p" / "t.jsonl", [row(2, 1, "10:00:01")])
+    assert read_transcript(whole).growing is False and read_transcript(whole).skips == ()
