@@ -4,7 +4,8 @@
   no torn line                       every line in the file parses afterwards
   traversal id rejected              a bad name never becomes a path (D85)
   torn tail healed, not truncated    an interrupted append is stepped over, not erased (D80)
-  corrupt complete line is fatal     guessing the next seq risks reusing one
+  corrupt complete line is fatal     JSON with no usable seq: guessing the next seq risks
+                                     reusing one; a non-JSON line is a fragment, stepped past
 
 The race test spawns real subprocesses rather than threads. ``flock`` serialises between
 *processes*; threads in one interpreter share a file description and would pass a test the
@@ -193,24 +194,42 @@ def test_a_second_append_after_a_tear_stays_clean(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "last_line",
-    [b"not json at all", b'{"ts":"2026-10-10T14:37:02+00:00"}', b'{"seq":"12"}', b'{"seq":0}'],
-    ids=["unparseable", "no-seq", "seq-not-int", "seq-zero"],
+    [b'{"ts":"2026-10-10T14:37:02+00:00"}', b'{"seq":"12"}', b'{"seq":0}', b"[1]"],
+    ids=["no-seq", "seq-not-int", "seq-zero", "not-an-object"],
 )
 def test_a_corrupt_complete_line_refuses_rather_than_guesses(
     tmp_path: Path, last_line: bytes
 ) -> None:
-    """A torn tail is an interrupted write; a corrupt *complete* line is something else.
+    """A torn tail is an interrupted write; a complete line that is JSON but not a record is
+    something else.
 
     The next seq comes from this line, so guessing risks reusing a number — which loses no
-    event but makes one ref ambiguous forever. Loud beats tidy.
+    event but makes one ref ambiguous forever. Loud beats tidy. The reader halts on the same
+    line, so the writer refusing is the two agreeing.
     """
     writer = StreamWriter(tmp_path, "maya", "mbp")
     writer.append(_observation())
     with open(writer.path, "ab") as f:
         f.write(last_line + b"\n")
 
-    with pytest.raises(CorruptLogError, match=r"seq|JSON"):
+    with pytest.raises(CorruptLogError, match="seq"):
         writer.append(_observation())
+
+
+def test_a_complete_line_that_is_not_json_is_stepped_past_as_the_reader_skips_it(
+    tmp_path: Path,
+) -> None:
+    """Until issue #128 this case was ``unparseable`` in the test above, and the writer refused
+    it. The reader skips a non-JSON line as a stepped-over fragment (D80), and a heal cut
+    after its newline leaves one *last* — so a writer that refused it left a stream that
+    loads and can never grow (finding 3.1). The writer now steps back past it to the last
+    record, as the reader does."""
+    writer = StreamWriter(tmp_path, "maya", "mbp")
+    writer.append(_observation())
+    with open(writer.path, "ab") as f:
+        f.write(b"not json at all\n")
+
+    assert writer.append(_observation("after")).seq == 2
 
 
 def test_a_long_record_is_found_past_the_tail_window(tmp_path: Path) -> None:
