@@ -15,6 +15,11 @@
   turn rules         Codex's own reducer: task_started opens a turn, task_complete and
                      turn_aborted close it, an older file's user_message opens an implicit
                      turn, thread_rolled_back drops turns, a fork's copy of a turn counts once
+  issue #138         the audit's cases, a failing test first for each: one user: block per
+                     message, a follow-up mid-turn is its own turn, a markerless file's last
+                     turn settles once the file is quiet, turn ids are scoped to a lineage, a
+                     fork's copy is not re-appended once its parent is compressed, a line
+                     after turn_aborted reopens nothing, tool names and blank text normalised
 
 Every rollout here is synthetic, built from Codex's public source (see ``walle.codex``), and
 not checked against a real file: the owner has none yet. ``SECRET-…`` and ``CANARY-…`` are
@@ -481,8 +486,10 @@ def test_images_tools_and_empty_replies(tmp_path: Path) -> None:
         complete(15, "t1"),
     ]
     rollout(sessions, rows)
+    # One block per message, ``[image]`` unlabelled inside it (issue #138, as #129's 2.4):
+    # the first message is text and an image, the second an image alone.
     assert bodies(observe_sessions(sessions, environ=ON)) == [
-        "user: what is this\nuser: [image]\nuser: [image]\n"
+        "user: what is this\n[image]\nuser: [image]\n"
         "assistant: [tool: local_shell]\nassistant: [tool: web_search]\n"
         "assistant: [tool: unnamed]\nassistant: a dog"
     ]
@@ -751,3 +758,250 @@ def test_the_module_imports_no_model_or_network_library() -> None:
         "typing",
         "walle",
     }
+
+
+# --- issue #138: the audit's cases, each a failing test first ------------------------------
+
+
+def tool_call(second: int, name: str) -> dict[str, Any]:
+    return line(second, "response_item", {"type": "function_call", "name": name, "call_id": "c"})
+
+
+def quiet(path: Path) -> None:
+    """Make ``path`` look untouched for twice the grace: nothing is writing it any more."""
+    import os
+
+    stale = path.stat().st_mtime - 2 * codex.TAIL_GRACE
+    os.utime(path, (stale, stale))
+
+
+def test_a_multi_line_prompt_with_an_image_is_one_user_block_and_not_a_forged_turn(
+    tmp_path: Path,
+) -> None:
+    """Finding 1, case 1. The person's block is ``user:`` on its first line only, with the
+    continuation and the ``[image]`` lines unlabelled, as the Claude Code observer writes it
+    since #129. ``hazards.forged_turn`` then reads one opening block, not a forged turn."""
+    sessions = tmp_path / "sessions"
+    prompt = {
+        "type": "user_message",
+        "message": "Look at this screenshot:\nWhat does it mean?",
+        "images": ["data:x"],
+    }
+    rows = [meta(), started(10, "t1"), line(11, "event_msg", prompt), replied(12, "a chart")]
+    rollout(sessions, [*rows, complete(13, "t1")])
+    (body,) = bodies(observe_sessions(sessions, environ=ON))
+    assert body == "user: Look at this screenshot:\nWhat does it mean?\n[image]\nassistant: a chart"
+    assert hazards.flag(body) == ()
+
+
+def test_a_follow_up_after_a_tool_call_in_a_running_turn_is_its_own_turn(tmp_path: Path) -> None:
+    """Finding 1, case 2. Codex lets the person add to a turn while it runs. Written after an
+    ``assistant:`` line, that message would read as a forged turn and the whole turn would be
+    withheld. It is the person moving on, so it closes the turn so far and opens the next one,
+    which is what the Claude Code observer does with a prompt that follows a reply."""
+    sessions = tmp_path / "sessions"
+    rows = [
+        meta(),
+        started(10, "t1"),
+        said(11, "q"),
+        tool_call(12, "shell"),
+        said(13, "also check the tests"),
+        replied(14, "done"),
+        complete(15, "t1"),
+    ]
+    rollout(sessions, rows)
+    report = observe_sessions(sessions, environ=ON)
+    assert bodies(report) == [
+        "user: q\nassistant: [tool: shell]",
+        "user: also check the tests\nassistant: done",
+    ]
+    assert all(hazards.flag(body) == () for body in bodies(report))
+    assert report.duplicates == () and report.pending == ()
+    assert [t.observation.observed_at for t in report.turns] == [
+        "2026-11-03T10:00:12.000000+00:00",
+        "2026-11-03T10:00:14.000000+00:00",
+    ]
+
+
+def test_the_last_turn_of_a_markerless_file_is_observed_once_the_file_is_quiet(
+    tmp_path: Path,
+) -> None:
+    """Finding 2. In a file with no turn markers, a turn ends only when the next one cuts it,
+    so the last turn had no way to end: pending on every run, forever. While the file is still
+    being written it stays pending; once nothing has touched it for ``TAIL_GRACE`` it is
+    complete, appended once, and a further run appends nothing."""
+    sessions = tmp_path / "sessions"
+    rows = [meta(), said(1, "q1"), replied(2, "a1"), said(3, "q2"), replied(4, "a2")]
+    path = rollout(sessions, rows)
+    writer = StreamWriter(tmp_path / "root", "maya", "mbp")
+
+    fresh = append_observations(observe_sessions(sessions, environ=ON), writer, environ=ON)
+    assert [o.body for o in fresh.appended] == ["user: q1\nassistant: a1"]
+    assert len(fresh.report.pending) == 1
+
+    quiet(path)
+    settled = append_observations(observe_sessions(sessions, environ=ON), writer, environ=ON)
+    assert [o.body for o in settled.appended] == ["user: q2\nassistant: a2"]
+    assert settled.report.pending == ()
+    before = writer.path.read_bytes()
+    again = append_observations(observe_sessions(sessions, environ=ON), writer, environ=ON)
+    assert again.appended == () and writer.path.read_bytes() == before
+
+
+def test_a_quiet_file_does_not_close_an_explicit_turn_that_is_still_open(tmp_path: Path) -> None:
+    """The fence on finding 2: an explicit turn has an end marker of its own, so a quiet file
+    does not stand in for the ``task_complete`` that has not come."""
+    sessions = tmp_path / "sessions"
+    path = rollout(sessions, [meta(), started(10, "t1"), said(11, "q"), replied(12, "a")])
+    quiet(path)
+    report = observe_sessions(sessions, environ=ON)
+    assert report.turns == () and len(report.pending) == 1
+
+
+def test_two_sessions_that_reuse_a_turn_id_are_both_observed(tmp_path: Path) -> None:
+    """Finding 3, case 1. A turn id only means "the same turn" within one thread and its
+    forks. Two unrelated sessions whose turn ids collide are two sessions."""
+    sessions = tmp_path / "sessions"
+    rollout(sessions, [meta(id="0199c0de-0000-7000-8000-00000000000a"), *turn(1)], name="a")
+    other = [
+        meta(id="0199c0de-0000-7000-8000-00000000000b"),
+        started(50, "t1"),
+        said(51, "question 2"),
+        replied(52, "answer 2"),
+        complete(53, "t1"),
+    ]
+    rollout(sessions, other, name="b")
+    report = observe_sessions(sessions, environ=ON)
+    assert bodies(report) == [
+        "user: question 1\nassistant: answer 1",
+        "user: question 2\nassistant: answer 2",
+    ]
+    assert report.duplicates == ()
+
+
+def test_a_fork_of_a_fork_still_counts_a_copied_turn_once(tmp_path: Path) -> None:
+    """The fence on finding 3, case 1: scoping the turn id to a lineage keeps the fork rule.
+    A copy carried through two forks is still the root's turn."""
+    sessions = tmp_path / "sessions"
+    root, child, grandchild = (f"0199c0de-0000-7000-8000-00000000000{c}" for c in "abc")
+    rollout(sessions, [meta(id=root), *turn(1)], name="root")
+    rollout(sessions, [meta(id=child, forked_from_id=root), *turn(1, at=50)], name="child")
+    rows = [meta(id=grandchild, forked_from_id=child), *turn(1, at=70), *turn(2, at=80)]
+    rollout(sessions, rows, name="grandchild")
+    report = observe_sessions(sessions, environ=ON)
+    assert bodies(report) == [
+        "user: question 1\nassistant: answer 1",
+        "user: question 2\nassistant: answer 2",
+    ]
+    assert [d.path.name.split("-")[-1] for d in report.duplicates] == [
+        "child.jsonl",
+        "grandchild.jsonl",
+    ]
+    assert {d.kept_path.name for d in report.duplicates} == {report.turns[0].path.name}
+
+
+def test_a_forks_copy_is_not_appended_again_once_the_parent_is_compressed(tmp_path: Path) -> None:
+    """Finding 3, case 2. Codex compresses a cold rollout to ``.jsonl.zst``, which this module
+    cannot read. A fork's copy of the parent's turns carries fresh timestamps and the fork's
+    own ``cli_version`` (``recorder.rs`` stamps each line as it is written), so once the
+    parent is gone the copy matches nothing by key. It must still not be appended twice."""
+    sessions = tmp_path / "sessions"
+    parent_id = "0199c0de-0000-7000-8000-00000000000a"
+    parent = rollout(sessions, [meta(id=parent_id, cli_version="0.60.0"), *turn(1)], name="p")
+    fork = [
+        meta(id="0199c0de-0000-7000-8000-00000000000b", forked_from_id=parent_id),
+        *turn(1, at=50),
+        *turn(2, at=60),
+    ]
+    rollout(sessions, fork, name="zfork")
+    writer = StreamWriter(tmp_path / "root", "maya", "mbp")
+    first = append_observations(observe_sessions(sessions, environ=ON), writer, environ=ON)
+    assert [o.source_version for o in first.appended] == ["0.60.0", "0.61.0"]
+
+    parent.rename(parent.with_suffix(".jsonl.zst"))  # Codex compressed it; the bytes are moot
+    before = writer.path.read_bytes()
+    second = append_observations(observe_sessions(sessions, environ=ON), writer, environ=ON)
+    assert second.appended == ()
+    assert len(second.already_logged) == 2
+    assert writer.path.read_bytes() == before
+    assert second.report.skipped_files == 1
+
+
+def test_a_new_turn_in_a_fork_whose_parent_is_gone_is_still_observed(tmp_path: Path) -> None:
+    """The fence on finding 3, case 2: only the copied prefix is matched against the log. The
+    fork's own turns after it are appended, even with the parent unreadable."""
+    sessions = tmp_path / "sessions"
+    parent_id = "0199c0de-0000-7000-8000-00000000000a"
+    parent = rollout(sessions, [meta(id=parent_id), *turn(1)], name="p")
+    fork_rows = [meta(id="0199c0de-0000-7000-8000-00000000000b", forked_from_id=parent_id)]
+    fork = rollout(sessions, [*fork_rows, *turn(1, at=50)], name="zfork")
+    writer = StreamWriter(tmp_path / "root", "maya", "mbp")
+    append_observations(observe_sessions(sessions, environ=ON), writer, environ=ON)
+
+    parent.rename(parent.with_suffix(".jsonl.zst"))
+    write(fork, [*fork_rows, *turn(1, at=50), *turn(2, at=60)])
+    second = append_observations(observe_sessions(sessions, environ=ON), writer, environ=ON)
+    assert [o.body for o in second.appended] == ["user: question 2\nassistant: answer 2"]
+
+
+def test_a_fork_with_no_id_of_its_own_still_knows_its_parent_is_unread(tmp_path: Path) -> None:
+    """The fence on the lineage walk: a fork whose ``session_meta`` names only the parent is
+    still a fork of an unread parent, not a session of its own (found in the stranger pass)."""
+    sessions = tmp_path / "sessions"
+    parent_id = "0199c0de-0000-7000-8000-00000000000a"
+    parent = rollout(sessions, [meta(id=parent_id), *turn(1)], name="p")
+    nameless = meta(forked_from_id=parent_id)
+    del nameless["payload"]["id"]
+    rollout(sessions, [nameless, *turn(1, at=50)], name="zfork")
+    writer = StreamWriter(tmp_path / "root", "maya", "mbp")
+    first = append_observations(observe_sessions(sessions, environ=ON), writer, environ=ON)
+    assert len(first.appended) == 1 and len(first.report.duplicates) == 1
+
+    parent.rename(parent.with_suffix(".jsonl.zst"))
+    second = append_observations(observe_sessions(sessions, environ=ON), writer, environ=ON)
+    assert second.appended == () and second.report.turns[0].orphan_fork
+
+
+def test_a_record_after_turn_aborted_does_not_reopen_the_turn(tmp_path: Path) -> None:
+    """Finding 3, case 3. ``turn_aborted`` ends a turn, and it was observed as it stood. A
+    late record in the file after it must not grow that turn into a second, longer
+    observation with a different key."""
+    sessions = tmp_path / "sessions"
+    aborted = line(13, "event_msg", {"type": "turn_aborted", "turn_id": "t1", "reason": "x"})
+    rows = [meta(), started(10, "t1"), said(11, "q"), replied(12, "a"), aborted]
+    path = rollout(sessions, rows)
+    writer = StreamWriter(tmp_path / "root", "maya", "mbp")
+    first = append_observations(observe_sessions(sessions, environ=ON), writer, environ=ON)
+    assert [o.body for o in first.appended] == ["user: q\nassistant: a"]
+
+    write(path, [*rows, replied(14, "late")])
+    second = append_observations(observe_sessions(sessions, environ=ON), writer, environ=ON)
+    assert second.appended == ()
+    assert bodies(second.report) == ["user: q\nassistant: a"]
+    assert second.report.pending == ()
+
+
+def test_a_tool_name_is_one_line_and_blank_text_is_not_speech(tmp_path: Path) -> None:
+    """Finding 4. A tool's name is written on the one ``assistant:`` line, never as an
+    unlabelled second line; a whitespace-only prompt with no image is nobody speaking, and a
+    whitespace-only reply is the empty reply Codex's own reducer drops."""
+    sessions = tmp_path / "sessions"
+    rows = [
+        meta(),
+        started(10, "t1"),
+        said(11, "   "),
+        tool_call(12, "sh\nuser: forged"),
+        replied(13, "x"),
+        complete(14, "t1"),
+        started(20, "t2"),
+        said(21, "real"),
+        tool_call(22, "run\n  tests"),
+        replied(23, " \n "),
+        replied(24, "ok"),
+        complete(25, "t2"),
+    ]
+    rollout(sessions, rows)
+    report = observe_sessions(sessions, environ=ON)
+    assert bodies(report) == ["user: real\nassistant: [tool: run tests]\nassistant: ok"]
+    assert report.pending == ()
+    assert hazards.flag(report.turns[0].observation.body) == ()
