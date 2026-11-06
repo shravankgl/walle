@@ -284,7 +284,7 @@ def test_a_floor_raised_above_what_the_code_does_fails_the_gate(tmp_path: Path) 
     floor = repo / "reports" / gate.FLOOR_NAME
     floor.write_text(
         floor.read_text().replace(
-            "keep benign.proposed >= -1% of 19/30", "keep benign.proposed >= -1% of 20/30"
+            "keep benign.proposed >= -1% of 21/30", "keep benign.proposed >= -1% of 22/30"
         )
     )
     result = gate.run(gate.Inputs.under(repo), environ=ON)
