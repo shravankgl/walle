@@ -58,6 +58,11 @@ as a warning:
 
 * An **unterminated final line** is pending, even if it parses. Claude Code may be writing it
   right now (there is no lock to take on a file we do not own), and the next read sees it whole.
+  A file whose last line is torn and whose ``mtime`` is within ``TAIL_GRACE`` seconds is
+  **growing** (``TranscriptFile.growing``, ``Transcripts.growing``): the observer holds back a
+  turn the tail could still extend (issue #129, finding 2.3). Older than that, nothing is
+  writing it: Claude Code writes a line in one go, so a tear left alone for minutes is a
+  crash, and the entries above it are final. The skip's reason says which.
 * A line that is not UTF-8 or not JSON, a JSON value that is not an object, and an object
   with a ``uuid`` that does not validate as an entry.
 
@@ -66,10 +71,29 @@ strictness protects our own log, where a skipped record would silently lose a re
 file is someone else's, and keeping the recoverable history is the rule D80 sets for the
 transcript observer.
 
+**A lost line must not cut the chain** (issue #129, finding 2.1). The entry after a skipped or
+unthreaded line names it as its parent, and without repair that entry would be an orphan
+root: every turn running through the gap would be lost, since the observer only looks below a
+prompt. Two repairs, both reported:
+
+* ``bridged``: the lost line parsed and carried a ``uuid`` and a ``parentUuid`` (a line kept
+  aside for want of a timestamp, a user line with a bad one, a payload line). Its link is
+  kept, in ``TranscriptFile.links``, and the entry below it is hung from the lost line's own
+  parent, through as many lost lines in a row as it takes. Nothing of the lost line but the
+  two identifiers is kept; a payload line's link is read before its content is dropped.
+* ``orphan``, attached: the lost line did not parse, so its parent is unknown. If a line
+  between the orphan and the entry before it in the same file was not loaded, the orphan is
+  hung from that entry before it: Claude Code appends, so the line before a torn line is
+  almost always its parent. With no lost line between them the parent went missing some other
+  way (a deleted file), and the orphan is a root as before. The limit of the guess: if the
+  lost line was the person's own prompt, the reply below it joins the turn above. The lost
+  prompt was unreadable either way; the anomaly names the gap.
+
 Graph repairs, also reported (``Transcripts.anomalies``): a parent that was never loaded
-(``orphan``) makes its child a root; an entry that is its own parent (``self-parent``)
-becomes a root; a ring of entries with no way in (``cycle``) is broken at its earliest entry.
-Repairs are a view: the files are only ever read.
+(``orphan``) makes its child a root, or hangs it from the entry before a lost line; a link
+through lost lines (``bridged``) is followed; an entry that is its own parent
+(``self-parent``) becomes a root; a ring of entries with no way in (``cycle``) is broken at
+its earliest entry. Repairs are a view: the files are only ever read.
 
 Two runners (Claude Code C appending to a session file, this reader R)
 ----------------------------------------------------------------------
@@ -88,6 +112,8 @@ from __future__ import annotations
 
 import json
 import logging
+import time
+from bisect import bisect_right
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -192,7 +218,7 @@ class Anomaly:
     """A repair made to the graph so it can be walked. The files are not touched."""
 
     kind: str
-    """``orphan``, ``self-parent``, ``cycle`` or ``unanchored-agent``."""
+    """``orphan``, ``bridged``, ``self-parent``, ``cycle`` or ``unanchored-agent``."""
     uuid: str
     detail: str
 
@@ -205,10 +231,24 @@ class TranscriptFile:
     entries: tuple[TranscriptEntry, ...]
     unthreaded: tuple[Unthreaded, ...]
     skips: tuple[LineSkip, ...]
+    links: Mapping[str, str | None] = field(default_factory=dict)
+    """``uuid`` to ``parentUuid`` of each line that parsed as an object with both but was not
+    loaded as an entry. The chain is followed through them (``load``). Identifiers only."""
+    growing: bool = False
+    """The last line is unterminated and the file changed within ``TAIL_GRACE`` seconds:
+    Claude Code may be writing it, and the chain may grow from the file's last entry."""
 
 
 # Lines that may carry a raw API request (issue #9). Their content is dropped on read.
 _PAYLOAD_TYPES = frozenset({"api-request", "api-request-blob"})
+
+TAIL_GRACE = 300.0
+"""Seconds since a file last changed within which its torn last line counts as being written.
+Claude Code writes a line in one go, so a tear this old is a crash, not a write in progress."""
+
+_LINK_LENGTH = 128
+"""The most a ``uuid`` or ``parentUuid`` may be to be kept as a link: a uuid is 36 characters,
+and a longer string in that field is not an identifier and is not copied out of the line."""
 
 # The types an entry must validate as. Any other type that does not fit is not corrupt.
 _CONVERSATIONAL = frozenset({"user", "assistant"})
@@ -247,10 +287,20 @@ def read_transcript(path: Path) -> TranscriptFile:
     entries: list[TranscriptEntry] = []
     unthreaded: list[Unthreaded] = []
     skips: list[LineSkip] = []
+    links: dict[str, str | None] = {}
 
     def skip(number: int, start: int, raw: bytes, reason: str) -> None:
         skips.append(LineSkip(path=path, line=number, offset=start, length=len(raw), reason=reason))
         logger.warning("%s:%d: skipped (%d bytes) — %s", path, number, len(raw), reason)
+
+    def link(parsed: Mapping[str, Any]) -> None:
+        """Keep the line's place in the chain, if it says where that is. Nothing else of it."""
+        uuid, parent = parsed.get("uuid"), parsed.get("parentUuid")
+        if not (isinstance(uuid, str) and 0 < len(uuid) <= _LINK_LENGTH):
+            return
+        if parent is not None and not (isinstance(parent, str) and len(parent) <= _LINK_LENGTH):
+            return
+        links.setdefault(uuid, parent)
 
     offset = 0
     for number, raw in enumerate(lines, start=1):
@@ -276,6 +326,7 @@ def read_transcript(path: Path) -> TranscriptFile:
         try:
             fields = _EntryFields.model_validate(parsed)
         except ValidationError as exc:
+            link(parsed)
             if isinstance(kind, str) and kind not in _CONVERSATIONAL:
                 # Not ours to judge: a type we do not read, in a schema we do not own.
                 logger.debug("%s:%d: %r line kept aside, not an entry", path, number, kind)
@@ -296,16 +347,34 @@ def read_transcript(path: Path) -> TranscriptFile:
             )
         )
 
+    growing = False
     if tail.strip():
-        skip(
-            len(lines) + 1,
-            offset,
-            tail,
-            "unterminated last line: pending, Claude Code may still be writing it",
+        growing = _changed_within(path, TAIL_GRACE)
+        reason = (
+            "unterminated last line: pending, Claude Code may still be writing it"
+            if growing
+            else "unterminated last line: the file has not changed for over "
+            f"{TAIL_GRACE:.0f}s, so nothing is writing it"
         )
+        skip(len(lines) + 1, offset, tail, reason)
     return TranscriptFile(
-        path=path, entries=tuple(entries), unthreaded=tuple(unthreaded), skips=tuple(skips)
+        path=path,
+        entries=tuple(entries),
+        unthreaded=tuple(unthreaded),
+        skips=tuple(skips),
+        links=links,
+        growing=growing,
     )
+
+
+def _changed_within(path: Path, seconds: float) -> bool:
+    """Whether ``path`` was modified in the last ``seconds``. A file that cannot be stat'ed
+    any more (deleted since it was read) is not being written."""
+    try:
+        modified = path.stat().st_mtime
+    except OSError:
+        return False
+    return time.time() - modified < seconds
 
 
 @dataclass(frozen=True)
@@ -324,6 +393,11 @@ class Transcripts:
     skips: tuple[LineSkip, ...]
     duplicates: tuple[Duplicate, ...]
     anomalies: tuple[Anomaly, ...]
+    growing: Mapping[Path, str | None] = field(default_factory=dict)
+    """Each file whose torn last line may still be being written (``TranscriptFile.growing``),
+    with the ``uuid`` of its last entry in file order: where the line being written hangs.
+    ``None`` for a file with no entry at all yet. Taken from the file's own order, not from
+    whichever copy of a replayed entry was kept."""
 
     def walk(self) -> tuple[TranscriptEntry, ...]:
         """Every entry once, depth first: parents before children, each branch whole."""
@@ -417,6 +491,34 @@ def load(paths: Iterable[Path]) -> Transcripts:
         if isinstance(spawned, str) and spawned and not entries[uuid].is_sidechain:
             anchors.setdefault(spawned, uuid)
 
+    # The chain through lines that were not loaded (finding 2.1). ``links`` is where each
+    # lost-but-parsed line said it hangs; ``before_gap`` is, for each entry that follows a
+    # skipped line in its own file, the entry before that gap. Only a skipped line counts as
+    # a gap: a line kept aside without a uuid cannot be anyone's parent, and one with a uuid
+    # is in ``links`` already.
+    links: dict[str, str | None] = {}
+    before_gap: dict[tuple[Path, int], str] = {}
+    for transcript in files:
+        for uuid, parent in transcript.links.items():
+            links.setdefault(uuid, parent)
+        skipped = sorted(skip.line for skip in transcript.skips)
+        for previous, entry in zip(transcript.entries, transcript.entries[1:], strict=False):
+            at = bisect_right(skipped, previous.line)
+            if at < len(skipped) and skipped[at] < entry.line:
+                before_gap[entry.path, entry.line] = previous.uuid
+
+    def bridge(start: str) -> tuple[str | None, int] | None:
+        """Follow ``links`` from the missing parent ``start`` to a loaded entry or a root.
+        ``None`` when the trail ends in a line nothing is known about, or loops."""
+        hop: str | None = start
+        crossed: list[str] = []
+        while hop is not None and hop not in entries:
+            if hop not in links or hop in crossed:
+                return None
+            crossed.append(hop)
+            hop = links[hop]
+        return hop, len(crossed)
+
     parent_of: dict[str, str | None] = {}
     for uuid, entry in entries.items():
         parent = entry.parent_uuid
@@ -424,8 +526,29 @@ def load(paths: Iterable[Path]) -> Transcripts:
             repair("self-parent", entry, "names itself as parent; walked as a root")
             parent = None
         elif parent is not None and parent not in entries:
-            repair("orphan", entry, f"parent {parent} was not loaded; walked as a root")
-            parent = None
+            bridged = bridge(parent)
+            attach = before_gap.get((entry.path, entry.line))
+            if bridged is not None and bridged[0] != uuid:
+                end, crossed = bridged
+                where = "a root" if end is None else f"entry {end}"
+                repair(
+                    "bridged",
+                    entry,
+                    f"parent {parent} was not loaded as an entry; its own parent chain "
+                    f"leads through {crossed} lost line(s) to {where}",
+                )
+                parent = end
+            elif attach is not None:
+                repair(
+                    "orphan",
+                    entry,
+                    f"parent {parent} was not loaded, and a line before this one was lost; "
+                    f"hung from the entry before the gap, {attach}",
+                )
+                parent = attach
+            else:
+                repair("orphan", entry, f"parent {parent} was not loaded; walked as a root")
+                parent = None
         elif parent is None and entry.agent_id and entry.path.parent.name == "subagents":
             parent = anchors.get(entry.agent_id)
             if parent is None:
@@ -489,4 +612,9 @@ def load(paths: Iterable[Path]) -> Transcripts:
         skips=skips,
         duplicates=tuple(duplicates),
         anomalies=tuple(anomalies),
+        growing={
+            transcript.path: transcript.entries[-1].uuid if transcript.entries else None
+            for transcript in files
+            if transcript.growing
+        },
     )

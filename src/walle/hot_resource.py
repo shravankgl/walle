@@ -86,7 +86,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
-import json
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -97,8 +96,7 @@ import mcp.types as mcp_types
 from fastmcp import FastMCP
 from mcp.server.subscriptions import InMemorySubscriptionBus, ListenHandler, ResourceUpdated
 
-from walle import hook, index
-from walle.resolver import resolve
+from walle import hook, hot
 
 URI = "memory://hot-tier"
 MIME = "text/markdown"
@@ -108,8 +106,8 @@ POLL_SECONDS = 1.0
 TASK_NAME = "walle-hot-tier-watch"
 
 MISSING_HEAD = "No hot tier to give you."
-STALE_HEAD = "This hot tier is older than the log."
-UNCHECKED_HEAD = "This hot tier's age could not be checked."
+STALE_HEAD = hot.STALE_HEAD
+UNCHECKED_HEAD = hot.UNCHECKED_HEAD
 
 
 class Status(StrEnum):
@@ -143,53 +141,10 @@ def read(root: Path, principal: str, hide: Callable[[str], str] | None = None) -
             Status.MISSING, _missing(principal, f"the hot tier could not be read: {why}")
         )
 
-    try:
-        rendered_from = _state_of(manifest)
-    except _NoRecord as exc:
-        return Reading(Status.UNCHECKED, _note(UNCHECKED_HEAD, str(exc), principal) + text)
-    try:
-        now = _current_state(root, principal)
-    except Exception as exc:  # any failure to fold is "could not check", never an error
-        why = f"the log could not be folded ({type(exc).__name__})"
-        return Reading(Status.UNCHECKED, _note(UNCHECKED_HEAD, why, principal) + text)
-    if now != rendered_from:
-        why = "the log has changed since it was rendered, and the change is not in it"
-        return Reading(Status.STALE, _note(STALE_HEAD, why, principal) + text)
-    return Reading(Status.CURRENT, text)
-
-
-class _NoRecord(Exception):
-    """The manifest cannot say which fold the render came from."""
-
-
-def _state_of(manifest: bytes | None) -> str:
-    if manifest is None:
-        raise _NoRecord("there is no record of the render it came from")
-    try:
-        data = json.loads(manifest)
-    except ValueError:
-        raise _NoRecord("the record of the render it came from is unreadable") from None
-    state = data.get("state") if isinstance(data, dict) else None
-    if not isinstance(state, str):
-        raise _NoRecord("the record of the render it came from names no state")
-    return state
-
-
-def _current_state(root: Path, principal: str) -> str:
-    """``index.state_hash`` of the log as it is now; on a read-only profile, of the index as
-    last built, as ``recall`` answers from."""
-    try:
-        records = index.update(root, principal).records
-    except PermissionError:
-        records = index.load_records(root, principal)
-    return index.state_hash(resolve(records))
-
-
-def _note(head: str, why: str, principal: str) -> str:
-    return (
-        f"{head} {why[0].upper()}{why[1:]}. What follows is still what you remember of "
-        f"{principal}; `walle render --principal {principal}` brings it up to date.\n\n"
-    )
+    # The age check is ``hot.age``, shared with the ACP client (``walle.acp``, issue #139), so
+    # the two surfaces that put the tier in front of a model say the same thing about it.
+    aged = hot.age(root, principal, manifest)
+    return Reading(Status(aged.age.value), aged.note(principal) + text)
 
 
 def _missing(principal: str, why: str) -> str:

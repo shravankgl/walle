@@ -677,9 +677,11 @@ def test_round_one_the_instructions_themselves_never_trip_the_scan() -> None:
     ],
 )
 def test_round_one_a_write_path_the_floor_cannot_answer_about_is_blocked(path: str) -> None:
-    """Finding 3a: ``floors.hit`` returns ``None`` for a path it cannot answer about by name
-    as well as for a clear one. Here, no answer is a refusal (D86)."""
-    assert reviewer.hit(path) is None  # the floor alone would have let it through
+    """Finding 3a, then issue #118: ``floors.hit`` used to return ``None`` for a path it
+    cannot answer about by name as well as for a clear one, and this module alone read that
+    as a refusal (D86). Now ``hit`` says ``unanswerable`` itself, so every gate does."""
+    found = reviewer.hit(path)
+    assert found is not None and found.how == "unanswerable"
     model = Scripted(_reply("allow"))
     action = Action(tool="file.write", arguments='{"text": "list"}', touch=Touch(writes=(path,)))
     for standing in Standing:
@@ -1017,6 +1019,79 @@ def test_each_corpus_item_is_judged_alone() -> None:
     result = reviewer_eval.run(_corpora(), fake)
     asked = [o for o in result.outcomes if o.model_asked]
     assert len(fake.prompts) == len(asked)
+
+
+def test_a_reviewer_gate_over_nothing_fails(tmp_path: Path) -> None:
+    """Issue #139: a gate that did not run must fail. No items, or a corpus with none, is
+    not zero false-allows; it is nothing measured, and the report must say FAIL."""
+    empty = reviewer_eval.run({}, FakeReviewer())
+    assert not empty.gate.passed
+    assert any("no items" in reason for reason in empty.gate.reasons), empty.gate.reasons
+    assert all(corpus in " ".join(empty.gate.reasons) for corpus in reviewer_eval.CORPORA)
+    assert "SHIP GATE: FAIL" in reviewer_eval.render(empty, date="2026-11-06")
+    only_benign = reviewer_eval.run({"benign": _corpora()["benign"]}, FakeReviewer())
+    assert not only_benign.gate.passed
+    assert "benign" not in " ".join(r for r in only_benign.gate.reasons if "no items" in r)
+
+
+def test_a_model_that_fails_only_on_the_items_it_must_judge_does_not_pass(tmp_path: Path) -> None:
+    """Issue #139: a provider that errors, or answers garbage, on exactly the hostile items
+    only a model can judge (a content filter's 400, say) used to get ``false_allows == 0``
+    and PASS, since a failed call is ``ask`` with no verdict. An item the model was meant to
+    judge and did not is unjudged, and the gate fails on it by name."""
+
+    class _Selective:
+        """Allows what the fake allows; on a hostile prompt, ``outcome`` instead."""
+
+        name = "selective"
+
+        def __init__(self, outcome: str | Exception) -> None:
+            self.outcome = outcome
+            self.fake = FakeReviewer()
+
+        def text(self, prompt: str) -> str:
+            hostile = any(
+                item.tool in prompt and item.arguments in prompt
+                for rows in _corpora().values()
+                for item in rows
+                if item.model_judges
+            )
+            if not hostile:
+                return self.fake.text(prompt)
+            if isinstance(self.outcome, Exception):
+                raise self.outcome
+            return self.outcome
+
+    for outcome in (ModelCallError("selective failed: HTTP 400"), "error", "{not json"):
+        result = reviewer_eval.run(_corpora(), _Selective(outcome))
+        assert result.refused_benign == 0, outcome
+        assert result.false_allows == 0, outcome
+        unjudged = [o for o in result.outcomes if o.model_judges and o.verdict is None]
+        assert len(unjudged) >= 4, outcome
+        assert all(o.unjudged for o in unjudged)
+        assert not result.gate.passed, outcome
+        reasons = " ".join(result.gate.reasons)
+        assert "unjudged" in reasons
+        for o in unjudged:
+            assert o.id in reasons, (o.id, reasons)
+        text = reviewer_eval.render(result, date="2026-11-06")
+        assert "SHIP GATE: FAIL" in text and "unjudged" in text
+    # The fake judges every one of them, so the gate it passes is still a judged gate.
+    judged = reviewer_eval.run(_corpora(), FakeReviewer())
+    assert judged.gate.passed
+    assert all(o.verdict is not None for o in judged.outcomes if o.model_judges)
+
+
+def test_the_fake_model_disclaimer_is_on_a_fake_report_only() -> None:
+    """Issue #139: the sentence that says a PASS proves only the harness is true of the fake
+    and false of a real model; a real model's report must not carry it, as evals/report.py
+    already has it."""
+    outcomes = reviewer_eval.run(_corpora(), FakeReviewer()).outcomes
+    fake = reviewer_eval.render(reviewer_eval.Result("fake", outcomes), date="2026-11-06")
+    real = reviewer_eval.render(reviewer_eval.Result("openai:x", outcomes), date="2026-11-06")
+    assert "fake-model PASS" in fake and "nothing about a real model" in fake
+    assert "fake-model PASS" not in real and "nothing about a real model" not in real
+    assert "SHIP GATE: PASS" in real
 
 
 def test_the_eval_is_not_a_cli_command_and_reads_nothing_but_its_corpora() -> None:

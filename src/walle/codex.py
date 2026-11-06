@@ -62,16 +62,31 @@ the person), ``session_meta.base_instructions``, ``turn_context``, compactions a
 counts. This matches the ``api-request`` rule in ``transcript.py``: a request body never
 reaches an observation.
 
-What a turn is (``ThreadHistoryBuilder``)
------------------------------------------
+What a turn is (``ThreadHistoryBuilder``, and where this module departs from it)
+--------------------------------------------------------------------------------
 1. ``task_started`` finishes the turn in progress and opens an explicit one.
 2. ``user_message`` inside an explicit turn belongs to it (the person can add to a turn while
    it runs). Outside one, as in older files with no turn markers, it finishes the implicit
    turn in progress and opens a new implicit one.
+   *Departure (issue #138):* a ``user_message`` that arrives after the turn has already been
+   answered, a follow-up typed while the tools run, closes what the turn holds so far and
+   opens a new segment of the same turn. Codex keeps both in one turn; this module writes
+   two observations, the way the Claude Code observer treats a prompt that follows a reply
+   (its rule 1). Written as one body, the follow-up would be a ``user:`` line after an
+   ``assistant:`` line, which ``hazards.forged_turn`` rightly reads as a forged turn, and
+   the whole turn would be withheld from the proposer.
 3. A reply or tool call outside any turn opens an implicit one.
 4. ``task_complete`` ends the turn it names and finishes it, or the turn in progress if none
-   matches. ``turn_aborted`` ends its turn but leaves it in progress, as Codex does.
-5. ``thread_rolled_back`` finishes the turn in progress and drops the last ``num_turns``.
+   matches. *Departure (issue #138):* ``turn_aborted`` ends its turn and finishes it too.
+   Codex leaves an aborted turn in progress, but an observation of it may already be in the
+   log, and a late line joining the turn would make a second, longer one (D92's content key
+   cannot tell the two apart). What Codex still writes under the aborted turn goes into a
+   further segment of it, where nobody spoke, so it is never observed; a rollback still
+   counts the two as the one turn they are to Codex.
+   A ``user_message`` with no text and no image is nobody speaking: it is dropped as it is
+   read, like an empty reply, so it neither opens, cuts nor splits a turn.
+5. ``thread_rolled_back`` finishes the turn in progress and drops the last ``num_turns``,
+   counted as Codex counts them: a turn split into segments here is one turn there.
 
 When a turn is complete (D56)
 -----------------------------
@@ -81,14 +96,26 @@ Claude Code's rule 1). The one turn still in progress at the end of a file, not 
 ``pending`` and is observed on a later run. A turn that ended or was cut off with no answer
 has nothing to observe and is not pending either.
 
+An *implicit* turn at the end of a file has no marker that could ever end it: only the next
+prompt cuts it, and for the last turn in the file there is none. So it is complete once the
+file has gone quiet: not changed for ``TAIL_GRACE`` seconds (the Claude Code observer's
+rule for a torn last line, task 129; the one constant, imported, so the two observers agree
+on what quiet means). While the file is still changing it is pending, as before. An explicit
+turn is never closed this way: its ``task_complete`` or ``turn_aborted`` is still to come, and
+a quiet file is not that marker. (A Codex that died mid-turn leaves it pending; see the
+log for task 138.)
+
 What an observation holds
 -------------------------
 The same shape as the Claude Code observer's, so the same session through either harness
 gives the same ``body`` and ``observed_at``:
 
-* ``body``: one line per item in file order. ``user: <text>`` for the person, ``user:
-  [image]`` per attached image, ``assistant: [tool: <name>]`` per call, ``assistant: <text>``
-  per reply.
+* ``body``: one line per item in file order. The person's message is one block, ``user:
+  <text>`` on its first line and its further lines unlabelled, then ``[image]`` on its own
+  unlabelled line per attached image, as ``observer._body`` writes it (issue #129, finding
+  2.4). ``hazards.forged_turn`` reads that as one opening block; ``user: [image]`` after a
+  multi-line prompt would read as a forged turn. Then ``assistant: [tool: <name>]`` per call,
+  the name folded onto that one line, and ``assistant: <text>`` per reply.
 * ``observed_at``: the time of the turn's last reply or tool call, the transcript's own time
   (D93), in UTC. Codex writes UTC (``JsonlWriter``); an odd offset on a line is converted as
   it is read, so no line can carry a time the log's ``Instant`` would refuse later.
@@ -96,9 +123,32 @@ gives the same ``body`` and ``observed_at``:
 * ``ts``: when the log learns it.
 
 No session id and no turn id is copied into an observation (D101). A turn id is used only to
-find the turn a ``task_complete`` names, and to count a fork's copy of a turn once: Codex can
-copy a thread's history into a new rollout when it forks, so two files may hold the same
-turn id, and the earlier file's turn is kept (by first timestamp, then path).
+find the turn a ``task_complete`` names, and to count a fork's copy of a turn once.
+
+Forks, and a turn counted once
+------------------------------
+Codex can copy a thread's history into a new rollout when it forks (``InitialHistory::Forked``
+in ``codex-rs/core/src/session/mod.rs``): the copied lines keep their payloads, so the same
+``turn_id`` appears in both files, but each copied line is stamped as it is written
+(``JsonlWriter::write_rollout_item`` in ``codex-rs/rollout/src/recorder.rs``), so the copy
+carries fresh timestamps and the fork's own ``cli_version``. The copy is found by turn id,
+never by content, and the earlier file's turn is kept (by first timestamp, then path).
+
+A turn id means "the same turn" only within one thread and its forks (Codex makes them as
+UUIDv7, but this module does not rely on that), so the match is scoped to a *lineage*: the
+file's ``session_meta.id`` followed through ``forked_from_id`` to the oldest ancestor named.
+Two unrelated sessions whose turn ids collide are two sessions (issue #138). The ids are kept
+on the ``RolloutFile`` only, for this one purpose, and reach no observation.
+
+When a fork's ancestor cannot be read in a run, because Codex compressed it to ``.jsonl.zst``
+(``codex-rs/rollout/src/compression.rs`` compresses cold rollouts) or it is gone, the copy
+cannot be matched by turn id, and its fresh timestamps match nothing by D92's key. Such a
+fork's turns are marked ``orphan_fork``, and ``append_observations`` reads them as the copy
+they probably are: in file order, each whose ``body`` is already a Codex observation in the
+log is already logged; the first that is not ends the copied prefix, and everything after is
+the fork's own. The cost, accepted: the fork's first new turn is dropped if its body is
+exactly a turn already logged. Reading the compressed file would remove the guess; zstd is
+not in the dependency allowlist, so that is a decision, not a fix.
 
 Skipped and counted (D80)
 -------------------------
@@ -143,6 +193,7 @@ from typing import Any, Literal
 
 from walle.events import ACTOR_OBSERVER, Observation, now_instant
 from walle.reader import StreamContents
+from walle.transcript import TAIL_GRACE
 from walle.writer import StreamWriter
 
 SOURCE = "codex"
@@ -253,6 +304,14 @@ class RolloutFile:
     skips: tuple[RolloutSkip, ...]
     source_version: str | None = None
     """The first ``session_meta.cli_version``: the Codex build that wrote the file."""
+    thread_id: str | None = None
+    """The first ``session_meta.id``. Scopes a turn id to its lineage; copied nowhere else."""
+    forked_from: str | None = None
+    """The first ``session_meta.forked_from_id``: the thread this one's history was copied
+    from, when it was. Copied nowhere else."""
+    growing: bool = False
+    """The file changed within ``TAIL_GRACE`` seconds of being read: Codex may be writing it,
+    so an implicit turn open at its end may still grow."""
 
 
 class _Malformed(Exception):
@@ -275,6 +334,8 @@ def read_rollout(path: Path) -> RolloutFile:
     records: list[RolloutRecord] = []
     skips: list[RolloutSkip] = []
     version: str | None = None
+    thread_id: str | None = None
+    forked_from: str | None = None
     seen_meta = False
 
     offset = 0
@@ -297,9 +358,10 @@ def read_rollout(path: Path) -> RolloutFile:
                     return _file_skip(
                         path, f"format not read: history_mode is not {READ_HISTORY_MODE}"
                     )
-                cli = payload.get("cli_version")
                 if not seen_meta:
-                    version = cli if isinstance(cli, str) and cli else None
+                    version = _string(payload.get("cli_version"))
+                    thread_id = _string(payload.get("id"))
+                    forked_from = _string(payload.get("forked_from_id"))
                     seen_meta = True
                 continue
             record = _record(path, number, at, kind, payload)
@@ -312,7 +374,29 @@ def read_rollout(path: Path) -> RolloutFile:
     if tail.strip():
         reason = "unterminated last line: pending, Codex may still be writing it"
         skips.append(RolloutSkip(path, len(lines) + 1, offset, len(tail), reason))
-    return RolloutFile(path, tuple(records), tuple(skips), version)
+    return RolloutFile(
+        path,
+        tuple(records),
+        tuple(skips),
+        version,
+        thread_id=thread_id,
+        forked_from=forked_from,
+        growing=_changed_within(path, TAIL_GRACE),
+    )
+
+
+def _string(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _changed_within(path: Path, seconds: float) -> bool:
+    """Whether ``path`` was modified in the last ``seconds``. A file that cannot be stat'ed
+    any more (gone since it was read) is not being written."""
+    try:
+        modified = path.stat().st_mtime
+    except OSError:
+        return False
+    return datetime.now(UTC).timestamp() - modified < seconds
 
 
 def read_or_skip(path: Path) -> RolloutFile:
@@ -379,7 +463,8 @@ def _record(
         name = payload.get("name")
         if not isinstance(name, str) or not name.strip():
             name = item.removesuffix("_call") if "name" not in payload else "unnamed"
-        return RolloutRecord(path, number, at, "tool", text=name)
+        # One line: a name with a line break in it would put an unlabelled line in the body.
+        return RolloutRecord(path, number, at, "tool", text=" ".join(name.split()))
     if kind != "event_msg":
         return None
     event = payload.get("type")
@@ -394,13 +479,15 @@ def _record(
             for key in ("images", "local_images")
             if isinstance(value := payload.get(key), list)
         )
+        if not message.strip() and not images:
+            return None  # nobody spoke: it must not open, cut or split a turn either
         return RolloutRecord(path, number, at, "prompt", text=message, count=images)
     if event == "agent_message":
         message = payload.get("message")
         if not isinstance(message, str):
             raise _Malformed("not a rollout line: agent_message without a message")
-        if not message:
-            return None  # Codex's own reducer drops an empty reply
+        if not message.strip():
+            return None  # Codex's own reducer drops an empty reply; blank is empty here
         return RolloutRecord(path, number, at, "reply", text=message)
     if event in _STARTED or event in _COMPLETE:
         turn_id = payload.get("turn_id")
@@ -446,11 +533,15 @@ class _Turn:
     turn_id: str | None
     explicit: bool
     line: int
+    segment: int = 0
+    """Which piece of its Codex turn this is: 0, or one more per follow-up (rule 2)."""
     lines: list[str] = field(default_factory=list)
     spoke: bool = False
     answered_at: datetime | None = None
     ended: bool = False
     cut: bool = False
+    open: bool = False
+    """Still in progress when the file ended."""
 
 
 @dataclass(frozen=True)
@@ -464,6 +555,10 @@ class ObservedTurn:
     line: int
     """Where the turn starts in ``path``."""
     observation: Observation
+    orphan_fork: bool = False
+    """From a fork none of whose ancestors could be read this run, so a copy of an ancestor's
+    turn cannot be told from the fork's own by turn id. ``append_observations`` matches the
+    copied prefix by body instead."""
 
 
 @dataclass(frozen=True)
@@ -521,6 +616,16 @@ def _fold(file: RolloutFile) -> list[_Turn]:
             current = _Turn(turn_id=None, explicit=False, line=record.line)
         return current
 
+    def abort() -> None:
+        """Finish the aborted turn, and leave a further segment of it open for whatever Codex
+        still writes under it: a late reply joins that segment, nobody spoke in it, and it is
+        never observed, while a rollback still counts the whole as one turn."""
+        nonlocal current
+        assert current is not None
+        tail = _Turn(current.turn_id, current.explicit, current.line, segment=current.segment + 1)
+        finish(cut=False)
+        current = tail
+
     for record in file.records:
         if record.kind == "started":
             finish(cut=True)
@@ -528,11 +633,16 @@ def _fold(file: RolloutFile) -> list[_Turn]:
         elif record.kind == "prompt":
             if current is not None and not current.explicit:
                 finish(cut=True)
+            elif current is not None and current.answered_at is not None:
+                # A follow-up after the answer began: the next segment of the same turn.
+                segment = _Turn(current.turn_id, True, record.line, segment=current.segment + 1)
+                finish(cut=True)
+                current = segment
             turn = ensure(record)
-            turn.spoke = True
-            if record.text and record.text.strip():
-                turn.lines.append(f"user: {record.text}")
-            turn.lines.extend(["user: [image]"] * record.count)
+            block = [record.text] if record.text and record.text.strip() else []
+            block.extend(["[image]"] * record.count)
+            turn.spoke = True  # ``_record`` dropped the blank-and-imageless message already
+            turn.lines.append("user: " + "\n".join(block))
         elif record.kind in ("tool", "reply"):
             turn = ensure(record)
             text = f"[tool: {record.text}]" if record.kind == "tool" else record.text
@@ -550,14 +660,17 @@ def _fold(file: RolloutFile) -> list[_Turn]:
         elif record.kind == "aborted":
             if current is not None and record.turn_id in (None, current.turn_id):
                 current.ended = True
+                abort()
             elif (done := _named(finished, record.turn_id)) is not None:
                 done.ended = True
             elif current is not None:
                 current.ended = True
+                abort()
         else:  # rollback
             finish(cut=True)
-            del finished[max(len(finished) - record.count, 0) :]
+            _rollback(finished, record.count)
     if current is not None:
+        current.open = True
         finished.append(current)
     return finished
 
@@ -566,6 +679,50 @@ def _named(turns: list[_Turn], turn_id: str | None) -> _Turn | None:
     if turn_id is None:
         return None
     return next((t for t in turns if t.turn_id == turn_id), None)
+
+
+def _rollback(finished: list[_Turn], num_turns: int) -> None:
+    """Drop the last ``num_turns`` of Codex's turns from ``finished``, in place.
+
+    Codex counts turns; ``finished`` holds segments. Consecutive segments with the same turn id
+    (a follow-up's split, an abort's tail) are one turn. An implicit turn has no id and is one
+    turn by itself.
+    """
+    keep = len(finished)
+    turns = 0
+    previous: str | None = None
+    for index in range(len(finished) - 1, -1, -1):
+        turn_id = finished[index].turn_id
+        if turn_id is None or turn_id != previous:
+            turns += 1
+            if turns > num_turns:
+                break
+        previous = turn_id
+        keep = index
+    del finished[keep:]
+
+
+def _lineage(file: RolloutFile, by_id: Mapping[str, RolloutFile]) -> tuple[str, bool]:
+    """The scope a turn id is unique within, and whether an ancestor could not be read.
+
+    The scope is the oldest thread id the fork chain names, following ``forked_from`` through
+    the files read this run; a file naming no thread at all is its own scope. The chain is
+    unread at its end when it names a thread no readable file has: compressed, archived or
+    gone. A loop in the ids (nothing Codex writes) ends the walk where it started.
+    """
+    root = file.thread_id
+    seen = set() if root is None else {root}
+    parent = file.forked_from
+    while parent is not None and parent not in seen:
+        seen.add(parent)
+        root = parent
+        ancestor = by_id.get(parent)
+        if ancestor is None:
+            return f"thread:{root}", True
+        parent = ancestor.forked_from
+    if root is None:
+        return f"path:{file.path}", False
+    return f"thread:{root}", False
 
 
 def observe(files: Iterable[RolloutFile], *, ts: str | None = None) -> CodexReport:
@@ -581,23 +738,30 @@ def observe(files: Iterable[RolloutFile], *, ts: str | None = None) -> CodexRepo
         return (first is None, first, str(f.path))
 
     ordered = sorted(files, key=file_key)
+    by_id: dict[str, RolloutFile] = {}
+    for file in ordered:
+        if file.thread_id is not None:
+            by_id.setdefault(file.thread_id, file)
     turns: list[ObservedTurn] = []
     pending: list[PendingTurn] = []
     duplicates: list[DuplicateTurn] = []
-    kept: dict[str, ObservedTurn] = {}
+    kept: dict[tuple[str, str, int], ObservedTurn] = {}
     for file in ordered:
+        scope, orphan = _lineage(file, by_id)
         for turn in _fold(file):
             if not turn.spoke:
                 continue  # nobody spoke: nothing to observe
-            complete = turn.answered_at is not None and (turn.ended or turn.cut)
+            settled = turn.open and not turn.explicit and not file.growing
+            complete = turn.answered_at is not None and (turn.ended or turn.cut or settled)
             if not complete:
                 if not turn.ended and not turn.cut:
                     pending.append(PendingTurn(file.path, turn.line))
                 continue
             assert turn.answered_at is not None
-            if turn.turn_id is not None and (first := kept.get(turn.turn_id)) is not None:
+            key = None if turn.turn_id is None else (scope, turn.turn_id, turn.segment)
+            if key is not None and (first := kept.get(key)) is not None:
                 duplicates.append(
-                    DuplicateTurn(turn.turn_id, file.path, turn.line, first.path, first.line)
+                    DuplicateTurn(key[1], file.path, turn.line, first.path, first.line)
                 )
                 continue
             observed = ObservedTurn(
@@ -612,9 +776,10 @@ def observe(files: Iterable[RolloutFile], *, ts: str | None = None) -> CodexRepo
                     body="\n".join(turn.lines),
                     source_version=file.source_version,
                 ),
+                orphan_fork=orphan,
             )
-            if turn.turn_id is not None:
-                kept[turn.turn_id] = observed
+            if key is not None:
+                kept[key] = observed
             turns.append(observed)
     return CodexReport(
         turns=tuple(turns),
@@ -694,11 +859,22 @@ def append_observations(
     already: list[ObservedTurn] = []
     with writer.locked() as stream:
         logged = _logged(stream.read())
+        bodies = {key[2] for key in logged}
+        # Files still inside the prefix a fork copied from an ancestor nobody could read.
+        copying = {turn.path for turn in report.turns if turn.orphan_fork}
         for turn in report.turns:
             key = _key(turn.observation)
             if key in logged:
                 already.append(turn)
+                # An exact key is a turn this fork itself was observed from on an earlier run
+                # (a copy carries fresh timestamps), so the copied prefix is over.
+                copying.discard(turn.path)
                 continue
+            if turn.path in copying and turn.observation.body in bodies:
+                already.append(turn)  # the ancestor's turn, observed from the ancestor
+                continue
+            copying.discard(turn.path)  # the fork's own turns begin here
             appended.append(stream.append(turn.observation))
             logged.add(key)
+            bodies.add(key[2])
     return AppendReport(appended=tuple(appended), already_logged=tuple(already), report=report)

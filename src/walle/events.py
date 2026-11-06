@@ -39,6 +39,9 @@ D78      ``ask`` is an inbox item — an approval, a question or a notification 
 D6/D114  ``automation`` is one change to the register of active automations: ``add``,
          ``retire``, ``pin`` or ``unpin``. Which automations are active, and whether the WIP
          cap allows another, is a fold in ``walle.automations``, never an edit of an add.
+D6/D20   ``outcome`` is one observed run of an automation, ``ok`` or ``failed``, against the
+         ref of its add. How many shipped automations still run at day 30 is a fold in
+         ``walle.survival`` over the log and an explicit ``as_of``.
 """
 
 from __future__ import annotations
@@ -263,6 +266,19 @@ class AutomationVerb(StrEnum):
     UNPIN = "unpin"
 
 
+class OutcomeResult(StrEnum):
+    """How one run of an automation went (D19, D20).
+
+    ``ok`` means it ran and did its job; ``failed`` means it ran and did not. There is no
+    ``stopped``: an automation that stopped produces no outcome at all, and that silence is
+    what ``walle.survival`` counts against it. A closed set, like ``StepVerb``: adding a member
+    is a version bump with an upcaster (D88).
+    """
+
+    OK = "ok"
+    FAILED = "failed"
+
+
 class Level(StrEnum):
     """How an assertion was reached (D94).
 
@@ -290,6 +306,17 @@ ACTOR_CURATOR = "curator"
 ACTOR_KERNEL = "kernel"
 ACTOR_MCP = "mcp"
 """The MCP server's ``remember``: the host model's words, not the person's (D97)."""
+ACTOR_BUILDER = "builder"
+"""The Builder: who a staged workflow comes from (D117). A machine, like the proposer."""
+
+MACHINE_ACTORS = frozenset(
+    {ACTOR_OBSERVER, ACTOR_PROPOSER, ACTOR_CURATOR, ACTOR_KERNEL, ACTOR_MCP, ACTOR_BUILDER}
+)
+"""Every actor that is a part of walle rather than a person, in one place (issue #119). No
+machine actor resolves an inbox item (``walle.inbox`` rule 4) or changes the register of
+automations (``walle.automations`` rule 4, D72). A new ``ACTOR_*`` is added here or it is
+not a machine, and ``tests/test_audit_approvals.py`` checks that every one defined in this
+package is defined in this module."""
 
 
 # --- errors -----------------------------------------------------------------------------
@@ -367,8 +394,12 @@ class Event(BaseModel):
         if not isinstance(data, dict):
             return data
         found = data.get("v", 1)
-        if not isinstance(found, int):
-            raise ValueError(f"v must be an integer, got {found!r}")
+        # The rule ``seq`` follows (``reader._record``): a JSON integer, not a bool, at least
+        # 1. ``bool`` is an ``int`` in Python, so ``true`` would otherwise pass as 1 and be
+        # read as v1; and ``0`` or ``false`` would blame a missing upcaster for a value no
+        # build ever wrote (issue #128, finding 4.1).
+        if not isinstance(found, int) or isinstance(found, bool) or found < 1:
+            raise ValueError(f"v must be a JSON integer >= 1, got {found!r}")
         if found > cls.SCHEMA_VERSION:
             raise FutureSchemaError(
                 event_type=data.get("type", cls.__name__),
@@ -393,7 +424,8 @@ class Event(BaseModel):
 # §5.2's taxonomy also has utterance, capability, trust, feedback and outcome. They belong
 # to phases that do not exist yet; adding them now would be guessing at their fields with
 # nothing to check the guess against. `mission` and `step` arrived with Phase 2 (R8, D67),
-# `ask` and `answer` with its inbox (D78), and `automation` with Phase 3's register (D6).
+# `ask` and `answer` with its inbox (D78), `automation` with Phase 3's register (D6),
+# `outcome` with its survival report (D20), and `utterance` with its conversation rules (D61).
 
 
 class Observation(Event):
@@ -848,6 +880,106 @@ class Automation(Event):
         return self
 
 
+# --- utterances (D61) ---------------------------------------------------------------------
+
+
+_SPEAKER_RE = re.compile(r"[A-Za-z0-9+][A-Za-z0-9_.:@+-]{0,127}")
+
+
+def check_speaker(value: str) -> str:
+    """A speaker is the platform's id for a person, never a display name (D61): one token,
+    no whitespace and no angle brackets, so it cannot print as a sentence or a tag."""
+    if not _SPEAKER_RE.fullmatch(value):
+        raise ValueError(
+            f"not a speaker id: {value!r} — letters, digits, '_', '.', ':', '@', '+' and '-', "
+            "as the platform gives it; never a display name"
+        )
+    return value
+
+
+type SpeakerId = Annotated[str, AfterValidator(check_speaker)]
+
+type RoleName = Literal["operator", "stakeholder", "admin"]
+"""D27's three roles, by name. ``walle.profiles.Role`` is the enum; the event carries the
+name so that the events module imports nothing that reads a folder."""
+
+
+class Utterance(Event):
+    """One completed turn in a conversation (§5.1, §5.2; D61).
+
+    ``conversation`` is the platform's id for the conversation. ``speaker`` is the identity
+    the kernel **verified** for the message — the principal's name when the platform's id
+    resolves to one, the platform's id otherwise — never a display name and never anything
+    the message says about itself. ``role`` is the role the kernel attached to that speaker
+    for this message **in this folder**: the principal's own role, or ``None`` for anyone who
+    is not the principal — a role is a fact about one profile, and another principal's is
+    not kept here (§7, #122) — and ``None`` when it could attach none: an unknown speaker is
+    the lowest role. ``body`` is the words, kept as data.
+
+    The context ratchet is a fold over these: the lowest role that has ever spoken in a
+    conversation, from the log, so that a restart cannot reset it (D61). There is no
+    ``floor`` field, because a floor is what the fold says, never what one turn declares.
+    """
+
+    type: Literal["utterance"] = "utterance"
+
+    conversation: CallId
+    speaker: SpeakerId
+    role: RoleName | None = None
+    body: str
+
+
+# --- outcomes (D19, D20) ------------------------------------------------------------------
+
+
+class Outcome(Event):
+    """One observed run of an automation: ``target`` is the ref of its add, ``result`` how it
+    went, ``note`` free text (what it sent, why it failed).
+
+    §5.2 says an outcome is observed against a ``capability`` or a ``mission``. Which kinds of
+    target count is the reader's call, not the event's: ``walle.survival`` counts outcomes
+    against an automation's add and reports any other. ``ts`` is when the run was recorded,
+    which for the runner that writes it is when it ran.
+
+    There is no ``survived`` or ``active`` field: whether an automation survived is what the
+    fold says over every event up to a date, never something one run declares.
+    """
+
+    type: Literal["outcome"] = "outcome"
+
+    target: Ref
+    result: OutcomeResult
+    note: str | None = None
+
+
+class Digest(Event):
+    """One run of a principal's digest (D31): ``slot`` is the start of the schedule slot it
+    ran for, ``body`` what it said, ``model`` what composed it.
+
+    ``body`` is ``None`` when the run had nothing to say. Silence is a result (D63): it is
+    recorded, so the slot is spent, and nothing is sent. A body that is only whitespace is
+    refused, so silence has one spelling. When there is a body it is written here because a
+    composed digest is not reproducible by replay (hard constraint 4), the same reason a
+    ``snapshot`` carries its body.
+
+    There is no recipient field on purpose (D63): the run decides *whether* there is
+    something to say, and configuration decides *where* it goes. Nothing appended to the log
+    can steer a later run's delivery. ``ts`` is when the run happened.
+    """
+
+    type: Literal["digest"] = "digest"
+
+    slot: Instant
+    body: str | None = None
+    model: str | None = None
+
+    @model_validator(mode="after")
+    def _silence_has_one_spelling(self) -> Digest:
+        if self.body is not None and not self.body.strip():
+            raise ValueError("a digest with nothing to say has no body, not a blank one")
+        return self
+
+
 type AnyEvent = Annotated[
     Observation
     | Assertion
@@ -859,7 +991,10 @@ type AnyEvent = Annotated[
     | Step
     | Ask
     | Answer
-    | Automation,
+    | Utterance
+    | Automation
+    | Outcome
+    | Digest,
     Field(discriminator="type"),
 ]
 
@@ -876,7 +1011,10 @@ EVENT_TYPES: dict[str, type[Event]] = {
     "step": Step,
     "ask": Ask,
     "answer": Answer,
+    "utterance": Utterance,
     "automation": Automation,
+    "outcome": Outcome,
+    "digest": Digest,
 }
 
 

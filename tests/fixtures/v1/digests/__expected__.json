@@ -1,0 +1,29 @@
+{
+  "principal": "the-hollies",
+  "events": 6,
+  "state_hash": "38a3055e0fb8591d46b831a76c155058339b5e818745851f219f197fea17ae36",
+  "fold": {
+    "current": [],
+    "retired": [],
+    "conflicts": [],
+    "unapplied": [],
+    "staged": []
+  },
+  "sentinels": {
+    "d-mbp:2.type": "digest",
+    "d-mbp:2.slot": "2026-10-05T09:00:00.000000+00:00",
+    "d-mbp:2.body": "This week: the boiler service is on Thursday.",
+    "d-mbp:2.model": "fake-composer",
+    "d-mbp:2.actor": "kernel",
+    "d-mbp:3.type": "digest",
+    "d-mbp:3.slot": "2026-10-12T09:00:00.000000+00:00",
+    "d-mbp:3.body": null,
+    "d-mbp:3.ts": "2026-10-12T09:00:02.000000+00:00",
+    "d-mbp:5.slot": "2026-11-02T09:00:00.000000+00:00",
+    "d-mbp:5.body": "Since 12 October: the bins moved to Wednesdays.",
+    "d-mbp:5.ts": "2026-11-02T09:00:04.000000+00:00",
+    "d-mbp:6.type": "supersede",
+    "d-mbp:6.target": "d-mbp:2",
+    "d-mbp:4.body": "Synthetic: the bins moved to Wednesdays."
+  }
+}

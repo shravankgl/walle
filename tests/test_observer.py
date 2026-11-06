@@ -411,7 +411,8 @@ def test_prompt_content_as_blocks_reads_text_and_marks_images(tmp_path: Path) ->
         reply(2, 1, 1, [{"type": "thinking", "thinking": "hidden"}, text("A fern.")], "end_turn"),
     ]
     (turn,) = observe_rows(tmp_path, rows).turns
-    assert turn.observation.body == "user: what is this?\nuser: [image]\nassistant: A fern."
+    # One ``user:`` block, the second block unlabelled under it (issue #129, finding 2.4).
+    assert turn.observation.body == "user: what is this?\n[image]\nassistant: A fern."
 
 
 # --- the fields on each observation (D93, D101) ---------------------------------------------
@@ -631,3 +632,220 @@ def test_two_processes_at_once_append_each_turn_once(tmp_path: Path) -> None:
     records = lines_of(StreamWriter(tmp_path / "root", "maya", "mbp"))
     assert [r["seq"] for r in records] == [1, 2]
     assert len({r["body"] for r in records}) == 2
+
+
+# --- audit #129: lost, repeated and mislabelled turns (D56, D80, D92) -----------------------
+
+
+def write_raw(path: Path, rows: list[dict[str, Any] | str], *, tail: str = "") -> Path:
+    """Rows as given, a ``str`` row verbatim (a corrupt line), then ``tail`` unterminated."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [r if isinstance(r, str) else json.dumps(r) for r in rows]
+    path.write_text("".join(line + "\n" for line in lines) + tail)
+    return path
+
+
+def observe_raw(tmp_path: Path, rows: list[dict[str, Any] | str]) -> observer.ObserveReport:
+    return observe(load([write_raw(tmp_path / "p" / "s.jsonl", rows)]), ts=TS)
+
+
+CORRUPT_TOOL_RESULT = '{"uuid": "' + u(3) + '", "parentUuid": "' + u(2) + '", "type": "user", CORRU'
+TOOL_TURN = "user: run it\nassistant: [tool: Bash]\nassistant: Done!"
+
+
+def test_a_corrupt_line_inside_a_turn_does_not_lose_the_turn(tmp_path: Path) -> None:
+    """Finding 2.1: the tool result's line is torn. D80 skips it; the reply below it is still
+    this turn's reply, not an orphan root nobody observes."""
+    rows: list[dict[str, Any] | str] = [
+        prompt(1, None, 0, "run it"),
+        reply(2, 1, 1, [tool_use("t1")], "tool_use"),
+        CORRUPT_TOOL_RESULT,
+        reply(4, 3, 3, [text("Done!")], "end_turn"),
+    ]
+    report = observe_raw(tmp_path, rows)
+    assert [(t.prompt, t.closing) for t in report.turns] == [(u(1), u(4))]
+    assert report.pending == ()
+    assert report.turns[0].observation.body == TOOL_TURN
+    assert [s.line for s in report.transcripts.skips] == [3]
+    assert [(a.kind, a.uuid) for a in report.transcripts.anomalies] == [("orphan", u(4))]
+
+
+@pytest.mark.parametrize(
+    "between",
+    [
+        {"type": "system", "uuid": u(3), "parentUuid": u(2), "subtype": "turn_duration"},
+        {**tool_result(3, 2, 2, "t1"), "timestamp": "not a time"},
+    ],
+    ids=["unthreaded", "skipped-but-parsed"],
+)
+def test_a_line_kept_aside_or_skipped_inside_a_turn_still_links_the_chain(
+    tmp_path: Path, between: dict[str, Any]
+) -> None:
+    """Finding 2.1: the line is not an entry (no timestamp, or a bad one) but it says what
+    its parent is. The chain runs through it."""
+    rows: list[dict[str, Any] | str] = [
+        prompt(1, None, 0, "run it"),
+        reply(2, 1, 1, [tool_use("t1")], "tool_use"),
+        between,
+        reply(4, 3, 3, [text("Done!")], "end_turn"),
+    ]
+    report = observe_raw(tmp_path, rows)
+    assert [(t.prompt, t.closing) for t in report.turns] == [(u(1), u(4))]
+    assert report.pending == ()
+    assert report.turns[0].observation.body == TOOL_TURN
+    assert report.transcripts.parent_of[u(4)] == u(2)
+    assert [(a.kind, a.uuid) for a in report.transcripts.anomalies] == [("bridged", u(4))]
+
+
+def test_a_turn_after_a_corrupt_line_is_still_its_own_turn(tmp_path: Path) -> None:
+    """The repair attaches the chain, it does not merge turns: the next prompt below the
+    gap still starts a new turn and closes the one above it."""
+    rows: list[dict[str, Any] | str] = [
+        prompt(1, None, 0, "run it"),
+        reply(2, 1, 1, [tool_use("t1")], "tool_use"),
+        CORRUPT_TOOL_RESULT,
+        reply(4, 3, 3, [text("Done!")], "end_turn"),
+        prompt(5, 4, 4, "thanks"),
+        reply(6, 5, 5, [text("Any time.")], "end_turn"),
+    ]
+    report = observe_raw(tmp_path, rows)
+    assert [(t.prompt, t.closing) for t in report.turns] == [(u(1), u(4)), (u(5), u(6))]
+    assert [t.observation.body for t in report.turns] == [
+        TOOL_TURN,
+        "user: thanks\nassistant: Any time.",
+    ]
+
+
+def test_a_growing_prefix_of_one_message_is_read_once_at_its_full_length(
+    tmp_path: Path,
+) -> None:
+    """Finding 2.2: entries of one message that each hold the text so far are snapshots of
+    one block, not pieces of it. The body holds the last, and never the prefixes."""
+    rows = [
+        prompt(1, None, 0, "hi"),
+        reply(2, 1, 1, [text("He")], None, mid="m"),
+        reply(3, 2, 2, [text("Hello")], None, mid="m"),
+        reply(4, 3, 3, [text("Hello, world!")], "end_turn", mid="m"),
+    ]
+    (turn,) = observe_rows(tmp_path, rows).turns
+    assert turn.observation.body == "user: hi\nassistant: Hello, world!"
+
+
+def test_a_snapshot_before_a_tool_call_in_the_same_message_is_read_once(tmp_path: Path) -> None:
+    rows = [
+        prompt(1, None, 0, "list"),
+        reply(2, 1, 1, [text("I will")], None, mid="m"),
+        reply(3, 2, 2, [text("I will look.")], None, mid="m"),
+        reply(4, 3, 3, [text("I will look."), tool_use("t1")], "tool_use", mid="m"),
+        tool_result(5, 4, 4, "t1"),
+        reply(6, 5, 5, [text("Two files.")], "end_turn", mid="m2"),
+    ]
+    (turn,) = observe_rows(tmp_path, rows).turns
+    assert turn.observation.body.splitlines() == [
+        "user: list",
+        "assistant: I will look.",
+        "assistant: [tool: Bash]",
+        "assistant: Two files.",
+    ]
+
+
+def test_a_prefix_in_another_message_is_not_a_snapshot(tmp_path: Path) -> None:
+    """Only one message's own entries supersede each other: two replies that happen to start
+    alike are two replies."""
+    rows = [
+        prompt(1, None, 0, "hi"),
+        reply(2, 1, 1, [text("Yes")], "end_turn", mid="m1"),
+        reply(3, 2, 2, [text("Yes, and no.")], "end_turn", mid="m2"),
+    ]
+    (turn,) = observe_rows(tmp_path, rows).turns
+    assert turn.observation.body == "user: hi\nassistant: Yes\nassistant: Yes, and no."
+
+
+def _old(path: Path) -> None:
+    """Make ``path`` look untouched for an hour: nothing is writing it."""
+    import os
+
+    stamp = path.stat().st_mtime - 3600
+    os.utime(path, (stamp, stamp))
+
+
+def test_a_final_reply_at_the_end_of_a_file_being_written_is_pending_until_the_tail_lands(
+    tmp_path: Path,
+) -> None:
+    """Finding 2.3: the file's last line is torn and the file was just written. The reply
+    above the tear says end_turn, but the tear may continue the turn, and an observation
+    made now and a longer one made next run would be two events for one turn (D92)."""
+    writer = StreamWriter(tmp_path / "root", "maya", "mbp")
+    path = tmp_path / "p" / "s.jsonl"
+    rows: list[dict[str, Any] | str] = [
+        prompt(1, None, 0, "q"),
+        reply(2, 1, 1, [text("a")], "end_turn"),
+    ]
+    more = reply(3, 2, 2, [text("and b")], "end_turn")
+    write_raw(path, rows, tail=json.dumps(more)[:40])
+
+    first = append_observations(observe(load([path]), ts=TS), writer)
+    assert first.report.turns == () and first.report.pending == (u(1),)
+    assert first.appended == () and not writer.path.exists()
+
+    write_raw(path, [*rows, more])
+    second = append_observations(observe(load([path]), ts=TS), writer)
+    assert [(t.prompt, t.closing) for t in second.report.turns] == [(u(1), u(3))]
+    assert [o.body for o in second.appended] == ["user: q\nassistant: a\nassistant: and b"]
+
+    third = append_observations(observe(load([path])), writer)
+    assert third.appended == () and len(lines_of(writer)) == 1
+
+
+def test_a_torn_tail_nobody_is_writing_does_not_hold_a_finished_turn_back(tmp_path: Path) -> None:
+    """Claude Code died mid-line an hour ago. The reply above the tear is the reply."""
+    path = write_raw(
+        tmp_path / "p" / "s.jsonl",
+        [prompt(1, None, 0, "q"), reply(2, 1, 1, [text("a")], "end_turn")],
+        tail='{"uuid": "x", "par',
+    )
+    _old(path)
+    report = observe(load([path]), ts=TS)
+    assert [(t.prompt, t.closing) for t in report.turns] == [(u(1), u(2))]
+    assert report.pending == ()
+    (skip,) = report.transcripts.skips
+    assert "unterminated" in skip.reason and "may still be writing" not in skip.reason
+
+
+def test_a_growing_file_holds_back_only_the_turn_its_tail_can_reach(tmp_path: Path) -> None:
+    """A turn the person has already moved on from is closed by their next prompt (rule 1),
+    tear or no tear. A turn in another file is not this file's business."""
+    growing = write_raw(
+        tmp_path / "p" / "s.jsonl",
+        [
+            prompt(1, None, 0, "one"),
+            reply(2, 1, 1, [text("first")], "end_turn"),
+            prompt(3, 2, 2, "two"),
+            reply(4, 3, 3, [text("second")], "end_turn"),
+            entry(5, 4, 4, "system", None, subtype="turn_duration"),
+        ],
+        tail='{"uuid": "x", "par',
+    )
+    other = write(
+        tmp_path / "p" / "t.jsonl",
+        [prompt(6, None, 10, "elsewhere"), reply(7, 6, 11, [text("here")], "end_turn")],
+    )
+    report = observe(load([growing, other]), ts=TS)
+    assert [(t.prompt, t.closing) for t in report.turns] == [(u(1), u(2)), (u(6), u(7))]
+    assert report.pending == (u(3),)  # the tear hangs off entry 5, inside this turn
+
+
+def test_a_multi_line_prompt_with_a_second_block_is_one_user_block(tmp_path: Path) -> None:
+    """Finding 2.4: the person's blocks are one ``user:`` block. A second label after an
+    unlabelled line is what a forged turn looks like to ``hazards``, so the observer must
+    never write one for the person's own second block."""
+    from walle.hazards import flag
+
+    blocks = [text("Line 1\nLine 2"), {"type": "image", "source": {"type": "base64", "data": "x"}}]
+    rows = [
+        entry(1, None, 0, "user", {"role": "user", "content": blocks}),
+        reply(2, 1, 1, [text("Got it.")], "end_turn"),
+    ]
+    (turn,) = observe_rows(tmp_path, rows).turns
+    assert turn.observation.body == "user: Line 1\nLine 2\n[image]\nassistant: Got it."
+    assert flag(turn.observation.body) == ()

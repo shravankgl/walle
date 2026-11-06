@@ -24,9 +24,38 @@ duplicate ``seq`` is not a lost append but a permanently ambiguous ref, since
 If A dies between 3 and 4, the OS drops its lock and B finds a line with no newline: an
 append that was never acknowledged, so nothing ever depended on it. B leaves those bytes
 where they are, starts its own record on a fresh line, and takes its ``seq`` from the last
-*complete* line. The reader skips the fragment (D80). Truncating would be tidier and is
-exactly what "append, never mutate" forbids (hard constraint 2) — the bytes are evidence
-that a crash happened here.
+line that *is a record* by the reader's rules. The reader skips the fragment (D80).
+Truncating would be tidier and is exactly what "append, never mutate" forbids (hard
+constraint 2) — the bytes are evidence that a crash happened here.
+
+How a tear is healed, byte by byte (issue #128)
+-----------------------------------------------
+The writer and the reader are one protocol: what the reader loads, the writer must be able to
+continue, and what the writer never acknowledged, the reader must never load. Two rules keep
+that true under any crash, full disk or torn write, and both are exhaustively tested
+(``tests/test_audit_log.py``) by cutting an append, then a heal, then a heal of that heal,
+at every byte offset:
+
+* **A heal begins with ``TORN_MARK``, never a bare newline.** B's first byte lands on the end
+  of A's torn line. A bare ``\n`` there would *terminate* A's line — and if A had written its
+  whole record but the newline, a heal cut after that one byte would turn an unacknowledged
+  record into a terminated one. The reader would load it; the next writer would build on its
+  ``seq``; an event nobody acknowledged would be back as a fact. ``TORN_MARK`` is a byte no
+  JSON line can end in, so A's line stays unparseable however B's heal is then cut: after
+  the mark alone (still a torn tail), after the newline (a complete line that is not JSON,
+  which the reader skips), or anywhere inside B's record (another torn tail, healed the
+  same way).
+* **The next ``seq`` comes from the last line that is a record, stepping back past what the
+  reader skips.** A heal cut after its newline leaves a complete non-JSON line *last*. The
+  reader skips it (D80); a writer that refused to number from it would leave a stream that
+  loads and cannot grow — forever, since nothing truncates. So the writer steps back past
+  blank lines and non-JSON lines exactly as the reader does, and refuses only what the
+  reader refuses: a complete line that is JSON but not a record with a usable ``seq``.
+
+Streams healed before this change begin a heal with ``\n``; the reader keeps the rule that
+loads them (a record with no newline that shares its ``seq`` with the very next line is the
+earlier, unacknowledged one), and a writer continuing such a stream takes its ``seq`` from the
+later line, as the reader does (D88).
 
 A locked session (``StreamWriter.locked``) is the same lock held across a read and any
 number of appends, for a caller whose decision to append depends on what the stream already
@@ -43,6 +72,48 @@ would append the turn: two events, two refs, for one thing that happened.
 What this does not survive: a stream on NFS, where ``flock`` does not reliably serialise
 between hosts. Local-first is the premise (D10); a shared-filesystem log would need a
 different mechanism, and would silently interleave with this one.
+
+A cause must already be in the log (D111, issue #121)
+------------------------------------------------------
+``caused_by`` is provenance: each ref in it must name an event some stream of this principal
+holds. The index refuses a log with a dangling one (``walle.index.DanglingRefError``), and the
+log is append-only, so a single event appended with a ref that does not exist — a typo, a
+ref from another principal, the event's own ref — would break ``index.update`` and the
+rebuild for the rest of the log's life. Every writer used to be trusted to get this right.
+Now the check is here, in ``LockedStream.append``, the one place a stream grows: before a
+byte is written, every cause is looked for — on this stream through the locked handle, on
+any other stream of the same principal by reading its file — and ``DanglingCauseError`` is
+raised with the refs that are missing. A cause on this stream with the ``seq`` about to be
+assigned is the event naming itself, and is missing like any other.
+
+The other streams are read *without* taking their lock. Taking ``LOCK_SH`` on another
+stream while holding ``LOCK_EX`` on this one would deadlock against a writer doing the same
+the other way round. A lockless read is sound here because the reader's rules already make
+it so (D80): a line is a record only once its newline is on disk, and the only line a
+concurrent writer can be mid-way through is the last one, which is skipped as torn. What is
+not there yet makes a cause missing, which refuses — fail closed — rather than lets through.
+
+What is there is not yet necessarily *durable*, and that is the one gap a lockless read
+opens. Writers A on ``d-mbp`` and B on ``d-phone``, where B cites what A writes:
+
+1. A holds ``LOCK_EX`` on ``d-mbp``, writes ``d-mbp:45`` and flushes. The bytes are in the
+   page cache; A has not yet called ``fsync``.
+2. B holds ``LOCK_EX`` on ``d-phone`` and reads ``d-mbp`` without its lock. It sees 45,
+   whole and newline-terminated: a record by the reader's rules. A reader taking ``LOCK_SH``
+   would have waited for A; B does not, which is the point, and so B sees what is not yet
+   on disk.
+3. **B ``fsync``s ``d-mbp``** through the descriptor it read from, before writing anything.
+   ``fsync`` on a file flushes every dirty page of that inode, whoever wrote them, so 45 is
+   durable when the call returns. No lock is taken: ``flock`` does not gate ``fsync``.
+4. B writes ``d-phone:1`` with ``caused_by: [d-mbp:45]``, flushes, ``fsync``s.
+5. Power is lost. Whatever else happens, there is no state in which ``d-phone:1`` is on disk
+   and ``d-mbp:45`` is not: B made 45 durable before B's own write began.
+
+Without step 3, a crash between B's step 4 and A's own ``fsync`` leaves ``d-phone:1`` durably
+citing an event that is gone, and ``index.update`` refuses the whole log with
+``DanglingRefError`` for the rest of its life. With it, the worst case is that B pays for A's
+``fsync``, and A's own ``fsync`` then finds nothing left to do. If A is still mid-write in
+step 2, B sees a torn tail, 45 is not a record, and B refuses: still fail closed.
 """
 
 from __future__ import annotations
@@ -56,7 +127,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO, TypeVar
 
-from walle.events import Event
+from walle.events import Event, parse_ref
 from walle.paths import stream_id, stream_path
 from walle.reader import StreamContents, parse_stream
 
@@ -82,15 +153,45 @@ already on disk. A status that contradicts the file is the worst kind of bug to 
 # costs a second read.
 _TAIL_WINDOW = 64 * 1024
 
+TORN_MARK = b"~"
+"""The first byte of a heal: what the writer puts at the end of a torn line before starting
+its own record on a fresh one (the module docstring, *How a tear is healed*).
+
+Any byte would do that is not whitespace and cannot end a JSON value — so that the torn line,
+whatever it held, stays unparseable once this byte is on it, even if the heal is cut right
+after it or right after the newline that follows. ``~`` rather than ``NUL`` because the file is
+for a person with ``cat`` and ``grep`` (D10), and a NUL byte makes ``grep`` call the whole
+stream binary. Fragments on disk were always arbitrary non-JSON bytes the reader skips (D80);
+this changes what a stepped-over fragment ends in, not what the reader does with it.
+"""
+
 
 class CorruptLogError(Exception):
-    """The last complete line of a stream is not a readable event.
+    """The last record-shaped line of a stream is JSON, but not a readable event.
 
     Deliberately fatal rather than repaired. The next ``seq`` is derived from that line, and
     guessing it risks reusing a number — which would not lose an event but would make one ref
-    name two of them, permanently and silently. A torn *tail* is an interrupted write and is
-    healed (D80); a corrupt complete line is something else, and the operator should see it.
+    name two of them, permanently and silently. The reader halts on the same line
+    (``reader.CorruptStreamError``): refusing here is agreement with it, not strictness.
+
+    Not raised for a line that is not JSON at all. That is a fragment an interrupted append
+    left and a heal stepped over, which the reader skips (D80), and the writer steps back past
+    it to the last real record — a stream the reader loads must stay a stream the writer can
+    grow (issue #128, finding 3.1).
     """
+
+
+class DanglingCauseError(ValueError):
+    """An event's ``caused_by`` names a ref no stream of this principal holds. Raised before
+    anything is written (D111, issue #121): an append-only log cannot take this back."""
+
+    def __init__(self, stream: str, missing: list[str]) -> None:
+        super().__init__(
+            f"refusing to append to {stream}: caused_by names {', '.join(missing)}, which "
+            f"{'is' if len(missing) == 1 else 'are'} not in the log; a cause must already be "
+            "an event of this principal (D111)"
+        )
+        self.missing = tuple(missing)
 
 
 def _fsync_dir(path: Path) -> None:
@@ -106,47 +207,98 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
-def _tail(f: BinaryIO, size: int) -> tuple[bytes | None, bool]:
-    """``(last complete line, tail was torn)``, reading backwards from the end.
+_NO_RECORD = object()
+"""What ``_last_record`` returns in place of a decoded line when the stream holds none. A
+sentinel rather than ``None``, because ``null`` is a JSON line too."""
 
-    "Complete" means newline-terminated. A window that starts mid-file may open in the middle
-    of a line, so its first element is only trusted when a second line follows it or the
-    window reaches byte zero.
+
+def _decode(line: bytes) -> object:
+    """The JSON value a complete line holds, or ``_NO_RECORD`` when it is not JSON."""
+    try:
+        return json.loads(line)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _NO_RECORD
+
+
+def _last_record(f: BinaryIO, size: int, path: Path) -> tuple[object, bool]:
+    """``(the last complete line that is JSON, decoded; tail was torn)``, reading backwards
+    from the end. The first element is ``_NO_RECORD`` when no complete line is JSON.
+
+    "Complete" means newline-terminated. Complete lines that are blank or not JSON are stepped
+    back past, by the reader's rule (D80): they are fragments an interrupted append left and a
+    later heal stepped over, and a heal cut after its own newline leaves one of them *last*.
+    The window doubles until a JSON line or byte zero is reached, so a fragment or a record
+    larger than the window still works — it just costs another read.
+
+    A window that starts mid-file may open in the middle of a line, so its first line is
+    only trusted when the window reaches byte zero.
     """
     if size == 0:
-        return None, False
+        return _NO_RECORD, False
     window = _TAIL_WINDOW
     while True:
+        passed = 0  # each pass rescans from the end, so the count is per pass
         start = max(0, size - window)
         f.seek(start)
         chunk = f.read(size - start)
         torn = not chunk.endswith(b"\n")
         cut = chunk.rfind(b"\n")
-        complete = chunk[: cut + 1] if cut != -1 else b""
-        lines = [line for line in complete.split(b"\n") if line.strip()]
-        if lines and (len(lines) >= 2 or start == 0):
-            return lines[-1], torn
+        lines = chunk[:cut].split(b"\n") if cut != -1 else []
+        if start != 0:
+            lines = lines[1:]  # may have begun mid-line; the next, wider read will hold it whole
+        for line in reversed(lines):
+            if not line.strip():
+                continue
+            record = _decode(line)
+            if record is not _NO_RECORD:
+                if passed:
+                    logger.warning(
+                        "%s: stepped back past %d complete line(s) that are not JSON to find "
+                        "the last record — heals of an interrupted append were themselves "
+                        "interrupted. Readers skip them (D80).",
+                        path,
+                        passed,
+                    )
+                return record, torn
+            passed += 1
         if start == 0:
-            return (lines[-1] if lines else None), torn
+            return _NO_RECORD, torn
         window *= 2
 
 
-def _seq_of(line: bytes, path: Path) -> int:
-    """The ``seq`` of an encoded event, or ``CorruptLogError`` naming what was wrong."""
-    try:
-        record = json.loads(line)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise CorruptLogError(
-            f"{path}: the last complete line is not JSON ({exc}). Refusing to append: the "
-            "next seq comes from it, and guessing would risk reusing one."
-        ) from exc
+def _seq_of(record: object, path: Path) -> int:
+    """The ``seq`` of a decoded event line, or ``CorruptLogError`` naming what was wrong.
+
+    The line was JSON (``_last_record`` saw to that); what can still be wrong is its shape.
+    """
     seq = record.get("seq") if isinstance(record, dict) else None
     if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
         raise CorruptLogError(
-            f"{path}: the last complete line has no usable seq (found {seq!r}). Refusing to "
-            "append rather than guess at the next one."
+            f"{path}: the last complete JSON line has no usable seq (found {seq!r}). Refusing "
+            "to append rather than guess at the next one; the reader halts on this line too."
         )
     return seq
+
+
+def _plan(f: BinaryIO, size: int, path: Path, event: Event) -> tuple[bytes, int]:
+    """``(bytes to append, seq assigned)`` for ``event`` on a stream whose ``size`` bytes
+    ``f`` can read. Reads; writes nothing; the one place the heal and the ``seq`` are decided,
+    so the exhaustive crash test can drive it over a ``BytesIO`` and know it is testing what
+    ``LockedStream.append`` does.
+    """
+    last, torn = _last_record(f, size, path)
+    next_seq = 1 if last is _NO_RECORD else _seq_of(last, path) + 1
+    payload = encode(event.model_copy(update={"seq": next_seq}))
+    if torn:
+        logger.warning(
+            "%s: last line was not newline-terminated — an append was interrupted. "
+            "Leaving the fragment in place, marking it, and starting seq %d on a fresh "
+            "line; readers skip it.",
+            path,
+            next_seq,
+        )
+        payload = TORN_MARK + b"\n" + payload
+    return payload, next_seq
 
 
 def encode(event: Event) -> bytes:
@@ -185,8 +337,17 @@ class StreamWriter:
         """Append one event, returning it with its ``seq`` filled in.
 
         Durable when it returns: the bytes are ``fsync``ed, and on the first append the
-        directory entry is too.
+        directory entry is too. Raises ``DanglingCauseError`` with nothing written — and, on
+        a stream that does not exist yet, nothing created.
         """
+        if event.caused_by and not self.path.exists():
+            # `locked()` creates the directory and the file. A refusal after that would leave
+            # an empty stream behind for the index to list (issue #128, finding 3.3), so the
+            # causes are checked first. A stream that does not exist holds nothing, so any
+            # cause on it is missing. Racy only in the harmless direction: if another writer
+            # creates the file between here and `locked()`, the check under the lock below
+            # runs again against what it wrote.
+            _refuse_dangling(event, self.stream, self.path, held_here=set())
         with self.locked() as stream:
             return stream.append(event)
 
@@ -228,7 +389,12 @@ class LockedStream:
         return parse_stream(self._f.read(size), self.path, self.stream)
 
     def append(self, event: E) -> E:
-        """Append one event, returning it with its ``seq`` filled in. Durable on return."""
+        """Append one event, returning it with its ``seq`` filled in. Durable on return.
+
+        Raises ``DanglingCauseError``, with nothing written, when a ref in ``caused_by`` is
+        not an event of this principal (see the module docstring).
+        """
+        self._check_causes(event)
         f = self._f
         size = f.seek(0, os.SEEK_END)
 
@@ -248,24 +414,61 @@ class LockedStream:
         if size == 0:
             _fsync_dir(self.path.parent)
 
-        last_line, torn = _tail(f, size)
-        next_seq = _seq_of(last_line, self.path) + 1 if last_line else 1
-
-        record = event.model_copy(update={"seq": next_seq})
-        # Encoded before anything is written, so a failure here leaves the file
+        # Decided and encoded before anything is written, so a failure here leaves the file
         # untouched rather than leaving a stray newline behind it (coding rule 7).
-        payload = encode(record)
-        if torn:
-            logger.warning(
-                "%s: last line was not newline-terminated — an append was interrupted. "
-                "Leaving the fragment in place and starting seq %d on a fresh line; "
-                "readers skip it.",
-                self.path,
-                next_seq,
-            )
-            payload = b"\n" + payload
+        payload, next_seq = _plan(f, size, self.path, event)
         f.seek(0, os.SEEK_END)  # "a" mode appends anyway; this keeps the position honest
         f.write(payload)
         f.flush()
         os.fsync(f.fileno())
-        return record
+        return event.model_copy(update={"seq": next_seq})
+
+    def _check_causes(self, event: Event) -> None:
+        """Every ref in ``event.caused_by`` is an event of this principal, or
+        ``DanglingCauseError`` names the ones that are not. This stream is read through the
+        locked handle; any other stream of the principal is read from its file, without its
+        lock, and ``fsync``ed before we write (the module docstring says why that is both
+        necessary and sound)."""
+        if not event.caused_by:
+            return
+        held = (
+            {r.ref for r in self.read().records}
+            if any(parse_ref(cause)[0] == self.stream for cause in event.caused_by)
+            else set()
+        )
+        _refuse_dangling(event, self.stream, self.path, held_here=held)
+
+
+def _refuse_dangling(event: Event, stream: str, path: Path, *, held_here: set[str]) -> None:
+    """Raise ``DanglingCauseError`` unless every cause is held: on ``stream`` by ``held_here``
+    (what the caller read of its own stream), on any other stream by its file."""
+    if not event.caused_by:
+        return
+    wanted: dict[str, set[str]] = {}
+    for cause in event.caused_by:
+        source, _ = parse_ref(cause)
+        wanted.setdefault(source, set()).add(cause)
+    missing: list[str] = []
+    for source, refs in wanted.items():
+        held = (
+            held_here if source == stream else _refs_of(path.with_name(f"{source}.jsonl"), source)
+        )
+        missing.extend(refs - held)
+    if missing:
+        raise DanglingCauseError(stream, sorted(missing, key=parse_ref))
+
+
+def _refs_of(path: Path, stream: str) -> set[str]:
+    """The refs a sibling stream file holds now, read without its lock and then made durable:
+    what we are about to cite must be on disk before our citation is (the module docstring,
+    *What is there is not yet necessarily durable*). A file that is not there holds nothing."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except FileNotFoundError:
+        return set()
+    with os.fdopen(fd, "rb") as f:
+        data = f.read()
+        # After the read, so everything the read saw is covered; before the parse, so a
+        # failure here refuses the append with nothing written.
+        os.fsync(fd)
+    return {r.ref for r in parse_stream(data, path, stream).records}

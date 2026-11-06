@@ -20,6 +20,8 @@ from walle import hot as walle_hot
 from walle import index as walle_index
 from walle import models as walle_models
 from walle import observer as walle_observer
+from walle import osusers as walle_osusers
+from walle import profiles as walle_profiles
 from walle import proposer as walle_proposer
 from walle import staging as walle_staging
 from walle import stats as walle_stats
@@ -249,6 +251,27 @@ def _body(value: str) -> str:
         raise click.UsageError(str(exc)) from exc
 
 
+def _edit_body(current: str) -> str | None:
+    """The edited body, or ``None`` if the reviewer emptied it.
+
+    A one-line body is edited at the prompt, and Enter keeps it. A body that spans lines
+    cannot be shown or typed at a one-line prompt without flattening it (issue #131,
+    finding 4.3), so it opens in the editor on the whole text; closing it unsaved keeps the
+    text. An emptied text is refused rather than asked again, since asking again would
+    reopen the editor on nothing.
+    """
+    if "\n" not in current:
+        return click.prompt("  body", default=current, show_default=False, value_proc=_body)
+    click.echo("  The body spans lines; it opens in your editor.")
+    edited = click.edit(current)
+    if edited is None:
+        return current
+    try:
+        return walle_staging.clean_body(edited)
+    except ValueError:
+        return None
+
+
 def _show(position: str, item: walle_staging.Staged) -> None:
     proposal = item.proposal
     click.echo(f"\n{position} {item.ref}, staged {proposal.ts[:10]} by {proposal.actor}")
@@ -323,9 +346,12 @@ def review_command(root: Path, principal: str, device: str) -> None:
                 summary = click.prompt(
                     "  summary", default=item.proposal.summary, value_proc=_summary
                 )
-                body = click.prompt(
-                    "  body", default=item.proposal.body, show_default=False, value_proc=_body
-                )
+                body = _edit_body(item.proposal.body)
+                if body is None:
+                    reviewed += 1
+                    done["s"] += 1
+                    click.echo("  nothing to remember — the text is empty; still staged")
+                    continue
                 new = walle_staging.edit(
                     root, principal, device, item.ref, body=body, summary=summary
                 )
@@ -338,7 +364,7 @@ def review_command(root: Path, principal: str, device: str) -> None:
             done["elsewhere"] += 1
             click.echo(f"  {exc}; left as it is")
             continue
-        except click.Abort:
+        except (click.Abort, click.ClickException):  # the editor failing is a ClickException
             report()
             raise
         except _LOG_ERRORS as exc:
@@ -887,3 +913,177 @@ def stats_command(root: Path, principal: str) -> None:
         click.echo(f"acceptance: {counts.accepted} of {counts.decided} decided ({rate}%).")
     else:
         click.echo("acceptance: nothing decided yet.")
+
+
+# --- household profiles (issue #102) -----------------------------------------------------------
+
+
+_PROFILE_ERRORS = (
+    walle_profiles.EmptyContextError,
+    walle_profiles.CrossPrincipalError,
+    walle_profiles.RoleError,
+    walle_profiles.SharedDataError,
+    FileExistsError,
+    FileNotFoundError,
+    OSError,
+    ValueError,
+)
+
+_AS = click.option(
+    "--as",
+    "actor",
+    required=True,
+    help="Who is acting, without the p- prefix. Every profile command acts for one principal.",
+)
+_ROLE = click.option(
+    "--role",
+    type=click.Choice([r.value for r in walle_profiles.Role]),
+    default=walle_profiles.Role.OPERATOR.value,
+    show_default=True,
+    help="The role the speaker holds (D27). Adding and deleting a profile need admin.",
+)
+
+
+@main.group("profiles")
+def profiles_group() -> None:
+    """A household's profiles: one folder per principal, capabilities shared, data never.
+
+    Off unless WALLE_PROFILES=on. Nothing here reads another principal's folder: an admin
+    may add or delete a profile, never read one, and only a folder's owner publishes from it.
+    """
+
+
+def _profile_context(root: Path, actor: str, role: str) -> walle_profiles.Context:
+    return walle_profiles.bind(root, actor, role=walle_profiles.Role(role))
+
+
+@profiles_group.command("add")
+@_ROOT
+@_AS
+@_ROLE
+@click.option("--principal", required=True, help="The new profile's name, without the p- prefix.")
+def profiles_add_command(root: Path, actor: str, role: str, principal: str) -> None:
+    """Make an empty profile folder for a new principal. Needs --role admin."""
+    if not walle_profiles.enabled():
+        raise click.ClickException(walle_profiles.OFF_MESSAGE)
+    try:
+        added = walle_profiles.add_profile(_profile_context(root, actor, role), principal)
+    except _PROFILE_ERRORS as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"{added.principal}: profile made at {added.folder}")
+
+
+@profiles_group.command("delete")
+@_ROOT
+@_AS
+@_ROLE
+@click.option("--principal", required=True, help="The profile to delete, without the p- prefix.")
+def profiles_delete_command(root: Path, actor: str, role: str, principal: str) -> None:
+    """Delete a principal's whole folder (D32 rule 5). Needs --role admin. Opens no file."""
+    if not walle_profiles.enabled():
+        raise click.ClickException(walle_profiles.OFF_MESSAGE)
+    try:
+        gone = walle_profiles.delete_profile(_profile_context(root, actor, role), principal)
+    except _PROFILE_ERRORS as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        f"{gone.principal}: profile deleted ({_plural(gone.files, 'file')}, "
+        f"{_plural(gone.links, 'link')}, {_plural(gone.folders, 'folder')})"
+    )
+
+
+@profiles_group.command("publish")
+@_ROOT
+@click.option("--principal", required=True, help="Whose capability, without the p- prefix.")
+@click.option(
+    "--kind",
+    type=click.Choice(list(walle_profiles.CAPABILITY_KINDS)),
+    required=True,
+    help="What kind of capability it is. shared/ holds nothing else (D33).",
+)
+@click.argument("source")
+def profiles_publish_command(root: Path, principal: str, kind: str, source: str) -> None:
+    """Copy SOURCE, a file inside your own profile folder, into shared/KIND/.
+
+    Only a folder's owner publishes from it: SOURCE is read inside --principal's folder and
+    nowhere else. Nothing already in shared/ is replaced.
+    """
+    if not walle_profiles.enabled():
+        raise click.ClickException(walle_profiles.OFF_MESSAGE)
+    try:
+        done = walle_profiles.publish(
+            walle_profiles.bind(root, principal),
+            source,
+            kind,  # type: ignore[arg-type]  # click.Choice narrows it to CAPABILITY_KINDS
+        )
+    except _PROFILE_ERRORS as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"{done.principal}: published {done.source.name} to {done.path}")
+
+
+# --- OS user permissions (issue #105, D110) ------------------------------------------------------
+
+
+def _owner_spec(
+    _ctx: click.Context, _param: click.Parameter, value: tuple[str, ...]
+) -> dict[str, walle_osusers.Owner]:
+    owners: dict[str, walle_osusers.Owner] = {}
+    for spec in value:
+        principal, sep, owner = spec.partition("=")
+        if not sep or not principal or not owner:
+            raise click.BadParameter(f"{spec!r} is not <principal>=<user>[:<group>]")
+        try:
+            owners[principal] = walle_osusers.Owner.parse(owner)
+        except ValueError as exc:
+            raise click.BadParameter(str(exc)) from exc
+    return owners
+
+
+@profiles_group.command("owners")
+@_ROOT
+@click.option(
+    "--owner",
+    "owners",
+    multiple=True,
+    required=True,
+    callback=_owner_spec,
+    metavar="PRINCIPAL=USER[:GROUP]",
+    help="A principal and the OS user (and group) that must own its folder. One per principal.",
+)
+@click.option(
+    "--shared-group",
+    default=None,
+    help="The household group that shared/ belongs to; shared/ is judged only when given.",
+)
+def profiles_owners_command(
+    root: Path, owners: dict[str, walle_osusers.Owner], shared_group: str | None
+) -> None:
+    """Check, read-only, that each profile folder is owned by its own OS user (D110).
+
+    Reports every folder or file with the wrong owner, group or mode, by name. Opens no file
+    and changes nothing: making users and handing folders to them is the owner's own step.
+    Exit 0 when clean, 1 when there is a finding or a folder could not be listed.
+    """
+    if not walle_osusers.enabled():
+        raise click.ClickException(walle_osusers.OFF_MESSAGE)
+    try:
+        shared = walle_osusers.group_id(shared_group) if shared_group else None
+        report = walle_osusers.check(root, owners, shared=shared)
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    for finding in report.findings:
+        click.echo(
+            f"{finding.path}: {finding.problem} — expected {finding.expected}, "
+            f"found {finding.actual}"
+        )
+    for folder in report.unlisted:
+        click.echo(f"{folder}: not listed (permission denied); its contents were not checked")
+    if report.clean:
+        click.echo(f"clean: {_plural(report.checked, 'item')} checked, as D110 wants them")
+        return
+    click.echo(
+        f"{_plural(len(report.findings), 'finding')}, "
+        f"{_plural(len(report.unlisted), 'folder')} not listed, "
+        f"{_plural(report.checked, 'item')} checked"
+    )
+    raise SystemExit(1)

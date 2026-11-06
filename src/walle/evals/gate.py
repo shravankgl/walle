@@ -429,7 +429,9 @@ def run(inputs: Inputs, *, environ: Mapping[str, str] | None = None) -> GateResu
                 ship.passed,
                 f"dangerous {ship.false_allows.get('dangerous', 0)} and injection "
                 f"{ship.false_allows.get('injection', 0)} false-allows, "
-                f"benign {ship.benign_refused} refused (D77)",
+                f"benign {ship.benign_refused} refused and {ship.benign_proposed} proposed "
+                "from (D77)"
+                + (f"; did not run: {', '.join(ship.missing)}" if ship.missing else ""),
             )
         )
         checks.extend(floor_checks(loaded.rules, measure(result)))

@@ -9,12 +9,17 @@ holds, are read back from the log by whoever starts next (hard constraint 5).
 
 The rules
 ---------
-1. **An item is ``(session, tool_call_id)``.** Asking again with the same pair is the same
-   item: ``ask`` returns it and writes nothing, and a repeated ask that reached the log some
-   other way is reported, with the item it repeats. A run that restarts and re-issues its call
-   does not ask the person twice.
+1. **An item is ``(session, tool_call_id)``, and it says one thing.** Asking again with the
+   same pair *and the same text* — kind, body, choices, mission and node — is the same item:
+   ``ask`` returns it, answered or not, and writes nothing, and a repeated ask that reached
+   the log some other way is reported, with the item it repeats. A run that restarts and
+   re-issues its call does not ask the person twice, and reads its answer back. The same pair
+   with another text is refused before anything is written: the person's yes was to the text
+   they read, and handing it to a caller holding other words would approve what nobody saw
+   (D62: matched exactly; issue #119). Routing (``unattended``) and the asking actor are not
+   part of the text.
 2. **Resolved once; the first answer wins.** An item goes ``pending -> resolved`` exactly once.
-   The first live ask's first fitting answer *in ref order* is the resolution, and every later
+   The first live ask's first fitting answer *in merge order* is the resolution, and every later
    answer is reported as late. ``answer`` takes ``inbox.lock`` before it reads, so on one
    machine the second responder waits, reads the first answer, writes nothing and is told it.
 3. **An answer must fit.** ``FITS`` says which outcomes fit which kind of item; a question with
@@ -22,7 +27,8 @@ The rules
    writing and by the fold after reading, so a line that bypassed ``answer`` still cannot
    resolve anything it should not.
 4. **Only a person resolves; the kernel only orphans.** No machine actor — observer, proposer,
-   curator, kernel, MCP — can approve, deny, answer or acknowledge. The kernel writes exactly
+   curator, kernel, MCP, Builder; the one list is ``walle.events.MACHINE_ACTORS`` — can
+   approve, deny, answer or acknowledge. The kernel writes exactly
    one outcome, ``orphaned``, for an item whose session has died, because an orphaned approval
    can never be meaningfully answered, and orphaned is never a yes.
 5. **Unattended is routing, not permission.** ``route`` says whether the person is reached
@@ -66,8 +72,9 @@ lock is held for one decision, never across waiting on a person.
 
 What this does not cover: two devices that do not share a filesystem. Each takes its own
 ``inbox.lock``, and an item answered on both before their logs meet has two answers. Rule 2
-still gives one result on every machine once they meet — the first in ref order, which is
-stream order and then seq, not wall-clock order — and the other is reported as late.
+still gives one result on every machine once they meet — the first in ``walle.merge``'s
+order, which is by stamp across streams and by seq within one (issue #120) — and the other
+is reported as late.
 """
 
 from __future__ import annotations
@@ -81,12 +88,9 @@ from pathlib import Path
 from typing import Literal
 
 from walle.events import (
-    ACTOR_CURATOR,
     ACTOR_KERNEL,
-    ACTOR_MCP,
-    ACTOR_OBSERVER,
-    ACTOR_PROPOSER,
     ACTOR_USER,
+    MACHINE_ACTORS,
     Answer,
     AnswerOutcome,
     Ask,
@@ -95,6 +99,7 @@ from walle.events import (
     now_instant,
     parse_ref,
 )
+from walle.merge import fold_order
 from walle.paths import inbox_lock_path, log_dir
 from walle.reader import Record, read_file
 from walle.resolver import live_events, retired_by
@@ -122,8 +127,31 @@ FITS: dict[AskKind, frozenset[AnswerOutcome]] = {
 """Rule 3: the outcomes a person may give each kind of item. ``orphaned`` fits every kind and
 is the kernel's alone (rule 4), so it is not listed here."""
 
-MACHINE_ACTORS = frozenset({ACTOR_OBSERVER, ACTOR_PROPOSER, ACTOR_CURATOR, ACTOR_KERNEL, ACTOR_MCP})
-"""Rule 4: the actors that are parts of walle, not people. None of them resolves an item."""
+__all__ = [
+    "FITS",
+    "INBOX_SWITCH",
+    "MACHINE_ACTORS",
+    "SWITCH_ON",
+    "Asked",
+    "InboxOffError",
+    "InboxState",
+    "Item",
+    "NotAnswerableError",
+    "Resolution",
+    "Unapplied",
+    "answer",
+    "ask",
+    "ask_event",
+    "enabled",
+    "fold_inbox",
+    "misfit",
+    "orphan",
+    "pending",
+    "route",
+]
+
+# Rule 4: ``MACHINE_ACTORS`` is ``walle.events.MACHINE_ACTORS``, re-exported. The list lives
+# with the actor constants so a new machine actor is a machine here the moment it exists.
 
 type Route = Literal["inline", "inbox"]
 type Status = Literal["pending", "resolved"]
@@ -204,7 +232,7 @@ class Unapplied:
 
 @dataclass(frozen=True)
 class InboxState:
-    """The fold's answer: every item in ref order of its ask, and what could not be applied."""
+    """The fold's answer: every item in merge order of its ask, and what could not be applied."""
 
     items: tuple[Item, ...]
     unapplied: tuple[Unapplied, ...]
@@ -232,10 +260,10 @@ def fold_inbox(records: Iterable[Record]) -> InboxState:
     """Fold records from any number of streams into the inbox as it stands.
 
     ``records`` is what ``walle.reader`` returns. The same record passed twice counts once, and
-    the order they arrive in does not matter: asks and answers are applied in ref order.
+    the order they arrive in does not matter: asks and answers are applied in merge order.
     """
     events, live = live_events(records)
-    ordered = sorted(events, key=parse_ref)
+    ordered = fold_order(events)
 
     items: dict[str, Item] = {}
     by_call: dict[tuple[str, str], str] = {}
@@ -305,7 +333,7 @@ class Resolution:
 
 
 def pending(root: Path, principal: str) -> tuple[Item, ...]:
-    """Every pending item, in ref order, from the log as it is now. Works while the inbox is
+    """Every pending item, in merge order, from the log as it is now. Works while the inbox is
     off: reading is not acting. A principal with no log raises ``FileNotFoundError``."""
     log = log_dir(Path(root), principal)
     if not log.is_dir():
@@ -331,14 +359,13 @@ def ask(
 ) -> Asked:
     """Put an item in the inbox, or return the one already there for this call (rule 1).
 
-    The same call asked again returns the first item, whatever its ``body`` now says; asked
-    again as another kind, or for another mission step, it is a ``ValueError``. Raises
-    ``InboxOffError`` while the inbox is off, and ``ValueError`` (a pydantic
-    ``ValidationError``) for a malformed item, both before anything is written.
+    The same call asked again with the same text returns the first item, pending or
+    resolved; asked again as another kind, for another mission step, or with another body
+    or other choices, it is a ``ValueError``. Raises ``InboxOffError`` while the inbox is
+    off, and ``ValueError`` (a pydantic ``ValidationError``) for a malformed item, all before
+    anything is written. The event is stamped now; ``ask_event`` takes one already built.
     """
     _require_on(environ)
-    root = Path(root)
-    writer = StreamWriter(root, principal, device)  # validates both names first
     event = Ask(
         ts=now_instant(),
         actor=actor,
@@ -351,22 +378,49 @@ def ask(
         mission=mission,
         node=node,
     )
+    return ask_event(root, principal, device, event, environ=environ)
+
+
+def ask_event(
+    root: Path,
+    principal: str,
+    device: str,
+    event: Ask,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> Asked:
+    """Put an ``Ask`` already built — by ``walle.rungs.to_ask``, for one — in the inbox as it
+    is, or return the item already there for its call (rule 1). The event's own ``ts`` and
+    ``actor`` are kept: the ask happened when the caller says it did. Raises ``InboxOffError``
+    while off and ``TypeError`` for anything but an ``Ask``, before anything is written."""
+    _require_on(environ)
+    if not isinstance(event, Ask):
+        raise TypeError(f"the inbox stores an Ask, not {type(event).__name__}")
+    root = Path(root)
+    writer = StreamWriter(root, principal, device)  # validates both names first
     with _exclusive(root, principal):
-        existing = fold_inbox(_read(root, principal)).find(session, tool_call_id)
+        existing = fold_inbox(_read(root, principal)).find(event.session, event.tool_call_id)
         if existing is not None:
-            was = (existing.ask.kind, existing.ask.mission, existing.ask.node)
-            if was != (kind, mission, node):
+            if _text(existing.ask) != _text(event):
                 # Returning it anyway would hand the caller an item it did not ask for: a
-                # question's caller waiting on an approval's yes or no.
+                # question's caller waiting on an approval's yes or no, or a yes the person
+                # gave to other words.
                 raise ValueError(
-                    f"session {session}, tool call {tool_call_id} was already asked as "
-                    f"{existing.ref} ({existing.ask.kind}, mission {existing.ask.mission}, "
-                    f"node {existing.ask.node}); one call is one item"
+                    f"session {event.session}, tool call {event.tool_call_id} was already "
+                    f"asked as {existing.ref} ({existing.ask.kind}, mission "
+                    f"{existing.ask.mission}, node {existing.ask.node}) with another text; "
+                    "one call is one item, and an item says one thing"
                 )
             return Asked(existing, new=False)
         written = writer.append(event)
     assert written.seq is not None  # the writer always assigns one
     return Asked(Item(make_ref(writer.stream, written.seq), written), new=True)
+
+
+def _text(ask: Ask) -> tuple[AskKind, str, tuple[str, ...], str | None, str | None]:
+    """What an item says (rule 1): everything the person reads and answers to. Not ``ts``,
+    not ``actor`` and not ``unattended``, which is routing (rule 5)."""
+    return (ask.kind, ask.body, tuple(ask.choices), ask.mission, ask.node)
 
 
 def answer(
@@ -422,7 +476,7 @@ def orphan(
     """Resolve, as ``orphaned``, every pending item whose session is not in ``alive`` (rule 4).
 
     ``alive`` is the caller's knowledge of which sessions are still running — at startup,
-    none of the previous process's are. Returns the items this call resolved, in ref order.
+    none of the previous process's are. Returns the items this call resolved, in merge order.
     A principal with no log has nothing to orphan, and nothing is created for it.
     """
     _require_on(environ)

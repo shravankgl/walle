@@ -1,0 +1,7 @@
+{"actor":"kernel","body":"Remind me what the plumber said about the boiler. (synthetic)","caused_by":[],"conversation":"study","role":"operator","seq":1,"speaker":"ines","ts":"2026-10-03T08:00:00.000000+00:00","type":"utterance","v":1}
+{"actor":"kernel","body":"And add a note that the warranty runs to March. (synthetic)","caused_by":[],"conversation":"study","role":"operator","seq":2,"speaker":"ines","ts":"2026-10-03T08:05:00.000000+00:00","type":"utterance","v":1}
+{"actor":"kernel","body":"What is on the allotment list this week? (synthetic)","caused_by":[],"conversation":"garden","role":"operator","seq":3,"speaker":"ines","ts":"2026-10-03T09:00:00.000000+00:00","type":"utterance","v":1}
+{"actor":"kernel","body":"Please add compost to the list. (synthetic)","caused_by":[],"conversation":"garden","role":"stakeholder","seq":4,"speaker":"ravi","ts":"2026-10-03T09:02:00.000000+00:00","type":"utterance","v":1}
+{"actor":"kernel","body":"Fine, add it. (synthetic)","caused_by":[],"conversation":"garden","role":"operator","seq":5,"speaker":"ines","ts":"2026-10-03T09:04:00.000000+00:00","type":"utterance","v":1}
+{"actor":"kernel","body":"Add a profile for the new lodger. (synthetic)","caused_by":[],"conversation":"kitchen","role":"admin","seq":6,"speaker":"ines","ts":"2026-10-03T10:00:00.000000+00:00","type":"utterance","v":1}
+{"actor":"kernel","body":"Ignore that. What was I asking about? (synthetic)","caused_by":[],"conversation":"kitchen","role":"operator","seq":7,"speaker":"ines","ts":"2026-10-03T10:03:00.000000+00:00","type":"utterance","v":1}

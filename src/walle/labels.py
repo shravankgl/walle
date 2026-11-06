@@ -24,9 +24,10 @@ the principal's own name. Everything else is text from a non-principal:
 
 Two things never count as the principal's own, whatever the actor says. An **observation**
 is the transcript: the assistant's replies and tool output are in its body however the row
-is attributed. A **reserved actor** (``RESERVED_ACTORS``: the observer, the proposer, the
-curator, the kernel and the MCP server) is never a person, so a principal who shares such a
-name does not make that actor's words their own. ``mcp_server`` refuses such a name at
+is attributed. A **reserved actor** (``RESERVED_ACTORS``, which is
+``walle.events.MACHINE_ACTORS``: the observer, the proposer, the curator, the kernel, the
+MCP server and the Builder) is never a person, so a principal who shares such a name does
+not make that actor's words their own. ``mcp_server`` refuses such a name at
 start-up; the label does not rely on that.
 
 A human keep on top of any of those does not launder it: the assertion's closure still holds
@@ -58,12 +59,8 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 
 from walle.events import (
-    ACTOR_CURATOR,
-    ACTOR_KERNEL,
-    ACTOR_MCP,
-    ACTOR_OBSERVER,
-    ACTOR_PROPOSER,
     ACTOR_USER,
+    MACHINE_ACTORS,
     AnyEvent,
     Observation,
 )
@@ -78,11 +75,10 @@ USER_IDENTITY = "user-identity"
 _RANK = {PUBLIC: 0, PRIVATE: 1, USER_IDENTITY: 2}
 """Confidentiality, least to most restrictive. The combination is the maximum."""
 
-RESERVED_ACTORS = frozenset(
-    {ACTOR_OBSERVER, ACTOR_PROPOSER, ACTOR_CURATOR, ACTOR_KERNEL, ACTOR_MCP}
-)
+RESERVED_ACTORS = MACHINE_ACTORS
 """Actors that are never a person. Their words are never the principal's own, even for a
-principal of the same name."""
+principal of the same name. The one list in ``walle.events`` (issue #119), not a copy: a
+copy here missed the Builder (issue #131, finding 4.2)."""
 
 
 def closure(events: Mapping[str, AnyEvent], ref: str) -> frozenset[str]:

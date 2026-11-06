@@ -35,6 +35,16 @@ real prompt, so it is complete in one of two ways:
 The closing entry is the *last* such entry, not the first: a message split into entries that
 each say ``end_turn``, or a reply that a hook continues, is read to its end.
 
+Rule 2 also waits for a file still being written (issue #129, finding 2.3). A transcript whose
+last line is torn, and which changed within ``transcript.TAIL_GRACE`` seconds, is **growing**:
+the torn line is Claude Code mid-write, and it hangs off the file's last entry. If that entry
+is inside the turn (below the prompt, on the main thread), what the tail holds may continue
+the turn, so the turn is pending until the tail lands or the file goes quiet. Observing it
+now and again after the tail landed would be two observations of one turn: the content key
+below would differ, and D92's fold would not catch it. A tear older than the grace is a
+crash, not a write; the turn above it is final and is observed. Rule 1 is unaffected: once
+the person has spoken again, the turn above their prompt cannot grow.
+
 ``tool_use`` and ``pause_turn`` mean more is coming. An unknown reason counts as more coming,
 so a new reason in a later build delays an observation and never invents one. An assistant
 entry still streaming, with ``stop_reason`` still ``null``, produces nothing, and neither do
@@ -70,10 +80,18 @@ on the event, which is a schema change (D88, D96).
 
 What an observation holds
 -------------------------
-* ``body``: one line per content block along the path from the prompt to the entry that
-  closed the turn. ``user:`` lines are the prompt's text. ``assistant:`` lines are text
-  replies and ``[tool: <name>]`` markers. Thinking, tool inputs and tool results are left
-  out. A block that repeats, unchanged, in a later entry of the same message is read once.
+* ``body``: the person's block, then one line per reply block along the path from the
+  prompt to the entry that closed the turn. The prompt is **one** ``user:`` block: its first
+  line labelled, every further line of it (a second line of text, a second text block, an
+  ``[image]`` marker) unlabelled below it. ``hazards.forged_turn`` reads a ``user:`` label
+  after an unlabelled line as a forged turn, and the observer must never write that shape
+  for the person's own words (issue #129, finding 2.4). ``assistant:`` lines are text
+  replies and ``[tool: <name>]`` markers, one per block. Thinking, tool inputs and tool
+  results are left out. A block that repeats, unchanged, in a later entry of the same
+  message is read once, and so is a text block that a later entry of the same message holds
+  a longer version of: entries that each carry the text so far are snapshots of one block,
+  not pieces of it, and only the last is the reply (issue #129, finding 2.2). Two messages
+  are never folded into each other, however alike they start.
 * ``observed_at``: the closing entry's timestamp, the transcript's own time (D93).
 * ``ts``: when the log learns it. That is now, once for the whole run, unless the caller
   gives one.
@@ -204,10 +222,11 @@ def observe(transcripts: Transcripts, *, ts: str | None = None) -> ObserveReport
     stamp = now_instant() if ts is None else ts
     turns: list[ObservedTurn] = []
     pending: list[str] = []
+    open_ends = _open_ends(transcripts)
     for entry in transcripts.walk():
         if not _is_prompt(entry):
             continue
-        closing = _closing(transcripts, entry.uuid)
+        closing = _closing(transcripts, entry.uuid, open_ends)
         if closing is None:
             pending.append(entry.uuid)
             continue
@@ -260,15 +279,25 @@ def _is_prompt(entry: TranscriptEntry) -> bool:
 # --- finding the end of a turn ------------------------------------------------------------
 
 
-def _closing(transcripts: Transcripts, prompt: str) -> TranscriptEntry | None:
+def _open_ends(transcripts: Transcripts) -> frozenset[str]:
+    """The last entry of each growing file: where a line still being written hangs."""
+    return frozenset(uuid for uuid in transcripts.growing.values() if uuid is not None)
+
+
+def _closing(
+    transcripts: Transcripts, prompt: str, open_ends: frozenset[str] = frozenset()
+) -> TranscriptEntry | None:
     """The entry that completes the turn started at ``prompt``, or ``None`` if none does yet.
 
     Depth first, in the walk's own child order, so "first" and "last" mean what they mean in
     ``Transcripts.walk``. The search stops at the next prompt and never enters a sidechain.
+    ``open_ends`` are the entries a line still being written may hang from (``_open_ends``):
+    a turn that reaches one may still grow, so rule 2 does not close it.
     """
     entries = transcripts.entries
     next_prompts: list[str] = []
     last: TranscriptEntry | None = None  # the last main-thread user or assistant line
+    may_grow = False
     stack = list(reversed(transcripts.children.get(prompt, ())))
     while stack:
         uuid = stack.pop()
@@ -278,6 +307,8 @@ def _closing(transcripts: Transcripts, prompt: str) -> TranscriptEntry | None:
         if _is_prompt(entry):
             next_prompts.append(uuid)
             continue
+        if uuid in open_ends:
+            may_grow = True
         if entry.type in ("user", "assistant"):
             last = entry
         stack.extend(reversed(transcripts.children.get(uuid, ())))
@@ -288,6 +319,7 @@ def _closing(transcripts: Transcripts, prompt: str) -> TranscriptEntry | None:
             return above
     if (  # rule 2: the reply has ended, and nothing after it says more is coming
         last is not None
+        and not may_grow
         and last.type == "assistant"
         and _message(last).get("stop_reason") in _FINAL_STOP_REASONS
     ):
@@ -326,35 +358,72 @@ def _path(transcripts: Transcripts, prompt: str, closing: str) -> list[Transcrip
 
 
 def _body(path: Iterable[TranscriptEntry]) -> str:
+    read = [
+        entry
+        for entry in path
+        if not entry.is_sidechain
+        and (entry.type == "assistant" or (entry.type == "user" and _is_prompt(entry)))
+    ]  # a tool result, a meta line: not the person, and not the reply
+    snapshots = _text_snapshots(read)
     lines: list[str] = []
     seen: set[tuple[str, str]] = set()
-    for entry in path:
-        if entry.is_sidechain or entry.type not in ("user", "assistant"):
+    for index, entry in enumerate(read):
+        if entry.type == "user":
+            parts = [p for p in (_part("user", block) for block in _blocks(entry)) if p]
+            if parts:
+                lines.append("user: " + "\n".join(parts))
             continue
-        if entry.type == "user" and not _is_prompt(entry):
-            continue  # a tool result, a meta line: not the person, and not the reply
         message_id = _message(entry).get("id")
         for block in _blocks(entry):
-            line = _line(entry.type, block)
-            if line is None:
+            part = _part("assistant", block)
+            if part is None:
                 continue
             if isinstance(message_id, str):
                 key = (message_id, json.dumps(block, sort_keys=True, default=str))
-                if key in seen:
+                if key in seen or _superseded(snapshots, message_id, index, block):
                     continue
                 seen.add(key)
-            lines.append(line)
+            lines.append(f"assistant: {part}")
     return "\n".join(lines)
 
 
-def _line(role: str, block: Mapping[str, Any]) -> str | None:
+def _text_snapshots(read: list[TranscriptEntry]) -> dict[str, list[tuple[int, str]]]:
+    """Every reply text block on the path, by message id, with the index of its entry."""
+    found: dict[str, list[tuple[int, str]]] = {}
+    for index, entry in enumerate(read):
+        message_id = _message(entry).get("id")
+        if entry.type != "assistant" or not isinstance(message_id, str):
+            continue
+        for block in _blocks(entry):
+            if block.get("type") == "text" and (value := _text_of(block)) is not None:
+                found.setdefault(message_id, []).append((index, value))
+    return found
+
+
+def _superseded(
+    snapshots: Mapping[str, list[tuple[int, str]]],
+    message_id: str,
+    index: int,
+    block: Mapping[str, Any],
+) -> bool:
+    """Whether a later entry of the same message holds a longer version of this text block:
+    then this one is the text so far, and the later one is the block."""
+    if block.get("type") != "text" or (value := _text_of(block)) is None:
+        return False
+    return any(
+        later > index and len(longer) > len(value) and longer.startswith(value)
+        for later, longer in snapshots.get(message_id, ())
+    )
+
+
+def _part(role: str, block: Mapping[str, Any]) -> str | None:
+    """What one block contributes to the body, without its label."""
     kind = block.get("type")
     if kind == "text":
-        value = _text_of(block)
-        return None if value is None else f"{role}: {value}"
+        return _text_of(block)
     if kind == "image":
-        return f"{role}: [image]"
+        return "[image]"
     if kind == "tool_use" and role == "assistant":
         name = block.get("name")
-        return f"{role}: [tool: {name if isinstance(name, str) and name else 'unnamed'}]"
+        return f"[tool: {name if isinstance(name, str) and name else 'unnamed'}]"
     return None  # thinking, tool input and output, and anything not yet known
