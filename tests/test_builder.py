@@ -291,8 +291,10 @@ def test_the_builder_has_no_way_to_start_a_process_of_its_own() -> None:
     ]
     # A job is data; ``run`` is the one door. ``enabled`` is asked first so an executor the
     # owner has not turned on leaves no mission and no step in the log, and ``Refusal`` is
-    # the answer it gives then (#121).
-    assert sorted(executor_calls) == ["Job", "Refusal", "enabled", "run"]
+    # the answer it gives then (#121). ``check_workspace`` is the executor's own rule for
+    # the mount, asked before the lock so a workspace it would refuse leaves nothing either
+    # (#130); it stats a folder and starts nothing.
+    assert sorted(executor_calls) == ["Job", "Refusal", "check_workspace", "enabled", "run"]
     assert not {"exec", "eval", "compile", "__import__"} & {
         n.func.id
         for n in ast.walk(tree)

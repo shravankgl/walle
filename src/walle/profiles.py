@@ -72,7 +72,11 @@ Fusion (D28)
 those records. The Curator already reads one folder per run (``walle.curator.curate`` takes
 one principal); D32 made D28 a filesystem fact, and this module adds the handle a background
 job reads through so the fact holds for jobs too. Nothing here, and nothing in the Curator,
-takes two principals.
+takes two principals. Every file the index touches goes through ``resolve`` first and must be
+plain (``INDEX_FILES``: ``log/``, each stream, ``index.sqlite``, ``index.lock`` and the SQLite
+sidecars), so a link at any of them — ``index.sqlite -> ../p-sam/index.sqlite``, which would
+hand Sam's rows to Ada's digest and write Ada's events into Sam's index, or a lock that
+creates a file in another folder — is refused before the index opens anything (#130).
 
 Roles (D27)
 -----------
@@ -150,6 +154,15 @@ from walle.writer import StreamWriter
 
 if TYPE_CHECKING:
     from walle.reader import Record
+
+INDEX_FILES: tuple[str, ...] = (
+    INDEX_FILENAME,
+    INDEX_LOCK_FILENAME,
+    *(f"{INDEX_FILENAME}{suffix}" for suffix in index.SIDECARS),
+)
+"""Every file the index reads, writes or creates in a profile folder beside ``log/``: the
+index, its lock, and the sidecars SQLite makes by name next to the index. ``records``
+resolves each and requires it plain before ``walle.index`` runs (#130)."""
 
 __all__ = [
     "CAPABILITY_KINDS",
@@ -554,12 +567,22 @@ class Profile:
         """This folder's log, indexed and up to date: the only input fusion gets (D28).
 
         ``log/`` and every stream file in it are resolved first, so a stream that is a link
-        into another folder is refused before the index reads a byte of it.
+        into another folder is refused before the index reads a byte of it. So is every
+        file the index itself touches (``INDEX_FILES``), and each of those must be plain:
+        the index is this folder's derived data and its lock is this folder's, so a link
+        standing at either — into another principal's folder, or into ``hot/`` of this one
+        — is refused before ``index.update`` opens or creates anything (#130).
         """
         log = self.path(LOG_DIRNAME)
         if log.is_dir():
             for entry in sorted(os.listdir(log)):
                 self.resolve(os.path.join(LOG_DIRNAME, entry))
+        for name in INDEX_FILES:
+            if not self.resolve(name).plain:
+                raise CrossPrincipalError(
+                    f"{self.principal!r}: {name!r} is a link; the index is this folder's own "
+                    "derived data and is reached through no link; refused"
+                )
         return index.update(self.context.root, self.context.principal).records
 
     def resolution(self) -> Resolution:
