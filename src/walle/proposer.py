@@ -211,9 +211,10 @@ class Request:
     contains every item. ``marker`` is the envelope id, random per request (D55).
     """
 
-    kind: Literal["propose", "judge", "curate"]
-    """``curate`` is the Curator's (``walle.curator``): the same envelope and marker rule,
-    its own instructions."""
+    kind: Literal["propose", "judge", "curate", "maintain"]
+    """``curate`` is the Curator's (``walle.curator``) and ``maintain`` the model maintenance
+    pass's (``walle.maintenance``): the same envelope and marker rule, their own
+    instructions."""
     marker: str
     items: tuple[tuple[str, str], ...]
     prompt: str
