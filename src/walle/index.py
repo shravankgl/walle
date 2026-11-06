@@ -122,6 +122,11 @@ INDEX_SCHEMA = 1
 """The shape of the tables below. A file with any other value is rebuilt, never migrated:
 there is nothing in it the log does not have (D10, D111)."""
 
+SIDECARS: tuple[str, ...] = ("-journal", "-wal", "-shm")
+"""What SQLite makes beside the index file, by name: the rollback journal, the write-ahead log
+and its shared memory. ``_remove`` deletes them with the index, and ``walle.profiles`` resolves
+each before a build, so a link standing at one is refused rather than written through (#130)."""
+
 _CUT_ATTEMPTS = 5
 _BUSY_TIMEOUT_S = 10.0
 _BUSY = frozenset({"SQLITE_BUSY", "SQLITE_LOCKED"})
@@ -241,6 +246,7 @@ def load_records(root: Path, principal: str) -> tuple[Record, ...]:
     root = Path(root)
     path = index_path(root, principal)
     with _shared(index_lock_path(root, principal)):
+        _plain(path)
         if not path.is_file():
             raise FileNotFoundError(f"{path}: no index yet. Run `walle rebuild`.")
         try:
@@ -290,6 +296,7 @@ def ancestors(root: Path, principal: str, ref: str) -> tuple[tuple[str, int, Any
     root = Path(root)
     path = index_path(root, principal)
     with _shared(index_lock_path(root, principal)):
+        _plain(path)
         if not path.is_file():
             raise FileNotFoundError(f"{path}: no index yet. Run `walle rebuild`.")
         with contextlib.closing(_connect(path, mode="ro")) as db:
@@ -361,6 +368,7 @@ def _build(root: Path, principal: str, *, full: bool) -> IndexReport:
     path = index_path(root, principal)
 
     with _exclusive(index_lock_path(root, principal)):
+        _plain(path)  # a linked index.sqlite is refused before it is opened or removed (#130)
         cut = _read_cut(log)  # raises FutureSchemaError / CorruptStreamError, index untouched
         dangling = _dangling(cut)
         if dangling:
@@ -385,26 +393,60 @@ def _build(root: Path, principal: str, *, full: bool) -> IndexReport:
     )
 
 
+def _plain(path: Path) -> None:
+    """Refuse an index file, or a sidecar beside it, that is a link. The index is one
+    principal's derived data, in that principal's folder; a link at its name points the
+    build, and every reader, at another file — another principal's index — and a link at a
+    sidecar's name is where SQLite would then write by that name (#130). ``ValueError``,
+    like a stream file that cannot be named."""
+    for file in (path, *(path.with_name(path.name + s) for s in SIDECARS)):
+        if file.is_symlink():
+            raise ValueError(
+                f"{file}: {file.name} is a link; the index is read and written through no link"
+            )
+
+
+_LOCK_WRITE = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
+"""How a builder opens ``index.lock``: append (never truncates, and the file stays empty),
+created if need be, and ``O_NOFOLLOW`` so a link standing where the lock belongs is refused
+rather than followed to wherever it points (#130)."""
+
+
+def _open_lock(lock: Path, flags: int) -> int:
+    try:
+        return os.open(lock, flags, 0o644)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ValueError(
+                f"{lock}: {lock.name} is a link; the lock is this folder's own file and is "
+                "opened through no link"
+            ) from None
+        raise
+
+
 @contextlib.contextmanager
 def _exclusive(lock: Path) -> Iterator[None]:
     """Hold ``index.lock`` exclusively: one builder per principal at a time."""
-    with open(lock, "ab") as f:  # "a": opening never truncates, and the file stays empty
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+    fd = _open_lock(lock, _LOCK_WRITE)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
         yield
-        # The lock goes with close.
+    finally:
+        os.close(fd)  # the lock goes with it
 
 
 _CANNOT_CREATE = frozenset({errno.EACCES, errno.EPERM, errno.EROFS, errno.ENOENT})
 
 
 def _open_for_shared_lock(lock: Path) -> int | None:
-    """``index.lock`` opened read-only, created if need be, or ``None`` if it cannot be."""
+    """``index.lock`` opened read-only, created if need be, or ``None`` if it cannot be.
+    ``O_NOFOLLOW`` both times: a link where the lock belongs is refused, not followed."""
     try:
-        return os.open(lock, os.O_RDONLY | os.O_CLOEXEC)
+        return _open_lock(lock, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except FileNotFoundError:
         pass
     try:
-        return os.open(lock, os.O_RDONLY | os.O_CREAT | os.O_CLOEXEC, 0o644)
+        return _open_lock(lock, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError as exc:
         if exc.errno in _CANNOT_CREATE:
             return None
@@ -554,7 +596,7 @@ def _remove(path: Path) -> None:
     The journal goes too: a hot journal left beside a *new* file of the same name would be
     "rolled back" into it on the next open, writing an old file's pages into a new one.
     """
-    for leftover in (path, *(path.with_name(path.name + s) for s in ("-journal", "-wal", "-shm"))):
+    for leftover in (path, *(path.with_name(path.name + s) for s in SIDECARS)):
         leftover.unlink(missing_ok=True)
 
 
