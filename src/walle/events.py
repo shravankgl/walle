@@ -907,8 +907,10 @@ class Utterance(Event):
     the kernel **verified** for the message — the principal's name when the platform's id
     resolves to one, the platform's id otherwise — never a display name and never anything
     the message says about itself. ``role`` is the role the kernel attached to that speaker
-    for this message, or ``None`` when it could attach none: an unknown speaker is the
-    lowest role. ``body`` is the words, kept as data.
+    for this message **in this folder**: the principal's own role, or ``None`` for anyone who
+    is not the principal — a role is a fact about one profile, and another principal's is
+    not kept here (§7, #122) — and ``None`` when it could attach none: an unknown speaker is
+    the lowest role. ``body`` is the words, kept as data.
 
     The context ratchet is a fold over these: the lowest role that has ever spoken in a
     conversation, from the log, so that a restart cannot reset it (D61). There is no

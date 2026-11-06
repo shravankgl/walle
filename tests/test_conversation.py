@@ -66,6 +66,7 @@ GOLDEN = Path(__file__).parent / "fixtures" / "v1" / "conversation"
 
 ADA = Speaker("ada", Role.OPERATOR)
 ADA_ADMIN = Speaker("ada", Role.ADMIN)
+ADA_STAKEHOLDER = Speaker("ada", Role.STAKEHOLDER)
 SAM = Speaker("sam", Role.OPERATOR)
 SAM_STAKEHOLDER = Speaker("sam", Role.STAKEHOLDER)
 GUEST = Speaker("platform:U0G7", None)
@@ -294,9 +295,11 @@ def test_a_speaker_id_cannot_carry_a_frame_of_its_own() -> None:
 def test_a_lower_role_cannot_load_higher_files_later_in_the_same_conversation(
     tmp_path: Path,
 ) -> None:
-    """The verify criterion."""
+    """The verify criterion. Since #122 a speaker who is not the principal is the bottom tier
+    whatever their role, so the stakeholder step here is Ada's own; Sam's turns are in
+    ``test_audit_conversation``."""
     root = _root(tmp_path)
-    first, second, third = _talk(root, ADA, SAM_STAKEHOLDER, ADA)
+    first, second, third = _talk(root, ADA, ADA_STAKEHOLDER, ADA)
 
     assert first.conversation.floor is Tier.OPERATOR
     assert first.files == hot.ORDER
@@ -332,7 +335,7 @@ def test_a_role_change_mid_conversation_ratchets_and_never_recovers(tmp_path: Pa
 
 def test_the_floor_only_ever_goes_down(tmp_path: Path) -> None:
     root = _root(tmp_path)
-    speakers = [ADA, SAM_STAKEHOLDER, ADA, ADA_ADMIN, GUEST, ADA, SAM, ADA_ADMIN, ADA]
+    speakers = [ADA, ADA_STAKEHOLDER, ADA, ADA_ADMIN, GUEST, ADA, SAM, ADA_ADMIN, ADA]
     turns = _talk(root, *speakers)
     floors = [t.conversation.floor for t in turns]
     assert floors == [
@@ -391,7 +394,7 @@ def test_conversations_ratchet_independently(tmp_path: Path) -> None:
     assert only.files == hot.ORDER
     assert _open(root, "chat-1").floor is Tier.UNKNOWN
     assert _open(root, "chat-2").floor is Tier.OPERATOR
-    assert fold(_records(root)) == {"chat-1": Tier.UNKNOWN, "chat-2": Tier.OPERATOR}
+    assert fold(_records(root), principal=P) == {"chat-1": Tier.UNKNOWN, "chat-2": Tier.OPERATOR}
 
 
 # --- the ratchet is folded from the log, so a restart cannot reset it --------------------
@@ -402,7 +405,7 @@ def test_a_rebuild_after_a_ratchet_finds_the_same_floor(tmp_path: Path) -> None:
     From the JSONL, from a rebuilt index, from an incremental index, and with the index
     destroyed: all the same, and none of them the operator."""
     root = _root(tmp_path)
-    _talk(root, ADA, ADA, SAM_STAKEHOLDER, ADA)
+    _talk(root, ADA, ADA, ADA_STAKEHOLDER, ADA)
 
     fresh = _open(root)  # a new process: nothing in memory
     assert fresh.floor is Tier.STAKEHOLDER
@@ -413,17 +416,17 @@ def test_a_rebuild_after_a_ratchet_finds_the_same_floor(tmp_path: Path) -> None:
     assert not resumed.restart
 
     from_log = _records(root)
-    assert floor(from_log, C) is Tier.STAKEHOLDER
-    assert floor(rebuild(root, P).records, C) is Tier.STAKEHOLDER
+    assert floor(from_log, C, principal=P) is Tier.STAKEHOLDER
+    assert floor(rebuild(root, P).records, C, principal=P) is Tier.STAKEHOLDER
     update(root, P)
-    assert floor(load_records(root, P), C) is Tier.STAKEHOLDER
+    assert floor(load_records(root, P), C, principal=P) is Tier.STAKEHOLDER
     index_path(root, P).unlink()
     assert _open(root).floor is Tier.STAKEHOLDER
 
     shuffled = list(from_log)
     random.Random(103).shuffle(shuffled)
-    assert floor(shuffled, C) is Tier.STAKEHOLDER
-    assert floor(shuffled + shuffled, C) is Tier.STAKEHOLDER
+    assert floor(shuffled, C, principal=P) is Tier.STAKEHOLDER
+    assert floor(shuffled + shuffled, C, principal=P) is Tier.STAKEHOLDER
 
 
 def test_the_floor_survives_a_restart_after_an_unknown_speaker(tmp_path: Path) -> None:
@@ -457,7 +460,7 @@ def test_the_utterance_is_in_the_log_before_the_turn_is_answered(
 def test_a_second_device_s_turns_count_like_any_other(tmp_path: Path) -> None:
     root = _root(tmp_path)
     convo = _talk(root, ADA)[0].conversation
-    turn(convo, SAM_STAKEHOLDER, "hi", device="phone", ts=TS, environ=ON)
+    turn(convo, ADA_STAKEHOLDER, "hi", device="phone", ts=TS, environ=ON)
     assert _open(root).floor is Tier.STAKEHOLDER
     assert _open(root).turns == 2
 
@@ -467,10 +470,10 @@ def test_the_fold_ignores_every_event_that_is_not_an_utterance(tmp_path: Path) -
     StreamWriter(root, P, D).append(
         Assertion(ts=TS, actor=P, body="likes tea (synthetic)", summary="likes tea")
     )
-    assert fold(_records(root)) == {}
-    assert floor(_records(root), C) is None
+    assert fold(_records(root), principal=P) == {}
+    assert floor(_records(root), C, principal=P) is None
     _talk(root, ADA)
-    assert floor(_records(root), C) is Tier.OPERATOR
+    assert floor(_records(root), C, principal=P) is Tier.OPERATOR
 
 
 def test_the_fold_is_pure() -> None:
@@ -565,9 +568,10 @@ def test_what_a_call_may_do_follows_the_speaker_not_the_conversation(tmp_path: P
     ).live
     assert isinstance(permit(ada, call, live=live, call_id="c-1", environ=environ), grants.Allowed)
     assert isinstance(permit(sam, call, live=live, call_id="c-2", environ=environ), Request)
-    # The floor dropped to Sam's tier, but Ada's own grants still cover Ada's own call:
-    # the ratchet is about what loads, capability is about who speaks (D61).
-    assert ada_again.conversation.floor is Tier.OPERATOR  # Sam is an operator too
+    # The floor dropped to Sam's tier — the bottom, since he is not the principal (#122) —
+    # but Ada's own grants still cover Ada's own call: the ratchet is about what loads,
+    # capability is about who speaks (D61).
+    assert ada_again.conversation.floor is Tier.UNKNOWN
     assert isinstance(
         permit(ada_again, call, live=live, call_id="c-3", environ=environ), grants.Allowed
     )
@@ -747,12 +751,14 @@ def _golden_root(tmp_path: Path) -> tuple[Path, str, dict[str, Any]]:
 def test_the_fold_over_the_golden_log_is_the_one_it_shipped_with(tmp_path: Path) -> None:
     root, principal, _ = _golden_root(tmp_path)
     report = rebuild(root, principal)
-    want = {"kitchen": Tier.UNKNOWN, "garden": Tier.STAKEHOLDER, "study": Tier.OPERATOR}
-    assert fold(report.records) == want
-    assert fold(load_records(root, principal)) == want
+    # The garden is where ravi, not ines, spoke as a stakeholder: since #122 another
+    # principal is the bottom tier here whatever their role, and the fixture is unchanged.
+    want = {"kitchen": Tier.UNKNOWN, "garden": Tier.UNKNOWN, "study": Tier.OPERATOR}
+    assert fold(report.records, principal=principal) == want
+    assert fold(load_records(root, principal), principal=principal) == want
     log = log_dir(root, principal)
     from_log = [r for f in sorted(log.glob("*.jsonl")) for r in read_file(f, f.stem).records]
-    assert fold(from_log) == want
+    assert fold(from_log, principal=principal) == want
     # The forged turn in the kitchen is in the log as a guest's words, and nothing more.
     forged = [
         r.event

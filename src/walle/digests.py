@@ -48,6 +48,11 @@ The rules
    ``WALLE_DIGESTS=on`` in the environment, outside the log (the owner's dormant condition on
    #104, D117). It is checked before anything is read. Reading is not acting: ``due`` works
    either way. Nothing calls ``run``, there is no real sender, and the CLI has no command.
+9. **A window holds live events only, each once** (#122). ``window_records`` goes through
+   ``walle.resolver.live_events``, the seam every other fold starts from, so a fact forgotten
+   with ``walle forget`` never reaches the composer and a stream read twice is not two
+   streams. The first run's window starts at the anchor and includes it; every later one
+   starts after the last run's ``ts``.
 
 ``due`` is a pure function of the records, the schedule and an explicit instant: no clock, no
 file, no model (hard constraint 3).
@@ -106,6 +111,7 @@ from walle.events import ACTOR_KERNEL, Digest, make_ref, parse_ref
 from walle.paths import LOG_DIRNAME, principal_dir
 from walle.profiles import Context, EmptyContextError, Profile
 from walle.reader import Record
+from walle.resolver import live_events
 
 if sys.platform == "win32":  # pragma: no cover - POSIX only in Phase 0
     raise ImportError(
@@ -213,6 +219,10 @@ class Due:
     until: str | None = None
     missed: int = 0
     """Slots between the last run and this one that never ran, and never will (rule 4)."""
+    first: bool = False
+    """No digest has ever run: the window starts at the anchor and includes it, since slot 0
+    starts there. Every later window starts after the last run's ``ts``, which that run's
+    own window already reached."""
 
 
 def due(records: Iterable[Record], schedule: Schedule, *, at: datetime) -> Due:
@@ -257,7 +267,15 @@ def due(records: Iterable[Record], schedule: Schedule, *, at: datetime) -> Due:
     if missed:
         after = "the last run" if runs else "the first slot"
         reason += f"; {missed} earlier slots since {after} are not run on their own"
-    return Due(True, reason, slot=_spell(current), since=_spell(since), until=until, missed=missed)
+    return Due(
+        True,
+        reason,
+        slot=_spell(current),
+        since=_spell(since),
+        until=until,
+        missed=missed,
+        first=not runs,
+    )
 
 
 @dataclass(frozen=True)
@@ -286,11 +304,28 @@ class Sender(Protocol):
 
 
 def window_records(
-    records: Iterable[Record], since: datetime, until: datetime
+    records: Iterable[Record], since: datetime, until: datetime, *, include_since: bool = False
 ) -> tuple[Record, ...]:
-    """The records whose ``ts`` is after ``since`` and at or before ``until``, in ref order,
-    each once."""
-    picked = {r.ref: r for r in records if since < _at(r.event.ts) <= until}
+    """The **live** records whose ``ts`` is after ``since`` (at or after it when
+    ``include_since``, the first run's case) and at or before ``until``, in ref order, each
+    once.
+
+    Liveness is ``walle.resolver.live_events`` over everything handed in, not over the
+    window: an assertion forgotten with ``walle forget``, a proposal dropped in review, a
+    withdrawn ask or a tombstoned outcome never reaches the composer, even when the supersede
+    that dropped it is stamped after ``until``. The supersede itself is an event like any
+    other and is in the window when its ``ts`` is: a digest may say a fact was withdrawn, it
+    may not say what it was. One ref naming two different events is a ``ResolutionError``,
+    as it is for every other fold.
+    """
+    records = tuple(records)  # read twice: once for liveness, once for the window
+    _, live = live_events(records)
+
+    def inside(record: Record) -> bool:
+        at = _at(record.event.ts)
+        return (since <= at if include_since else since < at) and at <= until
+
+    picked = {r.ref: r for r in records if live[r.ref] and inside(r)}
     return tuple(sorted(picked.values(), key=lambda r: parse_ref(r.ref)))
 
 
@@ -393,7 +428,7 @@ def run(
             slot=verdict.slot,
             since=verdict.since,
             until=verdict.until,
-            records=window_records(records, _at(verdict.since), at),
+            records=window_records(records, _at(verdict.since), at, include_since=verdict.first),
         )
         body = compose(window)
         if not isinstance(body, str):
