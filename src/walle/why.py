@@ -36,12 +36,14 @@ Nothing here writes, and nothing here calls a model (hard constraint 3).
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
 from walle import index
 from walle.events import AnyEvent, Assertion, Proposal, Supersede, parse_ref
+from walle.merge import fold_order
 from walle.reader import Record
 from walle.resolver import Belief, Retired, resolve, retired_by, staged
 
@@ -79,6 +81,11 @@ class Ledger:
         self.current: dict[str, Belief] = {b.ref: b for b in resolution.current}
         self.retired: dict[str, Retired] = {r.ref: r for r in resolution.retired}
         self._staged = {s.ref for s in staged(self.records)}
+
+    @functools.cached_property
+    def _fold_order(self) -> tuple[str, ...]:
+        """Every ref in the order the folds apply them (``walle.merge``), computed once."""
+        return fold_order(self.events)
 
     def status(self, ref: str) -> str | None:
         """A plain account of where ``ref`` stands, or ``None`` if there is nothing to say."""
@@ -142,10 +149,13 @@ class Ledger:
     def _proposal(self, ref: str) -> tuple[str, tuple[str, ...]]:
         if ref in self._staged:
             return "staged", ()
-        kept = sorted(
-            (r for r, e in self.events.items() if isinstance(e, Assertion) and ref in e.caused_by),
-            key=parse_ref,
-        )
+        # In fold order, so the first named is the keep that decided it, as ``walle.stats``
+        # and ``walle.staging`` say (issue #131, finding 7).
+        kept = [
+            r
+            for r in self._fold_order
+            if isinstance(self.events[r], Assertion) and ref in self.events[r].caused_by
+        ]
         if kept:
             return f"kept as {', '.join(kept)}", tuple(kept)
         by = retired_by(self.records, ref)

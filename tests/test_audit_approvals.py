@@ -243,7 +243,7 @@ def test_the_unattended_card_offers_only_what_the_inbox_can_carry() -> None:
     assert "always" not in event.body
     assert f"#c-1 {rungs.APPROVE}" in event.body and f"#c-1 {rungs.NO}" in event.body
     offered = {line.strip() for line in event.body.splitlines() if line.strip().startswith("#")}
-    carried = {rungs.reply_for(asked.pending, outcome) for outcome in inbox.FITS[AskKind.APPROVAL]}
+    carried = {rungs._reply_for(asked.pending, outcome) for outcome in inbox.FITS[AskKind.APPROVAL]}
     assert offered == carried
     # the attended card still offers the typed word, as D62 wrote it
     assert f"#c-1 {rungs.ALWAYS}" in asked.pending.card()
@@ -256,7 +256,7 @@ def test_the_one_table_drives_reply_for_and_the_inbox_fits() -> None:
     assert rungs.ALWAYS not in rungs.INBOX_REPLIES.values()
     pending = _ask(rungs.Ledger.start(P)).pending
     for outcome in AnswerOutcome:
-        reply = rungs.reply_for(pending, outcome)
+        reply = rungs._reply_for(pending, outcome)
         if outcome in rungs.INBOX_REPLIES:
             assert reply == f"#c-1 {rungs.INBOX_REPLIES[outcome]}"
         else:

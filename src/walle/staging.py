@@ -75,6 +75,7 @@ from walle.events import (
     now_instant,
     parse_ref,
 )
+from walle.merge import fold_order
 from walle.paths import check_name, log_dir, staging_lock_path
 from walle.reader import Record
 from walle.resolver import Staged, retired_by, staged
@@ -278,7 +279,14 @@ def _still_staged(records: tuple[Record, ...], ref: str) -> Staged:
         raise NotStagedError(f"no event {ref} in the log")
     if not isinstance(event, Proposal):
         raise NotStagedError(f"{ref} is not a proposal (it is a {event.type!r} event)")
-    kept = [r.ref for r in records if isinstance(r.event, Assertion) and ref in r.event.caused_by]
+    # The keep that decided it is the first in fold order, as ``walle.stats`` counts it:
+    # across devices that is by time, not by ref (issue #131, finding 7).
+    events = {r.ref: r.event for r in records}
+    kept = [
+        r
+        for r in fold_order(events)
+        if isinstance(events[r], Assertion) and ref in events[r].caused_by
+    ]
     if kept:
         raise NotStagedError(f"{ref} was already kept as {kept[0]}")
     by = retired_by(records, ref)

@@ -251,6 +251,27 @@ def _body(value: str) -> str:
         raise click.UsageError(str(exc)) from exc
 
 
+def _edit_body(current: str) -> str | None:
+    """The edited body, or ``None`` if the reviewer emptied it.
+
+    A one-line body is edited at the prompt, and Enter keeps it. A body that spans lines
+    cannot be shown or typed at a one-line prompt without flattening it (issue #131,
+    finding 4.3), so it opens in the editor on the whole text; closing it unsaved keeps the
+    text. An emptied text is refused rather than asked again, since asking again would
+    reopen the editor on nothing.
+    """
+    if "\n" not in current:
+        return click.prompt("  body", default=current, show_default=False, value_proc=_body)
+    click.echo("  The body spans lines; it opens in your editor.")
+    edited = click.edit(current)
+    if edited is None:
+        return current
+    try:
+        return walle_staging.clean_body(edited)
+    except ValueError:
+        return None
+
+
 def _show(position: str, item: walle_staging.Staged) -> None:
     proposal = item.proposal
     click.echo(f"\n{position} {item.ref}, staged {proposal.ts[:10]} by {proposal.actor}")
@@ -325,9 +346,12 @@ def review_command(root: Path, principal: str, device: str) -> None:
                 summary = click.prompt(
                     "  summary", default=item.proposal.summary, value_proc=_summary
                 )
-                body = click.prompt(
-                    "  body", default=item.proposal.body, show_default=False, value_proc=_body
-                )
+                body = _edit_body(item.proposal.body)
+                if body is None:
+                    reviewed += 1
+                    done["s"] += 1
+                    click.echo("  nothing to remember — the text is empty; still staged")
+                    continue
                 new = walle_staging.edit(
                     root, principal, device, item.ref, body=body, summary=summary
                 )
@@ -340,7 +364,7 @@ def review_command(root: Path, principal: str, device: str) -> None:
             done["elsewhere"] += 1
             click.echo(f"  {exc}; left as it is")
             continue
-        except click.Abort:
+        except (click.Abort, click.ClickException):  # the editor failing is a ClickException
             report()
             raise
         except _LOG_ERRORS as exc:

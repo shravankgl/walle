@@ -52,15 +52,17 @@ truth for what it says and what it means; the inbox carries it. ``to_ask`` makes
 that ``walle.inbox.ask_event`` stores verbatim: the id as the item's ``tool_call_id``, the
 card as its body, timed at the ask. ``INBOX_REPLIES`` is the one table from an inbox outcome
 to the word it stands for — ``approved`` is ``approve``, ``denied`` is ``no`` — and both the
-unattended card (``Pending.card(via_inbox=True)``) and ``reply_for`` are read off it, so the
+unattended card (``Pending.card(via_inbox=True)``) and ``_reply_for`` are read off it, so the
 card never offers what the inbox cannot carry, and nothing that arrives through the inbox is
 the literal word ``always``. ``settle`` takes the resolved inbox ``Item`` itself and settles
-the ``Pending`` it is bound to: the same session, the same id, and the body the exact card —
-an item saying anything else is ``MISMATCH``, however it was answered. The fifteen-minute
-window is the typed reply's (D62); an inbox item lives by the inbox's rule instead —
-resolved once, first answer wins, orphaned when its session dies (D78) — because a mission
-waits forty minutes for a person who is away (D67), and a yes they gave to the exact command
-must not come back as "expired". An orphaned item settles nothing: orphaned is never a yes.
+the ``Pending`` it is bound to: the same session, the same id, the body the exact card, and
+the ask timed at the pending's ask — an item saying anything else is ``MISMATCH``, however
+it was answered, and an answer timed before the ask is ``EARLY``, as a typed reply is. The
+fifteen-minute window is the typed reply's (D62); an inbox item lives by the inbox's rule
+instead — resolved once, first answer wins, orphaned when its session dies (D78) — because a
+mission waits forty minutes for a person who is away (D67), and a yes they gave to the exact
+command must not come back as "expired". An orphaned item settles nothing: orphaned is never
+a yes.
 
 Rung 4, autonomous-bounded
 --------------------------
@@ -136,7 +138,6 @@ __all__ = [
     "enabled",
     "load_envelope",
     "parse",
-    "reply_for",
     "resolve",
     "settle",
     "to_ask",
@@ -166,7 +167,7 @@ INBOX_REPLIES: Mapping[AnswerOutcome, str] = MappingProxyType(
     {AnswerOutcome.APPROVED: APPROVE, AnswerOutcome.DENIED: NO}
 )
 """The one table from an inbox outcome to the word it stands for. The unattended card offers
-exactly these words, ``reply_for`` and ``settle`` read them back, and ``always`` is not here:
+exactly these words, ``_reply_for`` and ``settle`` read them back, and ``always`` is not here:
 a standing rule comes from the literal word, typed (D62). ``tests/test_audit_approvals.py``
 holds this equal to ``walle.inbox.FITS[AskKind.APPROVAL]``."""
 
@@ -582,11 +583,16 @@ def to_ask(pending: Pending, *, unattended: bool) -> Ask:
     )
 
 
-def reply_for(pending: Pending, outcome: AnswerOutcome) -> str | None:
+def _reply_for(pending: Pending, outcome: AnswerOutcome) -> str | None:
     """The reply an inbox outcome stands for, from ``INBOX_REPLIES``: ``approved`` is
     ``#id approve``, ``denied`` is ``#id no``, anything else is no reply. There is no outcome
     that is ``always``: a standing rule comes from the literal word, typed, and never from a
-    button in an inbox."""
+    button in an inbox.
+
+    Private (issue #131, finding 7): it reads no inbox item, so it binds nothing. Outside
+    this module the only way from an inbox outcome to a settled request is ``settle``,
+    which checks the item is this pending's first. Kept so the tests can hold the card and
+    the table to one another."""
     _require(pending, Pending, "pending")
     _require(outcome, AnswerOutcome, "outcome")
     word = INBOX_REPLIES.get(outcome)
@@ -605,12 +611,13 @@ def settle(
     In order: off refuses before the item is read; a speaker who is not the ledger's
     principal giving an ``Order`` is refused before the item is read; an item whose id is
     not in the ledger is unknown; a settled id is replayed, or expired if it expired; an
-    item that is not this pending's — another session, or a body that is not the exact inbox
-    card — is a mismatch, approved or not; an item still pending, or orphaned, or whose
-    answer does not fit it by the inbox's own ``misfit`` (a machine actor's, say), is not a
-    reply. What is left is a person's approved or denied, and the item is settled by it:
-    ``approve`` for this request (``Scope.REQUEST``), never ``always``. No window: the
-    inbox's rule governs the inbox.
+    item that is not this pending's — another session, a body that is not the exact inbox
+    card, or an ask not timed at this pending's ask — is a mismatch, approved or not; an
+    answer timed before the ask is early, as a typed reply is; an item still pending, or
+    orphaned, or whose answer does not fit it by the inbox's own ``misfit`` (a machine
+    actor's, say), is not a reply. What is left is a person's approved or denied, and the
+    item is settled by it: ``approve`` for this request (``Scope.REQUEST``), never
+    ``always``. No window: the inbox's rule governs the inbox.
     """
     _require(ledger, Ledger, "ledger")
     _require(item, inbox.Item, "item")
@@ -636,6 +643,7 @@ def settle(
         item.ask.kind is AskKind.APPROVAL
         and item.ask.session == found.session
         and item.ask.body == found.card(via_inbox=True)
+        and _instant(item.ask.ts) == _instant(found.asked_at)
         and not item.ask.choices
     )
     if not bound:
@@ -645,6 +653,8 @@ def settle(
             "than the exact command the person was shown",
             ledger,
         )
+    if item.answer is not None and _instant(item.answer.ts) < _instant(found.asked_at):
+        return Refused(Refusal.EARLY, "this answer is timed before the request it answers", ledger)
     word = None
     if item.answer is not None and inbox.misfit(item.ask, item.answer) is None:
         word = INBOX_REPLIES.get(item.answer.outcome)
