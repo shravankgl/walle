@@ -649,7 +649,8 @@ def test_the_cli_gains_no_rot_or_restore_command() -> None:
 def test_nothing_in_the_package_calls_rot_on_its_own() -> None:
     """Only ``automations.add``'s cap refusal reads the labels, and only while ``WALLE_ROT``
     is on, and the model maintenance pass (#98), which runs ``rot`` first and is itself off
-    by default and called by nothing; no other module imports ``walle.rot``."""
+    by default and called by nothing, and the Phase 3 gate report (#106), which reads only with
+    ``WALLE_ROT`` and its own switch on; no other module imports ``walle.rot``."""
     users = sorted(
         p.name
         for p in PACKAGE.rglob("*.py")
@@ -660,7 +661,7 @@ def test_nothing_in_the_package_calls_rot_on_its_own() -> None:
             for n in ast.walk(ast.parse(p.read_text()))
         )
     )  # fmt: skip
-    assert users == ["automations.py", "maintenance.py"]
+    assert users == ["automations.py", "gate3.py", "maintenance.py"]
 
 
 # --- the golden log at v2 -----------------------------------------------------------------

@@ -15,6 +15,7 @@ from walle import acp as walle_acp
 from walle import codex as walle_codex
 from walle import context as walle_context
 from walle import curator as walle_curator
+from walle import gate3 as walle_gate3
 from walle import hot as walle_hot
 from walle import index as walle_index
 from walle import models as walle_models
@@ -858,6 +859,7 @@ def acp_command(
 
 main.add_command(walle_evals.eval_command)
 main.add_command(walle_gate.gate_command)
+main.add_command(walle_gate3.gate3_command)
 
 
 # --- the acceptance rate (issue #53) -----------------------------------------------------
