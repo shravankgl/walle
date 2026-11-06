@@ -11,6 +11,7 @@ Every event here is synthetic: a made-up person's kitchen and plants, no real da
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,7 @@ from walle.events import (
     Supersede,
     now_instant,
 )
+from walle.paths import stream_path
 from walle.writer import StreamWriter
 
 P = "maya"
@@ -135,9 +137,13 @@ def test_the_chain_comes_from_the_index_edges(tmp_path: Path) -> None:
 
 
 def test_a_cycle_in_caused_by_still_ends(tmp_path: Path) -> None:
-    """The writer does not check `caused_by`, so a hand-made log can hold a cycle. Both refs
-    exist, so the index takes it; the query must still terminate and list each event once."""
-    _append(tmp_path, "mbp", _obs("one", "d-phone:1"))
+    """The writer refuses a cause that is not in the log yet (#121), so a cycle can only come
+    from a hand-made log: the first line is planted by hand. Both refs exist, so the index
+    takes it; the query must still terminate and list each event once."""
+    first = _obs("one", "d-phone:1").model_copy(update={"seq": 1})
+    path = stream_path(tmp_path, P, "mbp")
+    path.parent.mkdir(parents=True)
+    path.write_bytes(json.dumps(first.model_dump(mode="json", exclude_none=True)).encode() + b"\n")
     _append(tmp_path, "phone", _obs("two", "d-mbp:1"))
 
     steps = why.explain(tmp_path, P, "d-mbp:1").steps

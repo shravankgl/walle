@@ -54,7 +54,7 @@ from walle.index import (
 from walle.paths import index_path, log_dir, stream_path
 from walle.reader import Record, StreamContents, read_stream
 from walle.resolver import resolve
-from walle.writer import StreamWriter
+from walle.writer import DanglingCauseError, StreamWriter
 
 Build = Callable[[Path, str], IndexReport]
 TS = "2026-11-04T09:00:00.000000+00:00"
@@ -205,6 +205,7 @@ def test_incremental_does_not_rewrite_rows_it_already_has(tmp_path: Path) -> Non
 
 def _append_raw(root: Path, device: str, record: dict[str, object]) -> None:
     path = stream_path(root, P, device)
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "ab") as f:
         f.write(json.dumps(record).encode() + b"\n")
 
@@ -253,10 +254,15 @@ def test_a_future_version_with_no_index_leaves_no_index_behind(tmp_path: Path) -
 @pytest.mark.parametrize("missing", ["d-mbp:99", "d-ghost:1"])
 @pytest.mark.parametrize("build", [update, rebuild])
 def test_a_dangling_caused_by_fails_the_build(tmp_path: Path, build: Build, missing: str) -> None:
+    """The writer refuses a dangling cause since #121, so the line is planted by hand, as a
+    hand-edited or truncated log would hold it: the index's own defence (D111) still stands."""
     _write(tmp_path, "mbp", _obs("Cooked rajma."))
     update(tmp_path, P)
     before = index_path(tmp_path, P).read_bytes()
-    _write(tmp_path, "phone", _assertion("Likes rajma", caused_by=["d-mbp:1", missing]))
+    with pytest.raises(DanglingCauseError):
+        _write(tmp_path, "phone", _assertion("Likes rajma", caused_by=["d-mbp:1", missing]))
+    bad = _assertion("Likes rajma", caused_by=["d-mbp:1", missing]).model_copy(update={"seq": 1})
+    _append_raw(tmp_path, "phone", bad.model_dump(mode="json", exclude_none=True))
 
     with pytest.raises(DanglingRefError) as caught:
         build(tmp_path, P)
@@ -520,7 +526,8 @@ def test_walle_rebuild_reports_what_it_did(tmp_path: Path) -> None:
 
 
 def test_walle_rebuild_fails_loudly_on_a_dangling_ref(tmp_path: Path) -> None:
-    _write(tmp_path, "mbp", _assertion("Likes rajma", caused_by=["d-mbp:7"]))
+    bad = _assertion("Likes rajma", caused_by=["d-mbp:7"]).model_copy(update={"seq": 1})
+    _append_raw(tmp_path, "mbp", bad.model_dump(mode="json", exclude_none=True))  # by hand (#121)
     result = CliRunner().invoke(main, ["rebuild", "--root", str(tmp_path), "--principal", P])
     assert result.exit_code == 1
     assert "d-mbp:7" in result.output and "dangling" in result.output

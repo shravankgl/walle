@@ -43,6 +43,27 @@ would append the turn: two events, two refs, for one thing that happened.
 What this does not survive: a stream on NFS, where ``flock`` does not reliably serialise
 between hosts. Local-first is the premise (D10); a shared-filesystem log would need a
 different mechanism, and would silently interleave with this one.
+
+A cause must already be in the log (D111, issue #121)
+------------------------------------------------------
+``caused_by`` is provenance: each ref in it must name an event some stream of this principal
+holds. The index refuses a log with a dangling one (``walle.index.DanglingRefError``), and the
+log is append-only, so a single event appended with a ref that does not exist — a typo, a
+ref from another principal, the event's own ref — would break ``index.update`` and the
+rebuild for the rest of the log's life. Every writer used to be trusted to get this right.
+Now the check is here, in ``LockedStream.append``, the one place a stream grows: before a
+byte is written, every cause is looked for — on this stream through the locked handle, on
+any other stream of the same principal by reading its file — and ``DanglingCauseError`` is
+raised with the refs that are missing. A cause on this stream with the ``seq`` about to be
+assigned is the event naming itself, and is missing like any other.
+
+The other streams are read *without* taking their lock. Taking ``LOCK_SH`` on another
+stream while holding ``LOCK_EX`` on this one would deadlock against a writer doing the same
+the other way round. A lockless read is sound here because the reader's rules already make
+it so (D80): a line is a record only once its newline is on disk, and the only line a
+concurrent writer can be mid-way through is the last one, which is skipped as torn. What is
+there before our read is there for good (append-only); what is not there yet makes a cause
+missing, which refuses — fail closed — rather than lets through.
 """
 
 from __future__ import annotations
@@ -56,7 +77,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO, TypeVar
 
-from walle.events import Event
+from walle.events import Event, parse_ref
 from walle.paths import stream_id, stream_path
 from walle.reader import StreamContents, parse_stream
 
@@ -91,6 +112,19 @@ class CorruptLogError(Exception):
     name two of them, permanently and silently. A torn *tail* is an interrupted write and is
     healed (D80); a corrupt complete line is something else, and the operator should see it.
     """
+
+
+class DanglingCauseError(ValueError):
+    """An event's ``caused_by`` names a ref no stream of this principal holds. Raised before
+    anything is written (D111, issue #121): an append-only log cannot take this back."""
+
+    def __init__(self, stream: str, missing: list[str]) -> None:
+        super().__init__(
+            f"refusing to append to {stream}: caused_by names {', '.join(missing)}, which "
+            f"{'is' if len(missing) == 1 else 'are'} not in the log; a cause must already be "
+            "an event of this principal (D111)"
+        )
+        self.missing = tuple(missing)
 
 
 def _fsync_dir(path: Path) -> None:
@@ -228,7 +262,12 @@ class LockedStream:
         return parse_stream(self._f.read(size), self.path, self.stream)
 
     def append(self, event: E) -> E:
-        """Append one event, returning it with its ``seq`` filled in. Durable on return."""
+        """Append one event, returning it with its ``seq`` filled in. Durable on return.
+
+        Raises ``DanglingCauseError``, with nothing written, when a ref in ``caused_by`` is
+        not an event of this principal (see the module docstring).
+        """
+        self._check_causes(event)
         f = self._f
         size = f.seek(0, os.SEEK_END)
 
@@ -269,3 +308,34 @@ class LockedStream:
         f.flush()
         os.fsync(f.fileno())
         return record
+
+    def _check_causes(self, event: Event) -> None:
+        """Every ref in ``event.caused_by`` is an event of this principal, or
+        ``DanglingCauseError`` names the ones that are not. This stream is read through the
+        locked handle; any other stream of the principal is read from its file, without its
+        lock (the module docstring says why that is both necessary and sound)."""
+        if not event.caused_by:
+            return
+        wanted: dict[str, set[str]] = {}
+        for cause in event.caused_by:
+            stream, _ = parse_ref(cause)
+            wanted.setdefault(stream, set()).add(cause)
+        missing: list[str] = []
+        for stream, refs in wanted.items():
+            if stream == self.stream:
+                held = {r.ref for r in self.read().records}
+            else:
+                held = _refs_of(self.path.with_name(f"{stream}.jsonl"), stream)
+            missing.extend(sorted(refs - held, key=parse_ref))
+        if missing:
+            raise DanglingCauseError(self.stream, sorted(missing, key=parse_ref))
+
+
+def _refs_of(path: Path, stream: str) -> set[str]:
+    """The refs a sibling stream file holds now, read without its lock: a file that is not
+    there holds nothing."""
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return set()
+    return {r.ref for r in parse_stream(data, path, stream).records}
