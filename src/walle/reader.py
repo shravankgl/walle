@@ -19,6 +19,11 @@ fail on every read for the rest of the log's life — one bad line bricking a st
   right after it.** The writer derived the next ``seq`` from the last *terminated* line, so
   it reused this one's number. The later record is the acknowledged one; the earlier is
   skipped, because one ref naming two events is the failure this log exists to prevent.
+  Only a heal written before issue #128 leaves this shape: a heal now begins with
+  ``writer.TORN_MARK``, which keeps the torn line unparseable however the heal is then cut,
+  so it is skipped under the previous rule instead. This one stays for the streams already
+  healed the old way (D88), and still requires the two lines to be adjacent — the old heal
+  wrote the newline and the next record in one write, so nothing can sit between them.
 * **Everything else that is wrong is fatal.** Valid JSON that is not a valid event, a
   missing ``seq``, a ``seq`` that is not a JSON integer a ref can carry (``"2"``, ``true``,
   ``2.0``, more than 19 digits), a ``seq`` that goes backwards: none of these is an
